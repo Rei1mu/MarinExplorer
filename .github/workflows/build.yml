@@ -19,20 +19,13 @@ jobs:
   build-gnu-x86_64:
     name: Windows x86_64 (GNU)
     runs-on: ubuntu-latest
-    env:
-      CARGO_TARGET_X86_64_PC_WINDOWS_GNU_LINKER: x86_64-w64-mingw32-gcc
     steps:
       - uses: actions/checkout@v4
 
-      - name: Install llvm-mingw toolchain
+      - name: Install MinGW-w64 toolchain (GCC-based, matches the local build)
         run: |
-          URL=$(curl -s https://api.github.com/repos/mstorsjo/llvm-mingw/releases/latest \
-            | jq -r '.assets[] | select(.name | endswith("ubuntu-22.04-x86_64.tar.xz")) | .browser_download_url' | head -1)
-          echo "Downloading $URL"
-          curl -sSL "$URL" -o llvm-mingw.tar.xz
-          mkdir -p "$HOME/llvm-mingw"
-          tar -xJf llvm-mingw.tar.xz -C "$HOME/llvm-mingw" --strip-components=1
-          echo "$HOME/llvm-mingw/bin" >> "$GITHUB_PATH"
+          sudo apt-get update
+          sudo apt-get install -y gcc-mingw-w64-x86-64 binutils-mingw-w64-x86-64
 
       - name: Set up Rust
         uses: dtolnay/rust-toolchain@v1

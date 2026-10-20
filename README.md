@@ -129,9 +129,9 @@ cargo build --release --target aarch64-pc-windows-msvc
 
 ## 🤖 自动构建（GitHub Actions / Automated Builds）
 
-仓库已在每次推送 `main` 时通过 GitHub Actions 自动编译 **两个 Windows 版本**（x86_64 在 Linux 上用 llvm-mingw 交叉编译，arm64 在 Windows runner 上用原生 MSVC 交叉编译，产物全是 Windows `.exe`）：
+仓库已在每次推送 `main` 时通过 GitHub Actions 自动编译 **两个 Windows 版本**（x86_64 在 Linux 上用 MinGW-w64（GCC）交叉编译，arm64 在 Windows runner 上用原生 MSVC 交叉编译，产物全是 Windows `.exe`）：
 
-On every push to `main`, GitHub Actions automatically builds **both Windows editions** (x86_64 is cross-compiled on Linux with llvm-mingw; arm64 is cross-compiled on a Windows runner with the native MSVC tools — every artifact is a Windows `.exe`):
+On every push to `main`, GitHub Actions automatically builds **both Windows editions** (x86_64 is cross-compiled on Linux with MinGW-w64 (GCC); arm64 is cross-compiled on a Windows runner with the native MSVC tools — every artifact is a Windows `.exe`):
 
 - `x86_64-pc-windows-gnu`（标准 Windows x64）
 - `aarch64-pc-windows-msvc`（Windows on ARM64）
