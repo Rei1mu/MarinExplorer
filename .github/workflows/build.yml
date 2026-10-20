@@ -169,10 +169,19 @@ jobs:
       - name: Build installer
         shell: pwsh
         run: |
-          $iscc = Get-ChildItem "$env:ProgramFiles","${env:ProgramFiles(x86)}","$env:LOCALAPPDATA\Programs" `
-                  -Filter ISCC.exe -Recurse -Depth 3 -ErrorAction SilentlyContinue |
-                  Select-Object -First 1
-          if (-not $iscc) { throw "ISCC.exe not found" }
+          # The runner ships Inno Setup 6, whose default install lacks the
+          # Chinese/Japanese language files that marin.iss compiles in. Prefer
+          # Inno Setup 7 (installed above), or any build that actually has them.
+          $cands = Get-ChildItem "$env:LOCALAPPDATA\Programs","${env:ProgramFiles(x86)}","$env:ProgramFiles" `
+                    -Filter ISCC.exe -Recurse -Depth 3 -ErrorAction SilentlyContinue
+          if (-not $cands) { throw "ISCC.exe not found" }
+          $withLang = $cands | Where-Object {
+            Test-Path (Join-Path $_.DirectoryName "Languages\ChineseSimplified.isl")
+          }
+          $iscc = if ($withLang) { $withLang[0] } else { $cands[0] }
+          Write-Output "using $($iscc.FullName)"
+          Get-ChildItem (Join-Path $iscc.DirectoryName "Languages") -Filter *.isl -ErrorAction SilentlyContinue |
+            Select-Object -ExpandProperty Name
           & $iscc.FullName installer/marin.iss "/DMyAppVersion=${{ steps.ver.outputs.version }}" "/Oinstaller\Output"
 
       - name: Upload installer artifact
