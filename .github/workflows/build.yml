@@ -1,9 +1,10 @@
 name: Build
 
 # MarinExplorer targets Windows only:
-#   - x86_64-pc-windows-gnu    (standard Windows x64, MinGW-w64)
+#   - x86_64-pc-windows-gnu    (standard Windows x64, MinGW-w64 / llvm-mingw)
 #   - aarch64-pc-windows-msvc  (Windows on ARM64, e.g. Surface / Snapdragon, MSVC)
-# The CI runner is Linux, but every artifact is a Windows .exe.
+# Each artifact is a Windows .exe. The GNU build runs on Linux (llvm-mingw);
+# the ARM64 build runs on a Windows runner using the native MSVC cross-tools.
 on:
   push:
     branches: [main]
@@ -15,27 +16,15 @@ permissions:
   contents: write
 
 jobs:
-  build:
-    name: ${{ matrix.target }}
+  build-gnu-x86_64:
+    name: Windows x86_64 (GNU)
     runs-on: ubuntu-latest
-    strategy:
-      fail-fast: false
-      matrix:
-        - target: x86_64-pc-windows-gnu
-          arch: x86_64
-          toolchain: gnu
-        - target: aarch64-pc-windows-msvc
-          arch: arm64
-          toolchain: msvc
     env:
       CARGO_TARGET_X86_64_PC_WINDOWS_GNU_LINKER: x86_64-w64-mingw32-gcc
-      CARGO_TARGET_X86_64_PC_WINDOWS_GNU_AR: x86_64-w64-mingw32-ar
-      CARGO_TARGET_X86_64_PC_WINDOWS_GNU_RUSTFLAGS: ""
     steps:
       - uses: actions/checkout@v4
 
-      - name: Install llvm-mingw toolchain (GNU x86_64)
-        if: matrix.toolchain == 'gnu'
+      - name: Install llvm-mingw toolchain
         run: |
           URL=$(curl -s https://api.github.com/repos/mstorsjo/llvm-mingw/releases/latest \
             | jq -r '.assets[] | select(.name | endswith("ubuntu-22.04-x86_64.tar.xz")) | .browser_download_url' | head -1)
@@ -49,32 +38,60 @@ jobs:
         uses: dtolnay/rust-toolchain@v1
         with:
           toolchain: stable
-          targets: ${{ matrix.target }}
+          targets: x86_64-pc-windows-gnu
 
-      - name: Install cargo-xwin (MSVC cross-build, arm64)
-        if: matrix.toolchain == 'msvc'
-        run: cargo install cargo-xwin --locked
+      - name: Build release
+        run: cargo build --release --target x86_64-pc-windows-gnu
 
-      - name: Build release (GNU)
-        if: matrix.toolchain == 'gnu'
-        run: cargo build --release --target ${{ matrix.target }}
-
-      - name: Build release (MSVC via xwin)
-        if: matrix.toolchain == 'msvc'
-        run: cargo xwin build --release --target ${{ matrix.target }}
-
-      - name: Stage artifact with distinct name
-        run: cp "target/${{ matrix.target }}/release/MarinExplorer.exe" "MarinExplorer-${{ matrix.arch }}.exe"
+      - name: Stage artifact
+        run: cp "target/x86_64-pc-windows-gnu/release/MarinExplorer.exe" "MarinExplorer-x86_64.exe"
 
       - name: Upload build artifact
         uses: actions/upload-artifact@v4
         with:
-          name: MarinExplorer-${{ matrix.arch }}
-          path: MarinExplorer-${{ matrix.arch }}.exe
+          name: MarinExplorer-x86_64
+          path: MarinExplorer-x86_64.exe
           if-no-files-found: error
 
       - name: Upload to GitHub Release
         if: startsWith(github.ref, 'refs/tags/v')
         uses: softprops/action-gh-release@v2
         with:
-          files: MarinExplorer-${{ matrix.arch }}.exe
+          files: MarinExplorer-x86_64.exe
+
+  build-msvc-arm64:
+    name: Windows ARM64 (MSVC)
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Rust
+        uses: dtolnay/rust-toolchain@v1
+        with:
+          toolchain: stable
+          targets: aarch64-pc-windows-msvc
+
+      - name: Build release (cross to ARM64 via MSVC)
+        shell: cmd
+        run: |
+          for /f "usebackq tokens=*" %%i in (`"%ProgramFiles(x86)%\Microsoft Visual Studio\Installer\vswhere.exe" -latest -property installationPath`) do set VS=%%i
+          if not defined VS (echo "Visual Studio not found" && exit /b 1)
+          call "%VS%\VC\Auxiliary\Build\vcvarsall.bat" x64_arm64
+          cargo build --release --target aarch64-pc-windows-msvc
+
+      - name: Stage artifact
+        shell: pwsh
+        run: Copy-Item "target/aarch64-pc-windows-msvc/release/MarinExplorer.exe" "MarinExplorer-arm64.exe"
+
+      - name: Upload build artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: MarinExplorer-arm64
+          path: MarinExplorer-arm64.exe
+          if-no-files-found: error
+
+      - name: Upload to GitHub Release
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: MarinExplorer-arm64.exe
