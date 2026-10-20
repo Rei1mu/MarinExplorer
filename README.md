@@ -95,13 +95,13 @@ cargo build --release --target aarch64-pc-windows-msvc
 |---|---|---|
 | C 运行时 | MinGW 自带（libgcc / winpthread + 系统 msvcrt） | 微软运行时，CI 已静态链接（`-C target-feature=+crt-static`） |
 | 要装 VC++ 运行库吗 | 不需要 | 不需要（已静态链接进去） |
-| exe 文件图标 | 有（内嵌，`build.rs` 用 windres 编进资源） | 无（显示系统默认图标；窗口/任务栏图标照常） |
+| exe 文件图标 | 有（`build.rs` 用 windres 内嵌） | 有（`build.rs` 用 rc.exe 内嵌） |
 | 调试生态 | GCC / DWARF | Visual Studio / WinDbg / PDB |
 | 与 C 库互操作 | 只能链 MinGW 的 `.a` | 只能链 MSVC 的 `.lib` |
 
 说明：
 - 发布构建已为体积优化（`opt-level = "z"` + LTO + strip）。
-- 应用图标由 `build.rs` 把 `logo.ico` 编译进 Windows 资源，只作用于 `x86_64-pc-windows-gnu`；两个 MSVC 产物不带内嵌文件图标，但不影响运行。
+- 应用图标由 `build.rs` 编进 Windows 资源，三个产物都带：**GNU 版用 MinGW 的 `windres` 生成 `.o`，MSVC 版用 Windows SDK 的 `rc.exe` 生成 `.res`**。找不到资源编译器时编译照常通过，只是没有文件图标。
 - 代码签名（可选）见 `sign.ps1`：用受信任 CA 的 `.pfx` 给 exe 签名 + 时间戳，消除 SmartScreen 拦截。
 - 普通用户直接用 **GNU 版**即可（有文件图标、无运行时依赖）。只有要接入 MSVC 编译的库、或要用 VS / WinDbg 调试时，才必须选 MSVC 版。
 
@@ -219,13 +219,13 @@ Both x64 editions run on the same ordinary 64-bit Windows PC and are functionall
 |---|---|---|
 | C runtime | MinGW's own (libgcc / winpthread + system msvcrt) | Microsoft's, linked **statically** in CI (`-C target-feature=+crt-static`) |
 | Needs VC++ redistributable | No | No (statically linked in) |
-| exe file icon | Yes (embedded by `build.rs` via windres) | No (system default icon; window/taskbar icon still fine) |
+| exe file icon | Yes (embedded by `build.rs` via `windres`) | Yes (embedded by `build.rs` via `rc.exe`) |
 | Debug ecosystem | GCC / DWARF | Visual Studio / WinDbg / PDB |
 | C interop | Links MinGW `.a` only | Links MSVC `.lib` only |
 
 Notes:
 - Release builds are size-optimized (`opt-level = "z"` + LTO + strip).
-- The app icon is embedded by `build.rs` for `x86_64-pc-windows-gnu` only; the two MSVC artifacts ship without a bundled file icon, but run fine.
+- The app icon is embedded by `build.rs` in all three builds: MinGW's `windres` for the GNU target, Windows SDK `rc.exe` for the MSVC targets. If no resource compiler is found the build still succeeds, just without a file icon.
 - Optional code signing lives in `sign.ps1`.
 - For everyday use just take the **GNU build** (file icon, no runtime dependency). You only need the MSVC build to link MSVC-compiled libraries, or to debug with VS / WinDbg.
 
