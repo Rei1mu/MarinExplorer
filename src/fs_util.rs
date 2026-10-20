@@ -1055,71 +1055,16 @@ fn dib_bytes(rgba: &image::RgbaImage) -> Vec<u8> {
 }
 
 // ---------------------------------------------------------------------------
-// Context-menu registration lives in standalone PowerShell scripts shipped
-// next to the executable (右键菜单-安装.ps1 / 右键菜单-卸载.ps1) instead of
-// being written by the app itself.
-//
-// Why: an unsigned binary that quietly writes HKCU\Software\Classes is
-// exactly the shape Windows SmartScreen and endpoint-security tools dislike.
-// Keeping the registry write in an explicit, user-launched script leaves the
-// app side-effect free, and the script can be read before it runs.
+// Context-menu registration no longer lives here — see `src/shell.rs`. The
+// app writes `HKCU\Software\Classes` itself now, triggered by the Settings
+// toggle. That key is per-user, so it needs no elevation, touches nobody
+// else's account, and is fully reversible from the same toggle.
 // ---------------------------------------------------------------------------
 
-/// Directory that holds the running executable (and the context-menu scripts).
+/// Directory that holds the running executable — also where the portable app
+/// keeps its own store (see `cache::cache_dir`).
 pub fn exe_dir() -> Option<std::path::PathBuf> {
     std::env::current_exe()
         .ok()
         .and_then(|p| p.parent().map(|d| d.to_path_buf()))
-}
-
-/// Open the folder that contains the context-menu scripts so the user can run
-/// the install / uninstall script by hand.
-#[cfg(target_os = "windows")]
-pub fn open_context_menu_script_dir() -> Option<std::path::PathBuf> {
-    let dir = exe_dir()?;
-    let _ = Command::new("explorer.exe").arg(&dir).spawn();
-    Some(dir)
-}
-
-#[cfg(not(target_os = "windows"))]
-pub fn open_context_menu_script_dir() -> Option<std::path::PathBuf> {
-    exe_dir()
-}
-
-/// Read-only check: is the context-menu verb currently registered?
-///
-/// This only *reads* `HKCU\Software\Classes` — the app never writes it.
-pub fn context_menu_installed() -> bool {
-    #[cfg(target_os = "windows")]
-    unsafe {
-        #[link(name = "advapi32")]
-        extern "system" {
-            fn RegOpenKeyExW(
-                hkey: usize,
-                lpSubKey: *const u16,
-                ulOptions: u32,
-                samDesired: u32,
-                phkResult: *mut usize,
-            ) -> i32;
-            fn RegCloseKey(hkey: usize) -> i32;
-        }
-        const HKEY_CURRENT_USER: usize = 0x8000_0001;
-        const KEY_READ: u32 = 0x20019;
-        let sub = "Software\\Classes\\*\\shell\\MarinExplorer";
-        let wide: Vec<u16> = std::os::windows::ffi::OsStrExt::encode_wide(
-            std::ffi::OsStr::new(sub),
-        )
-        .chain(std::iter::once(0))
-        .collect();
-        let mut hkey: usize = 0;
-        let ok = RegOpenKeyExW(HKEY_CURRENT_USER, wide.as_ptr(), 0, KEY_READ, &mut hkey) == 0;
-        if hkey != 0 {
-            RegCloseKey(hkey);
-        }
-        ok
-    }
-    #[cfg(not(target_os = "windows"))]
-    {
-        false
-    }
 }

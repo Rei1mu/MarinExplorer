@@ -26,11 +26,12 @@ icodump.py
 peico.py
 rsdump.py
 sign.ps1
-右键菜单-安装.ps1
-右键菜单-卸载.ps1
 解除SmartScreen拦截.ps1
 task.md
 
 # ---- Editor / OS ----
 .DS_Store
 Thumbs.db
+
+# ---- Inno Setup installer build output ----
+installer/Output/

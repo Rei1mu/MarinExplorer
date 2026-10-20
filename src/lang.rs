@@ -315,6 +315,34 @@ fn lookup(key: &str) -> Option<(&'static str, &'static str, &'static str)> {
         ("深色模式", "Dark mode", "ダークモード", "深色模式"),
         ("语言", "Language", "言語", "語言"),
         ("关闭标签页", "Close tab", "タブを閉じる", "關閉標籤頁"),
+        // --- shell integration ---
+        ("集成", "Integration", "統合", "整合"),
+        (
+            "通过 MarinExplorer 打开",
+            "Open with MarinExplorer",
+            "MarinExplorer で開く",
+            "透過 MarinExplorer 開啟",
+        ),
+        (
+            "通过 MarinExplorer 打开（右键菜单）",
+            "Open with MarinExplorer (context menu)",
+            "MarinExplorer で開く（コンテキストメニュー）",
+            "透過 MarinExplorer 開啟（右鍵選單）",
+        ),
+        (
+            "在文件、文件夹、磁盘和文件夹空白处右键菜单里显示此项；只对当前用户生效，不需要管理员权限",
+            "Shows this entry in the right-click menu of files, folders, drives and empty folder space. Applies to the current user only — no administrator rights needed",
+            "ファイル・フォルダー・ドライブ・フォルダーの何もない場所の右クリックメニューに表示します。現在のユーザーのみ対象で、管理者権限は不要です",
+            "在檔案、資料夾、磁碟機與資料夾空白處的右鍵選單中顯示此項目；僅對目前使用者生效，不需要管理員權限",
+        ),
+        ("右键菜单已添加", "Context menu added", "コンテキストメニューを追加しました", "右鍵選單已新增"),
+        ("右键菜单已移除", "Context menu removed", "コンテキストメニューを削除しました", "右鍵選單已移除"),
+        (
+            "右键菜单操作失败",
+            "Context menu operation failed",
+            "コンテキストメニューの操作に失敗しました",
+            "右鍵選單操作失敗",
+        ),
         // --- known folders ---
         ("桌面", "Desktop", "デスクトップ", "桌面"),
         ("下载", "Downloads", "ダウンロード", "下載"),

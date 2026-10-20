@@ -23,6 +23,7 @@ mod icons;
 mod lang;
 mod preview;
 mod quickaccess;
+mod shell;
 mod shellicon;
 mod tray;
 mod dragout;
@@ -144,6 +145,12 @@ fn main() -> eframe::Result {
             }
             cc.egui_ctx.set_fonts(fonts);
             let mut ex = Explorer::new(store, size_tx, back_rx);
+            // A path handed over on the command line (context menu, drag onto
+            // the exe, `MarinExplorer.exe D:\foo`) opens that folder — or, for
+            // a file, its parent with the file selected.
+            if let Some(arg) = std::env::args().nth(1) {
+                ex.open_arg(&arg);
+            }
             ex.hwnd = hwnd;
             ex.apply_frame_theme();
             // Hand the OS window handle to the system tray so it can show /
@@ -366,29 +373,16 @@ impl eframe::App for Explorer {
                         }
                     });
                     ui.separator();
-                    ui.label(t("右键菜单"));
-                    ui.horizontal(|ui| {
-                        if ui
-                            .button(t("打开脚本目录"))
-                            .on_hover_text(t("右键菜单由脚本注册，不在程序启动时自动改注册表"))
-                            .clicked()
-                        {
-                            self.open_ctx_menu_scripts();
-                        }
-                        let state = if self.ctx_menu {
-                            t("已安装")
-                        } else {
-                            t("未安装")
-                        };
-                        ui.colored_label(
-                            if self.ctx_menu {
-                                egui::Color32::from_rgb(120, 200, 120)
-                            } else {
-                                ui.visuals().weak_text_color()
-                            },
-                            state,
-                        );
-                    });
+                    ui.label(t("集成"));
+                    // A real on/off switch: writes HKCU\Software\Classes, which
+                    // needs no administrator rights and never prompts UAC.
+                    if ui
+                        .checkbox(&mut self.ctx_menu, t("通过 MarinExplorer 打开（右键菜单）"))
+                        .on_hover_text(t("在文件、文件夹、磁盘和文件夹空白处右键菜单里显示此项；只对当前用户生效，不需要管理员权限"))
+                        .clicked()
+                    {
+                        self.set_ctx_menu(self.ctx_menu);
+                    }
                     ui.separator();
                     ui.label(t("语言"));
                     egui::ComboBox::from_id_salt("lang_select")

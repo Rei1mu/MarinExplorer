@@ -15,7 +15,17 @@
 
 ### 运行
 
-直接启动 `MarinExplorer.exe`。首次打开会读取并缓存磁盘信息，之后都很快。
+**安装包（推荐）**：从 **Releases** 下载 `MarinExplorer-Setup-<版本>.exe`，一路「下一步」即可。安装向导提供三个选项：
+
+- ☑ 加入开始菜单（默认勾选）
+- ☑ 在右键菜单中加入「通过 MarinExplorer 打开」（默认勾选）
+- ☐ 创建桌面快捷方式
+
+安装目录可自行更改，默认是 `%LOCALAPPDATA%\Programs\MarinExplorer`。之所以不用 Program Files：MarinExplorer 把文件夹大小缓存写在**自己的安装目录**里以保持自包含，而 Program Files 没有管理员权限就写不进去。若希望完全不碰 C 盘，安装时改成 `D:\Programs\MarinExplorer` 之类即可。
+
+**绿色免安装**：也可以直接下载 `MarinExplorer-x64-gnu.exe`，放到任意位置运行。右键菜单的开关就摆在**设置**里，随时可以自己打开或关掉。
+
+首次打开会读取并缓存磁盘信息，之后都很快。
 
 💡 **建议以管理员身份运行**：访问受保护的系统目录、写入系统路径时，管理员权限能避免因权限不足导致的功能受限。
 
@@ -52,9 +62,10 @@
 - 从面板**拖出文件**到外部程序。
 - 使用系统**真实文件图标**（shell icon），而不是自己画一套。
 - 支持 Windows 原生：深色标题栏、应用图标、系统托盘常驻。
+- **右键菜单集成**：「通过 MarinExplorer 打开」可出现在文件、文件夹、磁盘以及文件夹空白处，开关在设置里（也由安装包代为注册）。只写 `HKCU` 当前用户 hive，**不需要管理员权限**，随时可关。
 
 **性能与体验**
-- 文件夹大小在**后台线程**计算，并持久化到磁盘（`%APPDATA%\rust-explorer\store.txt`），重开即秒显。
+- 文件夹大小在**后台线程**计算，并持久化到磁盘（`<安装目录>\MarinExplorer\store.txt`，即 `.exe` 所在文件夹内），重开即秒显。程序不会往系统盘或用户目录里丢任何东西；只有安装目录不可写时（例如装在系统保护区）才回退到 `%LOCALAPPDATA%\MarinExplorer`。
 - 底部状态栏：状态、当前路径、条目数、任务进度。
 - 多语言界面：**简体中文 / English / 日本語 / 繁體中文**。
 - 亮色 / 暗色主题；中文用 **Windows 系统字体**（微软雅黑优先，运行时从 `%WINDIR%\Fonts` 加载，不打包进 exe），观感与系统一致且不乱码。
@@ -133,7 +144,17 @@ A **lightweight, Windows-on-ARM64-capable, Rust + [egui](https://github.com/emil
 
 ### Usage
 
-Just launch `MarinExplorer.exe`. The first open reads and caches disk info; afterwards it's fast.
+**Installer (recommended)**: download `MarinExplorer-Setup-<version>.exe` from **Releases** and click through. The wizard offers three options:
+
+- ☑ Add to Start menu (checked by default)
+- ☑ Add "Open with MarinExplorer" to the right-click menu (checked by default)
+- ☐ Create a desktop shortcut
+
+You may change the install directory; the default is `%LOCALAPPDATA%\Programs\MarinExplorer`. Program Files is deliberately not the default: MarinExplorer keeps its folder-size cache **inside its own install directory** to stay self-contained, and Program Files is not writable without elevation. If you want nothing on `C:`, point the installer at something like `D:\Programs\MarinExplorer`.
+
+**Portable**: you can also just download `MarinExplorer-x64-gnu.exe` and run it from anywhere. The context-menu switch lives in **Settings**, so you can turn it on or off at any time.
+
+The first open reads and caches disk info; afterwards it's fast.
 
 💡 **Run as Administrator** is recommended: it avoids permission errors when reaching protected system folders or writing to system paths.
 
@@ -170,9 +191,10 @@ Current form: a Rust + egui Windows desktop file manager focused on "works and f
 - Drag files **out** of a panel into other apps.
 - Uses the system's **real file icons** (shell icons), not a hand-drawn set.
 - Native Windows: dark title bar, app icon, system tray resident.
+- **Right-click menu integration**: "Open with MarinExplorer" can appear on files, folders, drives and empty folder space, toggled from Settings (and registered for you by the installer). It only writes the current-user `HKCU` hive — **no administrator rights**, and it can be switched off at any time.
 
 **Performance & UX**
-- Folder sizes computed in a **background thread** and persisted (`%APPDATA%\rust-explorer\store.txt`) for instant reload.
+- Folder sizes computed in a **background thread** and persisted to disk (`<install dir>\MarinExplorer\store.txt`, i.e. right next to the `.exe`) for instant reload. Nothing is written to the system drive or your user profile; only if the install directory is not writable does it fall back to `%LOCALAPPDATA%\MarinExplorer`.
 - Status bar: state, current path, item count, task progress.
 - UI languages: Simplified Chinese / English / Japanese / Traditional Chinese.
 - Light / dark theme; Chinese uses the **Windows system font** (Microsoft YaHei first, loaded at runtime from `%WINDIR%\Fonts` — not bundled), so it matches the OS look and never mojibakes.

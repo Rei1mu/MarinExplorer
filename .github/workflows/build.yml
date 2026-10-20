@@ -129,8 +129,49 @@ jobs:
           path: MarinExplorer-arm64.exe
           if-no-files-found: error
 
-      - name: Upload to GitHub Release
+  # Packages the GNU x64 build into a real Windows installer with Inno Setup.
+  # It needs no local tooling — the runner installs Inno Setup via winget.
+  installer:
+    name: Windows installer
+    runs-on: windows-latest
+    needs: build-gnu-x86_64
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Download the GNU x64 build
+        uses: actions/download-artifact@v7
+        with:
+          name: MarinExplorer-x64-gnu
+          path: target/x86_64-pc-windows-gnu/release
+
+      - name: Install Inno Setup
+        run: winget install --id JRSoftware.InnoSetup.7 -e --accept-source-agreements --accept-package-agreements --disable-interactivity
+
+      - name: Resolve version
+        id: ver
+        shell: pwsh
+        run: |
+          $v = if ($env:GITHUB_REF -like 'refs/tags/v*') { $env:GITHUB_REF -replace 'refs/tags/v','' } else { '0.0.0-ci' }
+          "version=$v" >> $env:GITHUB_OUTPUT
+
+      - name: Build installer
+        shell: pwsh
+        run: |
+          $iscc = Get-ChildItem "$env:ProgramFiles","${env:ProgramFiles(x86)}","$env:LOCALAPPDATA\Programs" `
+                  -Filter ISCC.exe -Recurse -Depth 3 -ErrorAction SilentlyContinue |
+                  Select-Object -First 1
+          if (-not $iscc) { throw "ISCC.exe not found" }
+          & $iscc.FullName installer/marin.iss "/DMyAppVersion=${{ steps.ver.outputs.version }}" "/Oinstaller\Output"
+
+      - name: Upload installer artifact
+        uses: actions/upload-artifact@v7
+        with:
+          name: MarinExplorer-Setup
+          path: installer/Output/*.exe
+          if-no-files-found: error
+
+      - name: Upload installer to GitHub Release
         if: startsWith(github.ref, 'refs/tags/v')
         uses: softprops/action-gh-release@v3
         with:
-          files: MarinExplorer-arm64.exe
+          files: installer/Output/*.exe

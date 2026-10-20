@@ -152,9 +152,10 @@ pub struct Explorer {
     pub lang: crate::lang::Lang,
     /// UI font scale (1.0 = default). Persisted as `font_scale`.
     pub font_scale: f32,
-    /// Whether the Explorer context-menu entry is installed. Persisted as
-    /// `ctx_menu`; the actual registry write happens in the standalone
-    /// PowerShell script, never in the app itself.
+    /// Whether the Explorer context-menu entry ("通过 MarinExplorer 打开")
+    /// is registered under `HKCU\Software\Classes`. The value is re-read from
+    /// the registry whenever the toggle is used, so it reflects reality even
+    /// if something outside the app changed it.
     pub ctx_menu: bool,
     pub last_flush: Instant,
     /// Set every frame: true when the filter text-edit currently has focus.
@@ -281,7 +282,7 @@ impl Explorer {
             .unwrap_or(1.0)
             .clamp(0.8, 1.6);
         // Read-only probe of the actual registry state (the app never writes it).
-        let ctx_menu = crate::fs_util::context_menu_installed();
+        let ctx_menu = crate::shell::is_installed();
 
         let mut me = Self {
             tabs,
@@ -710,6 +711,11 @@ impl Explorer {
     pub fn set_lang(&mut self, lang: crate::lang::Lang) {
         self.lang = lang;
         self.store.set_meta("lang", lang.id());
+        // The context-menu text lives in the registry, written once at install
+        // time. Rewrite it so the menu follows the UI language.
+        if self.ctx_menu {
+            self.set_ctx_menu(true);
+        }
     }
 
     /// Switch light/dark and persist it.
@@ -725,26 +731,64 @@ impl Explorer {
         self.store.set_meta("font_scale", &format!("{:.2}", self.font_scale));
     }
 
-    /// Open the folder that holds the context-menu install/uninstall scripts.
+    /// Turn the "通过 MarinExplorer 打开" context menu on or off.
     ///
-    /// The app itself never writes `HKCU\Software\Classes` — an unsigned
-    /// binary doing that quietly is a pattern security tools flag. The
-    /// registry change is done by the explicit PowerShell script the user
-    /// launches from that folder.
-    pub fn open_ctx_menu_scripts(&mut self) {
-        match crate::fs_util::open_context_menu_script_dir() {
-            Some(dir) => {
-                self.status = crate::lang::tr("已打开脚本所在目录，右键“右键菜单-安装.ps1”运行", self.lang)
-                    .into();
-                let _ = dir;
+    /// Writes `HKCU\Software\Classes` — the per-user hive, so this works
+    /// without administrator rights and never prompts UAC. Anything that goes
+    /// wrong is reported in the status bar instead of failing silently.
+    pub fn set_ctx_menu(&mut self, on: bool) {
+        let label = crate::lang::tr("通过 MarinExplorer 打开", self.lang);
+        let result = if on {
+            crate::shell::install(&label)
+        } else {
+            crate::shell::uninstall()
+        };
+        match result {
+            Ok(()) => {
+                self.ctx_menu = crate::shell::is_installed();
+                self.status = if self.ctx_menu {
+                    crate::lang::tr("右键菜单已添加", self.lang).into()
+                } else {
+                    crate::lang::tr("右键菜单已移除", self.lang).into()
+                };
             }
-            None => {
-                self.status = crate::lang::tr("找不到脚本所在目录", self.lang).into();
+            Err(e) => {
+                // Re-read the real state so the badge is honest even after a
+                // partial failure.
+                self.ctx_menu = crate::shell::is_installed();
+                self.status = format!("{}: {}", crate::lang::tr("右键菜单操作失败", self.lang), e);
             }
         }
-        // Re-read the (read-only) registry state so the badge is accurate if
-        // the user ran the script in the meantime.
-        self.ctx_menu = crate::fs_util::context_menu_installed();
+    }
+
+    /// Open a path handed to us on the command line (Explorer context menu,
+    /// drag-and-drop onto the exe, `start MarinExplorer D:\`). Directories are
+    /// opened directly; for a file we open its parent and select the file,
+    /// which is what users expect from "open this file's folder".
+    pub fn open_arg(&mut self, arg: &str) {
+        let raw = arg.trim_matches('"');
+        let p = std::path::PathBuf::from(raw);
+        if p.is_dir() {
+            self.pane_of(true).navigate(p);
+        } else if p.is_file() {
+            match p.parent() {
+                Some(parent) => {
+                    let parent = parent.to_path_buf();
+                    self.pane_of(true).navigate(parent);
+                }
+                None => return,
+            }
+            if let Some(name) = p.file_name().map(|n| n.to_string_lossy().to_string()) {
+                let panel = self.pane_of(true);
+                // Only select it if it really got listed (a filter could hide
+                // it, or the folder may have failed to read).
+                if panel.entries.iter().any(|e| e.name == name) {
+                    panel.selected = Some(name.clone());
+                    panel.multi = std::iter::once(name).collect();
+                }
+            }
+        }
+        self.apply_cached_sizes();
     }
 
     /// Repaint the OS window frame (title bar + border) to match the theme.

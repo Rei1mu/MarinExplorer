@@ -14,20 +14,43 @@ use std::path::{Path, PathBuf};
 
 use crate::fs_util::{percent_decode, percent_encode};
 
-pub const CACHE_SUBDIR: &str = "rust-explorer";
+pub const CACHE_SUBDIR: &str = "MarinExplorer";
 pub const STORE_FILE: &str = "store.txt";
 
-/// Where the store lives. APPDATA on Windows, `~/.config` elsewhere.
+/// Where the store lives.
+///
+/// Preferred location is **next to the running executable** (`<exe dir>/
+/// MarinExplorer/store.txt`), so the app stays self-contained: nothing is
+/// scattered into the user profile, and installing to another drive moves
+/// everything with it.
+///
+/// If that directory is not writable — a machine-wide install under Program
+/// Files, typically — we fall back to the per-user data directory.
 pub fn cache_dir() -> PathBuf {
-    let base = std::env::var("APPDATA")
+    if let Some(exe) = crate::fs_util::exe_dir() {
+        let candidate = exe.join(CACHE_SUBDIR);
+        if is_writable(&candidate) {
+            return candidate;
+        }
+    }
+    let base = std::env::var("LOCALAPPDATA")
+        .or_else(|_| std::env::var("APPDATA"))
         .map(PathBuf::from)
-        .or_else(|_| {
-            std::env::var("HOME")
-                .map(PathBuf::from)
-                .map(|h| h.join(".config"))
-        })
+        .or_else(|_| std::env::var("HOME").map(|h| PathBuf::from(h).join(".config")))
         .unwrap_or_else(|_| PathBuf::from("."));
     base.join(CACHE_SUBDIR)
+}
+
+/// True when `dir` exists (or can be created) and accepts writes. Probing once
+/// at startup is cheap; assuming write access and failing later is not.
+fn is_writable(dir: &Path) -> bool {
+    if fs::create_dir_all(dir).is_err() {
+        return false;
+    }
+    let probe = dir.join(".w");
+    let ok = fs::write(&probe, b"").is_ok();
+    let _ = fs::remove_file(&probe);
+    ok
 }
 
 pub struct Store {
