@@ -151,7 +151,8 @@ jobs:
         id: ver
         shell: pwsh
         run: |
-          $v = if ($env:GITHUB_REF -like 'refs/tags/v*') { $env:GITHUB_REF -replace 'refs/tags/v','' } else { '0.0.0-ci' }
+          # Keep this numeric: it feeds VersionInfoVersion in the .iss.
+          $v = if ($env:GITHUB_REF -like 'refs/tags/v*') { $env:GITHUB_REF -replace 'refs/tags/v','' } else { '0.0.0' }
           "version=$v" >> $env:GITHUB_OUTPUT
 
       - name: Build installer

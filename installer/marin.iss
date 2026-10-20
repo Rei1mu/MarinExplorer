@@ -12,6 +12,15 @@
   #define MyAppVersion "0.1.0"
 #endif
 
+; `VersionInfoVersion` must be strictly numeric (x[.x.x.x]), while a display
+; version may carry a suffix ("1.2.3-beta"). Strip anything from "-" onwards so
+; a pre-release tag can never break the build.
+#if Pos("-", MyAppVersion) > 0
+  #define MyNumericVersion Copy(MyAppVersion, 1, Pos("-", MyAppVersion) - 1)
+#else
+  #define MyNumericVersion MyAppVersion
+#endif
+
 #define MyAppName "MarinExplorer"
 #define MyAppPublisher "Rei1mu"
 #define MyAppURL "https://github.com/Rei1mu/MarinExplorer"
@@ -29,7 +38,7 @@ AppPublisher={#MyAppPublisher}
 AppPublisherURL={#MyAppURL}
 AppSupportURL={#MyAppURL}/issues
 AppUpdatesURL={#MyAppURL}/releases
-VersionInfoVersion={#MyAppVersion}
+VersionInfoVersion={#MyNumericVersion}
 
 ; Default install location: the per-user "Programs" directory.
 ; Why not Program Files: MarinExplorer keeps its own store (folder-size cache)
