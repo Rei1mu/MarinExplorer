@@ -1,10 +1,13 @@
 name: Build
 
-# MarinExplorer targets Windows only:
-#   - x86_64-pc-windows-gnu    (standard Windows x64, MinGW-w64 / llvm-mingw)
-#   - aarch64-pc-windows-msvc  (Windows on ARM64, e.g. Surface / Snapdragon, MSVC)
-# Each artifact is a Windows .exe. The GNU build runs on Linux (MinGW-w64/GCC);
-# the ARM64 build runs on a Windows runner using the native MSVC cross-tools.
+# MarinExplorer targets Windows only, and ships three editions:
+#   - x86_64-pc-windows-gnu    standard Windows x64, MinGW-w64/GCC, built on Linux
+#   - x86_64-pc-windows-msvc   standard Windows x64, MSVC, built on a Windows runner
+#   - aarch64-pc-windows-msvc  Windows on ARM64, MSVC, built on a Windows runner
+#
+# Both x64 editions run on any ordinary 64-bit Windows PC. They differ only in
+# how they were compiled: GNU links the MinGW runtime, MSVC links Microsoft's
+# (statically here — see the RUSTFLAGS below, so no redistributable needed).
 on:
   push:
     branches: [main]
@@ -15,9 +18,15 @@ on:
 permissions:
   contents: write
 
+env:
+  # Link the MSVC C runtime statically, so the .exe starts on a clean Windows
+  # install that has no "Visual C++ Redistributable" present.
+  CARGO_TARGET_X86_64_PC_WINDOWS_MSVC_RUSTFLAGS: "-C target-feature=+crt-static"
+  CARGO_TARGET_AARCH64_PC_WINDOWS_MSVC_RUSTFLAGS: "-C target-feature=+crt-static"
+
 jobs:
   build-gnu-x86_64:
-    name: Windows x86_64 (GNU)
+    name: Windows x64 (GNU)
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -37,20 +46,57 @@ jobs:
         run: cargo build --release --target x86_64-pc-windows-gnu
 
       - name: Stage artifact
-        run: cp "target/x86_64-pc-windows-gnu/release/MarinExplorer.exe" "MarinExplorer-x86_64.exe"
+        run: cp "target/x86_64-pc-windows-gnu/release/MarinExplorer.exe" "MarinExplorer-x64-gnu.exe"
 
       - name: Upload build artifact
         uses: actions/upload-artifact@v4
         with:
-          name: MarinExplorer-x86_64
-          path: MarinExplorer-x86_64.exe
+          name: MarinExplorer-x64-gnu
+          path: MarinExplorer-x64-gnu.exe
           if-no-files-found: error
 
       - name: Upload to GitHub Release
         if: startsWith(github.ref, 'refs/tags/v')
         uses: softprops/action-gh-release@v2
         with:
-          files: MarinExplorer-x86_64.exe
+          files: MarinExplorer-x64-gnu.exe
+
+  build-msvc-x86_64:
+    name: Windows x64 (MSVC)
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Rust
+        uses: dtolnay/rust-toolchain@v1
+        with:
+          toolchain: stable
+          targets: x86_64-pc-windows-msvc
+
+      - name: Build release
+        shell: cmd
+        run: |
+          for /f "usebackq tokens=*" %%i in (`"%ProgramFiles(x86)%\Microsoft Visual Studio\Installer\vswhere.exe" -latest -property installationPath`) do set VS=%%i
+          if not defined VS (echo "Visual Studio not found" && exit /b 1)
+          call "%VS%\VC\Auxiliary\Build\vcvarsall.bat" x64
+          cargo build --release --target x86_64-pc-windows-msvc
+
+      - name: Stage artifact
+        shell: pwsh
+        run: Copy-Item "target/x86_64-pc-windows-msvc/release/MarinExplorer.exe" "MarinExplorer-x64-msvc.exe"
+
+      - name: Upload build artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: MarinExplorer-x64-msvc
+          path: MarinExplorer-x64-msvc.exe
+          if-no-files-found: error
+
+      - name: Upload to GitHub Release
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: MarinExplorer-x64-msvc.exe
 
   build-msvc-arm64:
     name: Windows ARM64 (MSVC)

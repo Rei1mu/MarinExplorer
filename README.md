@@ -62,9 +62,10 @@ MarinExplorer 是一个典型的 **vibe coding** 产物——它不是一个先�
 
 ### 构建
 
-需要 Rust 工具链。本项目只产出 **Windows** 可执行文件，两个目标：
+需要 Rust 工具链。本项目只产出 **Windows** 可执行文件，三个目标：
 
-- `x86_64-pc-windows-gnu` —— 标准 Windows x64，使用 MinGW-w64。
+- `x86_64-pc-windows-gnu` —— 标准 Windows x64，使用 MinGW-w64（GCC）。
+- `x86_64-pc-windows-msvc` —— 标准 Windows x64，使用 MSVC。
 - `aarch64-pc-windows-msvc` —— Windows on ARM64（如 Surface / 骁龙笔记本），使用 MSVC。
 
 ```bash
@@ -74,27 +75,45 @@ cargo build --release
 # Windows x64（gnu）
 cargo build --release --target x86_64-pc-windows-gnu
 
+# Windows x64（msvc）
+cargo build --release --target x86_64-pc-windows-msvc
+
 # Windows on ARM64（msvc）
 cargo build --release --target aarch64-pc-windows-msvc
 ```
 
 产物：
 - `target/x86_64-pc-windows-gnu/release/MarinExplorer.exe`
+- `target/x86_64-pc-windows-msvc/release/MarinExplorer.exe`
 - `target/aarch64-pc-windows-msvc/release/MarinExplorer.exe`
+
+**GNU 版和 MSVC 版有什么区别？**
+
+两个 x64 版本能在同一台普通 64 位 Windows 上跑，功能完全一致，区别只在"怎么编出来的"：
+
+| | GNU（MinGW-w64） | MSVC |
+|---|---|---|
+| C 运行时 | MinGW 自带（libgcc / winpthread + 系统 msvcrt） | 微软运行时，CI 已静态链接（`-C target-feature=+crt-static`） |
+| 要装 VC++ 运行库吗 | 不需要 | 不需要（已静态链接进去） |
+| exe 文件图标 | 有（内嵌，`build.rs` 用 windres 编进资源） | 无（显示系统默认图标；窗口/任务栏图标照常） |
+| 调试生态 | GCC / DWARF | Visual Studio / WinDbg / PDB |
+| 与 C 库互操作 | 只能链 MinGW 的 `.a` | 只能链 MSVC 的 `.lib` |
 
 说明：
 - 发布构建已为体积优化（`opt-level = "z"` + LTO + strip）。
-- 应用图标由 `build.rs` 把 `logo.ico` 编译进 Windows 资源（仅 x86_64-gnu；arm64-msvc 构建不带内嵌文件图标，但不影响运行）。
+- 应用图标由 `build.rs` 把 `logo.ico` 编译进 Windows 资源，只作用于 `x86_64-pc-windows-gnu`；两个 MSVC 产物不带内嵌文件图标，但不影响运行。
 - 代码签名（可选）见 `sign.ps1`：用受信任 CA 的 `.pfx` 给 exe 签名 + 时间戳，消除 SmartScreen 拦截。
+- 普通用户直接用 **GNU 版**即可（有文件图标、无运行时依赖）。只有要接入 MSVC 编译的库、或要用 VS / WinDbg 调试时，才必须选 MSVC 版。
 
 ### 自动构建（GitHub Actions）
 
-仓库已在每次推送 `main` 时通过 GitHub Actions 自动编译 **两个 Windows 版本**（x86_64 在 Linux 上用 MinGW-w64（GCC）交叉编译，arm64 在 Windows runner 上用原生 MSVC 交叉编译，产物全是 Windows `.exe`）：
+仓库已在每次推送 `main` 时通过 GitHub Actions 自动编译 **三个 Windows 版本**（GNU x64 在 Linux 上用 MinGW-w64（GCC）交叉编译；两个 MSVC 版本在 Windows runner 上用原生 MSVC 工具链编译，产物全是 Windows `.exe`）：
 
-- `x86_64-pc-windows-gnu`（标准 Windows x64）
-- `aarch64-pc-windows-msvc`（Windows on ARM64）
+- `x86_64-pc-windows-gnu`（标准 Windows x64，GNU）
+- `x86_64-pc-windows-msvc`（标准 Windows x64，MSVC）
+- `aarch64-pc-windows-msvc`（Windows on ARM64，MSVC）
 
-工作流见 [`.github/workflows/build.yml`](.github/workflows/build.yml)。两个产物名为 `MarinExplorer-x86_64.exe` 与 `MarinExplorer-arm64.exe`，可在 **Actions → 对应运行 → Artifacts** 下载；打 `v*` 标签推送时会自动发布到 **Releases**。
+工作流见 [`.github/workflows/build.yml`](.github/workflows/build.yml)。三个产物名为 `MarinExplorer-x64-gnu.exe`、`MarinExplorer-x64-msvc.exe` 与 `MarinExplorer-arm64.exe`，可在 **Actions → 对应运行 → Artifacts** 下载；打 `v*` 标签推送时会自动发布到 **Releases**。
 
 ### 运行
 
@@ -167,9 +186,10 @@ Current form: a Rust + egui Windows desktop file manager focused on "works and f
 
 ### Build
 
-Requires the Rust toolchain. This project builds **Windows** executables only, for two targets:
+Requires the Rust toolchain. This project builds **Windows** executables only, for three targets:
 
-- `x86_64-pc-windows-gnu` — standard Windows x64, built with MinGW-w64.
+- `x86_64-pc-windows-gnu` — standard Windows x64, built with MinGW-w64 (GCC).
+- `x86_64-pc-windows-msvc` — standard Windows x64, built with MSVC.
 - `aarch64-pc-windows-msvc` — Windows on ARM64 (e.g. Surface / Snapdragon laptops), built with MSVC.
 
 ```bash
@@ -179,27 +199,45 @@ cargo build --release
 # Windows x64 (gnu)
 cargo build --release --target x86_64-pc-windows-gnu
 
+# Windows x64 (msvc)
+cargo build --release --target x86_64-pc-windows-msvc
+
 # Windows on ARM64 (msvc)
 cargo build --release --target aarch64-pc-windows-msvc
 ```
 
 Artifacts:
 - `target/x86_64-pc-windows-gnu/release/MarinExplorer.exe`
+- `target/x86_64-pc-windows-msvc/release/MarinExplorer.exe`
 - `target/aarch64-pc-windows-msvc/release/MarinExplorer.exe`
+
+**How do the GNU and MSVC builds differ?**
+
+Both x64 editions run on the same ordinary 64-bit Windows PC and are functionally identical — they differ only in how they were compiled:
+
+| | GNU (MinGW-w64) | MSVC |
+|---|---|---|
+| C runtime | MinGW's own (libgcc / winpthread + system msvcrt) | Microsoft's, linked **statically** in CI (`-C target-feature=+crt-static`) |
+| Needs VC++ redistributable | No | No (statically linked in) |
+| exe file icon | Yes (embedded by `build.rs` via windres) | No (system default icon; window/taskbar icon still fine) |
+| Debug ecosystem | GCC / DWARF | Visual Studio / WinDbg / PDB |
+| C interop | Links MinGW `.a` only | Links MSVC `.lib` only |
 
 Notes:
 - Release builds are size-optimized (`opt-level = "z"` + LTO + strip).
-- The app icon is embedded via `build.rs` (x86_64-gnu only; the arm64-msvc build ships without a bundled file icon, but runs fine).
+- The app icon is embedded by `build.rs` for `x86_64-pc-windows-gnu` only; the two MSVC artifacts ship without a bundled file icon, but run fine.
 - Optional code signing lives in `sign.ps1`.
+- For everyday use just take the **GNU build** (file icon, no runtime dependency). You only need the MSVC build to link MSVC-compiled libraries, or to debug with VS / WinDbg.
 
 ### Automated Builds (GitHub Actions)
 
-On every push to `main`, GitHub Actions automatically builds **both Windows editions** (x86_64 is cross-compiled on Linux with MinGW-w64 (GCC); arm64 is cross-compiled on a Windows runner with the native MSVC tools — every artifact is a Windows `.exe`):
+On every push to `main`, GitHub Actions automatically builds **three Windows editions** (GNU x64 is cross-compiled on Linux with MinGW-w64 (GCC); both MSVC editions are built on a Windows runner with the native MSVC toolchain — every artifact is a Windows `.exe`):
 
-- `x86_64-pc-windows-gnu` (standard Windows x64)
-- `aarch64-pc-windows-msvc` (Windows on ARM64)
+- `x86_64-pc-windows-gnu` (standard Windows x64, GNU)
+- `x86_64-pc-windows-msvc` (standard Windows x64, MSVC)
+- `aarch64-pc-windows-msvc` (Windows on ARM64, MSVC)
 
-Workflow: [`.github/workflows/build.yml`](.github/workflows/build.yml). The two artifacts are `MarinExplorer-x86_64.exe` and `MarinExplorer-arm64.exe`, downloadable from **Actions → run → Artifacts**; pushing a `v*` tag also publishes them to **Releases**.
+Workflow: [`.github/workflows/build.yml`](.github/workflows/build.yml). The three artifacts are `MarinExplorer-x64-gnu.exe`, `MarinExplorer-x64-msvc.exe` and `MarinExplorer-arm64.exe`, downloadable from **Actions → run → Artifacts**; pushing a `v*` tag also publishes them to **Releases**.
 
 ### Usage
 
