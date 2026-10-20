@@ -2,7 +2,7 @@
 name = "MarinExplorer"
 version = "0.1.0"
 edition = "2021"
-description = "A small, multi-platform, egui-based two-pane file manager"
+description = "A lightweight Windows two-pane file manager (x86_64 + ARM64), built with Rust + egui"
 build = "build.rs"
 
 [dependencies]

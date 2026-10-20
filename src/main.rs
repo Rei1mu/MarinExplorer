@@ -1,4 +1,4 @@
-//! MarinExplorer: a small, multi-platform, egui-based file resource manager.
+//! MarinExplorer: a lightweight Windows two-pane file manager (x86_64 + ARM64), built with Rust + egui.
 //!
 //! Layout:
 //!   - Top toolbar : Back / Forward / Up / Refresh / Copy / Move / Paste /
