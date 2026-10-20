@@ -144,6 +144,17 @@ jobs:
           name: MarinExplorer-x64-gnu
           path: target/x86_64-pc-windows-gnu/release
 
+      # The artifact keeps the published name; the .iss expects MarinExplorer.exe.
+      - name: Stage payload
+        shell: pwsh
+        run: |
+          $d = "target\x86_64-pc-windows-gnu\release"
+          Get-ChildItem $d | Select-Object -ExpandProperty Name
+          Get-ChildItem $d -Filter *.exe | ForEach-Object {
+            Rename-Item $_.FullName -NewName MarinExplorer.exe -Force
+          }
+          if (-not (Test-Path "$d\MarinExplorer.exe")) { throw "payload exe missing" }
+
       - name: Install Inno Setup
         run: winget install --id JRSoftware.InnoSetup.7 -e --accept-source-agreements --accept-package-agreements --disable-interactivity
 
