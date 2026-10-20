@@ -1,0 +1,14 @@
+# Linking setup for the x86_64-pc-windows-gnu target on this machine.
+# The MinGW-W64 toolchain supplies the Windows import libraries (shlwapi, …)
+# that some crates (windows/accesskit/webbrowser) link against. Point the
+# linker + lib search at the local mingw-w64 install so `cargo build` works
+# without extra env vars. Adjust the paths if your mingw lives elsewhere.
+#
+# NOTE: cargo is a native Windows binary, so these must be Windows-style
+# paths ("D:/…"), not MSYS paths ("/d/…") — the latter resolve to "C:/d/…".
+[target.x86_64-pc-windows-gnu]
+linker = "D:/d/mingw64b/mingw64/bin/x86_64-w64-mingw32-gcc.exe"
+rustflags = [
+  "-LD:/d/mingw64b/mingw64/x86_64-w64-mingw32/lib",
+  "-LD:/d/mingw64b/mingw64/lib",
+]
