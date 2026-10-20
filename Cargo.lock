@@ -11,6 +11,7 @@ dependencies = [
  "image",
  "png",
  "raw-window-handle",
+ "ttf-parser",
 ]
 
 [[package]]

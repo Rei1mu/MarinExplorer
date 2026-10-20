@@ -55,7 +55,7 @@ MarinExplorer 是一个典型的 **vibe coding** 产物——它不是一个先�
 - 文件夹大小在**后台线程**计算，并持久化到磁盘（`%APPDATA%\rust-explorer\store.txt`），重开即秒显。
 - 底部状态栏：状态、当前路径、条目数、任务进度。
 - 多语言界面：**简体中文 / English / 日本語 / 繁體中文**。
-- 亮色 / 暗色主题；中文字体回退（Noto Sans SC，已打包进 exe），中文不乱码。
+- 亮色 / 暗色主题；中文用 **Windows 系统字体**（微软雅黑优先，运行时从 `%WINDIR%\Fonts` 加载，不打包进 exe），观感与系统一致且不乱码。
 
 **键盘**
 `↑/↓` 选择 · `Enter` 打开 · `Home/End` 跳首尾 · `Delete` 删除 · `Alt+←/→` 后退/前进 · `Esc` 关闭弹窗。
@@ -160,7 +160,7 @@ Current form: a Rust + egui Windows desktop file manager focused on "works and f
 - Folder sizes computed in a **background thread** and persisted (`%APPDATA%\rust-explorer\store.txt`) for instant reload.
 - Status bar: state, current path, item count, task progress.
 - UI languages: Simplified Chinese / English / Japanese / Traditional Chinese.
-- Light / dark theme; CJK font fallback (Noto Sans SC, bundled in the exe) so Chinese never mojibakes.
+- Light / dark theme; Chinese uses the **Windows system font** (Microsoft YaHei first, loaded at runtime from `%WINDIR%\Fonts` — not bundled), so it matches the OS look and never mojibakes.
 
 **Keyboard**
 `↑/↓` select · `Enter` open · `Home/End` jump to top/bottom · `Delete` delete · `Alt+←/→` back/forward · `Esc` close dialog.

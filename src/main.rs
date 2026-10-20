@@ -106,23 +106,24 @@ fn main() -> eframe::Result {
         ..Default::default()
     };
 
-    // 注册中文字体（Noto Sans SC），避免中文显示为方口/乱码。
-    // 追加到字体族末尾作为回退：拉丁字符仍用默认字体，缺字形的中文字符回退到 Noto Sans SC。
+    // 中文字体：运行时从 Windows 字体目录加载系统自带字体（微软雅黑优先）。
+    // 不把字体文件打包进 exe（省掉 ~8MB），中文观感也与 Windows 原生 UI 一致。
     let mut fonts = egui::FontDefinitions::default();
-    fonts.font_data.insert(
-        "noto_sc".to_owned(),
-        egui::FontData::from_static(include_bytes!("../assets/fonts/NotoSansSC-Regular.otf")).into(),
-    );
-    fonts
-        .families
-        .get_mut(&egui::FontFamily::Proportional)
-        .unwrap()
-        .push("noto_sc".to_owned());
-    fonts
-        .families
-        .get_mut(&egui::FontFamily::Monospace)
-        .unwrap()
-        .push("noto_sc".to_owned());
+    if let Some((_name, data)) = load_windows_cjk_font() {
+        fonts
+            .font_data
+            .insert("cjk".to_owned(), std::sync::Arc::new(data));
+        fonts
+            .families
+            .get_mut(&egui::FontFamily::Proportional)
+            .unwrap()
+            .push("cjk".to_owned());
+        fonts
+            .families
+            .get_mut(&egui::FontFamily::Monospace)
+            .unwrap()
+            .push("cjk".to_owned());
+    }
 
     // The native window handle, grabbed once here: it is what lets us repaint
     // the OS title bar to match the in-app dark theme.
@@ -154,6 +155,49 @@ fn main() -> eframe::Result {
             Ok::<_, Box<dyn std::error::Error + Send + Sync>>(Box::new(ex))
         }),
     )
+}
+
+/// CJK font, loaded at runtime from the Windows font directory — Microsoft YaHei
+/// first. We deliberately do *not* bundle a font file: that costs ~8MB of exe
+/// size, and the system font also matches the native Windows look.
+///
+/// egui ships no CJK glyphs at all (only Ubuntu-Light / Hack / NotoEmoji), so
+/// without this every Chinese character renders as an empty box.
+///
+/// epaint *panics* when handed a font file it cannot parse, so every candidate
+/// is validated with `ttf-parser` before it reaches egui; a missing or broken
+/// file simply moves us on to the next candidate.
+fn load_windows_cjk_font() -> Option<(&'static str, egui::FontData)> {
+    // (display name, file name inside %WINDIR%\Fonts, face index within a .ttc)
+    const CANDIDATES: &[(&str, &str, u32)] = &[
+        ("Microsoft YaHei", "msyh.ttc", 0),
+        ("Microsoft YaHei UI", "msyhui.ttc", 0),
+        ("DengXian", "Deng.ttf", 0),
+        ("SimHei", "simhei.ttf", 0),
+        ("SimSun", "simsun.ttc", 0),
+    ];
+
+    let windir = std::env::var("WINDIR")
+        .or_else(|_| std::env::var("SystemRoot"))
+        .unwrap_or_else(|_| "C:\\Windows".to_owned());
+    let dir = std::path::PathBuf::from(windir).join("Fonts");
+
+    for &(name, file, index) in CANDIDATES {
+        let path = dir.join(file);
+        let Ok(bytes) = std::fs::read(&path) else {
+            continue;
+        };
+        if ttf_parser::Face::parse(&bytes, index).is_err() {
+            continue;
+        }
+        let mut data = egui::FontData::from_owned(bytes);
+        data.index = index;
+        eprintln!("[font] CJK: {name} ({file})");
+        return Some((name, data));
+    }
+
+    eprintln!("[font] warning: no Windows CJK font found; Chinese may render as boxes");
+    None
 }
 
 /// Window / taskbar icon, decoded straight from the multi-size `logo.ico`
