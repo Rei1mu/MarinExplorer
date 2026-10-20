@@ -1,6 +1,6 @@
 [package]
 name = "MarinExplorer"
-version = "0.1.0"
+version = "0.1.2"
 edition = "2021"
 description = "A lightweight Windows two-pane file manager (x86_64 + ARM64), built with Rust + egui"
 build = "build.rs"
