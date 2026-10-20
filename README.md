@@ -17,7 +17,7 @@
 
 直接启动 `MarinExplorer.exe`。首次打开会读取并缓存磁盘信息，之后都很快。
 
-💡 **建议以管理员身份运行**：访问受保护的系统目录、写入系统路径、以及**安全弹出**移动设备时，管理员权限能避免权限不足导致的功能受限。
+💡 **建议以管理员身份运行**：访问受保护的系统目录、写入系统路径时，管理员权限能避免因权限不足导致的功能受限。
 
 🔒 **安全提醒**：请只从本仓库的 **Releases** 或官方构建渠道获取 `MarinExplorer.exe`。不要从不明来源下载，以免被植入木马或后门。
 
@@ -135,7 +135,7 @@ A **lightweight, Windows-on-ARM64-capable, Rust + [egui](https://github.com/emil
 
 Just launch `MarinExplorer.exe`. The first open reads and caches disk info; afterwards it's fast.
 
-💡 **Run as Administrator** is recommended: it avoids permission errors when reaching protected system folders, writing to system paths, or **safely ejecting** removable drives.
+💡 **Run as Administrator** is recommended: it avoids permission errors when reaching protected system folders or writing to system paths.
 
 🔒 **Security**: only download `MarinExplorer.exe` from this repo's **Releases** or official build artifacts. Do not fetch it from unknown sources — that's how trojans and backdoors get in.
 
