@@ -1,7 +1,0 @@
-name: Smoke
-on: [push]
-jobs:
-  hello:
-    runs-on: ubuntu-latest
-    steps:
-      - run: echo "actions works"

@@ -1,17 +1,41 @@
 name: Build
 
+# MarinExplorer targets Windows only:
+#   - x86_64-pc-windows-gnu    (standard Windows x64, MinGW-w64)
+#   - aarch64-pc-windows-msvc  (Windows on ARM64, e.g. Surface / Snapdragon, MSVC)
+# The CI runner is Linux, but every artifact is a Windows .exe.
 on:
   push:
     branches: [main]
+    tags: ['v*']
+  pull_request:
   workflow_dispatch:
+
+permissions:
+  contents: write
 
 jobs:
   build:
+    name: ${{ matrix.target }}
     runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        - target: x86_64-pc-windows-gnu
+          arch: x86_64
+          toolchain: gnu
+        - target: aarch64-pc-windows-msvc
+          arch: arm64
+          toolchain: msvc
+    env:
+      CARGO_TARGET_X86_64_PC_WINDOWS_GNU_LINKER: x86_64-w64-mingw32-gcc
+      CARGO_TARGET_X86_64_PC_WINDOWS_GNU_AR: x86_64-w64-mingw32-ar
+      CARGO_TARGET_X86_64_PC_WINDOWS_GNU_RUSTFLAGS: ""
     steps:
       - uses: actions/checkout@v4
 
-      - name: Install llvm-mingw
+      - name: Install llvm-mingw toolchain (GNU x86_64)
+        if: matrix.toolchain == 'gnu'
         run: |
           URL=$(curl -s https://api.github.com/repos/mstorsjo/llvm-mingw/releases/latest \
             | jq -r '.assets[] | select(.name | endswith("ubuntu-22.04-x86_64.tar.xz")) | .browser_download_url' | head -1)
@@ -21,18 +45,36 @@ jobs:
           tar -xJf llvm-mingw.tar.xz -C "$HOME/llvm-mingw" --strip-components=1
           echo "$HOME/llvm-mingw/bin" >> "$GITHUB_PATH"
 
-      - uses: dtolnay/rust-toolchain@v1
+      - name: Set up Rust
+        uses: dtolnay/rust-toolchain@v1
         with:
-          targets: x86_64-pc-windows-gnu
+          toolchain: stable
+          targets: ${{ matrix.target }}
 
-      - name: Build release (x86_64 gnu)
-        env:
-          CARGO_TARGET_X86_64_PC_WINDOWS_GNU_LINKER: x86_64-w64-mingw32-gcc
-          CARGO_TARGET_X86_64_PC_WINDOWS_GNU_AR: x86_64-w64-mingw32-ar
-        run: cargo build --release --target x86_64-pc-windows-gnu
+      - name: Install cargo-xwin (MSVC cross-build, arm64)
+        if: matrix.toolchain == 'msvc'
+        run: cargo install cargo-xwin --locked
 
-      - uses: actions/upload-artifact@v4
+      - name: Build release (GNU)
+        if: matrix.toolchain == 'gnu'
+        run: cargo build --release --target ${{ matrix.target }}
+
+      - name: Build release (MSVC via xwin)
+        if: matrix.toolchain == 'msvc'
+        run: cargo xwin build --release --target ${{ matrix.target }}
+
+      - name: Stage artifact with distinct name
+        run: cp "target/${{ matrix.target }}/release/MarinExplorer.exe" "MarinExplorer-${{ matrix.arch }}.exe"
+
+      - name: Upload build artifact
+        uses: actions/upload-artifact@v4
         with:
-          name: MarinExplorer-x86_64
-          path: target/x86_64-pc-windows-gnu/release/MarinExplorer.exe
+          name: MarinExplorer-${{ matrix.arch }}
+          path: MarinExplorer-${{ matrix.arch }}.exe
           if-no-files-found: error
+
+      - name: Upload to GitHub Release
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: MarinExplorer-${{ matrix.arch }}.exe
