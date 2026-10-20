@@ -13,6 +13,14 @@
 
 **仅支持 Windows**——`x86_64`（标准 Windows 64 位）与 `aarch64`（Windows on ARM64，如 Surface / 骁龙笔记本）。不提供 Linux 或 macOS 版本。
 
+### 运行
+
+直接启动 `MarinExplorer.exe`。首次打开会读取并缓存磁盘信息，之后都很快。
+
+💡 **建议以管理员身份运行**：访问受保护的系统目录、写入系统路径、以及**安全弹出**移动设备时，管理员权限能避免权限不足导致的功能受限。
+
+🔒 **安全提醒**：请只从本仓库的 **Releases** 或官方构建渠道获取 `MarinExplorer.exe`。不要从不明来源下载，以免被植入木马或后门。
+
 ### 它解决了什么
 
 1. **资源占用太大** — 资源管理器偏重。MarinExplorer 用 Rust + egui 自绘 UI，常驻内存远低于系统资源管理器，在内存吃紧的 ARM64 设备上差别尤其明显。
@@ -109,14 +117,6 @@ cargo build --release --target aarch64-pc-windows-msvc
 
 工作流见 [`.github/workflows/build.yml`](.github/workflows/build.yml)。三个产物名为 `MarinExplorer-x64-gnu.exe`、`MarinExplorer-x64-msvc.exe` 与 `MarinExplorer-arm64.exe`，可在 **Actions → 对应运行 → Artifacts** 下载；打 `v*` 标签推送时会自动发布到 **Releases**。
 
-### 运行
-
-直接启动 `MarinExplorer.exe`。首次打开会读取并缓存磁盘信息，之后都很快。
-
-💡 **建议以管理员身份运行**：访问受保护的系统目录、写入系统路径、以及正常弹出/弹出移动设备时，管理员权限能避免权限不足导致的功能受限。
-
-🔒 **安全提醒**：请只从本仓库的 **Releases** 或官方构建渠道获取 `MarinExplorer.exe`。不要从不明来源下载，以免被植入木马或后门。
-
 ### 许可证
 
 [MIT](./LICENSE) © 2026 Rei1mu
@@ -130,6 +130,14 @@ cargo build --release --target aarch64-pc-windows-msvc
 A **lightweight, Windows-on-ARM64-capable, Rust + [egui](https://github.com/emilk/egui) based two-pane file manager**.
 
 **Windows only** — `x86_64` (standard 64-bit Windows) and `aarch64` (Windows on ARM64, e.g. Surface / Snapdragon laptops). No Linux or macOS builds.
+
+### Usage
+
+Just launch `MarinExplorer.exe`. The first open reads and caches disk info; afterwards it's fast.
+
+💡 **Run as Administrator** is recommended: it avoids permission errors when reaching protected system folders, writing to system paths, or **safely ejecting** removable drives.
+
+🔒 **Security**: only download `MarinExplorer.exe` from this repo's **Releases** or official build artifacts. Do not fetch it from unknown sources — that's how trojans and backdoors get in.
 
 ### What It Fixes
 
@@ -226,14 +234,6 @@ On every push to `main`, GitHub Actions automatically builds **three Windows edi
 - `aarch64-pc-windows-msvc` (Windows on ARM64, MSVC)
 
 Workflow: [`.github/workflows/build.yml`](.github/workflows/build.yml). The three artifacts are `MarinExplorer-x64-gnu.exe`, `MarinExplorer-x64-msvc.exe` and `MarinExplorer-arm64.exe`, downloadable from **Actions → run → Artifacts**; pushing a `v*` tag also publishes them to **Releases**.
-
-### Usage
-
-Just launch `MarinExplorer.exe`. The first open reads and caches disk info; afterwards it's fast.
-
-💡 **Run as Administrator** is recommended: it avoids permission errors when reaching protected system folders, writing to system paths, or safely ejecting removable drives.
-
-🔒 **Security**: only download `MarinExplorer.exe` from this repo's **Releases** or official build artifacts. Do not fetch it from unknown sources — that's how trojans and backdoors get in.
 
 ### License
 
