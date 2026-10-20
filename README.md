@@ -13,21 +13,6 @@
 
 **仅支持 Windows**——`x86_64`（标准 Windows 64 位）与 `aarch64`（Windows on ARM64，如 Surface / 骁龙笔记本）。不提供 Linux 或 macOS 版本。
 
-设计目标只有一条：**普通人也能顺手用**。没有华丽的架构，没有学习成本，打开就能用。
-
-### 项目由来（Vibe Coding）
-
-MarinExplorer 是一个典型的 **vibe coding** 产物：没有先画好架构图再往里填代码，而是在与 AI 结对的快速迭代里「长」出来的。
-
-起点很朴素——作者的 **Windows 11 ARM64 设备内存吃紧**，而系统自带的资源管理器本身就不算轻量。多开几个窗口、再挂几个后台服务，机器就开始喘。于是一切从一句话开始：「能不能有个占资源少点的文件管理器。」然后在这个念头下一次次打磨：
-
-> 「这个按钮点了没反应」
-> 「图标带黑底，alpha 没取对」
-> 「回收站一打开就卡死」
-> 「这行字太灰，看不清」
-
-代码里保留了大量中文注释，因为作者和 AI 全程用中文交流。功能优先级永远是 **易用性 > 精度**：宁可牺牲一点严谨，也要让第一次打开的人不用看说明书。
-
 ### 它解决了什么
 
 1. **资源占用太大** — 资源管理器偏重。MarinExplorer 用 Rust + egui 自绘 UI，常驻内存远低于系统资源管理器，在内存吃紧的 ARM64 设备上差别尤其明显。
@@ -145,21 +130,6 @@ cargo build --release --target aarch64-pc-windows-msvc
 A **lightweight, Windows-on-ARM64-capable, Rust + [egui](https://github.com/emilk/egui) based two-pane file manager**.
 
 **Windows only** — `x86_64` (standard 64-bit Windows) and `aarch64` (Windows on ARM64, e.g. Surface / Snapdragon laptops). No Linux or macOS builds.
-
-The only design goal: **usable by anyone, out of the box**. No fancy architecture, no learning curve — open it and it just works.
-
-### Origin (Vibe Coding)
-
-MarinExplorer is a textbook **vibe coding** artifact: it did not start from an architecture diagram that got filled in with code — it *grew* out of rapid, AI-paired iteration.
-
-The starting point was plain enough: the author's **Windows 11 ARM64 machine is short on RAM**, and the built-in Explorer is not exactly light. A few windows, a few background services, and the device starts gasping. So it all began with one line — "can there be a file manager that costs less memory?" — and was polished again and again from there:
-
-> "This button does nothing when I click it"
-> "The icon has a black background — wrong alpha"
-> "The Recycle Bin freezes the moment it opens"
-> "This text is too grey, I can't read it"
-
-The code keeps plenty of Chinese comments because the author and the AI talked in Chinese the whole way. Feature priority is always **usability > precision**: we'd rather give up a little rigour than make a first-time user read a manual.
 
 ### What It Fixes
 
