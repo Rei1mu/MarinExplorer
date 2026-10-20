@@ -3,7 +3,7 @@ name: Build
 # MarinExplorer targets Windows only:
 #   - x86_64-pc-windows-gnu    (standard Windows x64, MinGW-w64 / llvm-mingw)
 #   - aarch64-pc-windows-msvc  (Windows on ARM64, e.g. Surface / Snapdragon, MSVC)
-# Each artifact is a Windows .exe. The GNU build runs on Linux (llvm-mingw);
+# Each artifact is a Windows .exe. The GNU build runs on Linux (MinGW-w64/GCC);
 # the ARM64 build runs on a Windows runner using the native MSVC cross-tools.
 on:
   push:
