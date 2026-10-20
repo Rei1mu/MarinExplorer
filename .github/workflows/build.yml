@@ -55,12 +55,6 @@ jobs:
           path: MarinExplorer-x64-gnu.exe
           if-no-files-found: error
 
-      - name: Upload to GitHub Release
-        if: startsWith(github.ref, 'refs/tags/v')
-        uses: softprops/action-gh-release@v3
-        with:
-          files: MarinExplorer-x64-gnu.exe
-
   build-msvc-x86_64:
     name: Windows x64 (MSVC)
     runs-on: windows-latest
@@ -91,12 +85,6 @@ jobs:
           name: MarinExplorer-x64-msvc
           path: MarinExplorer-x64-msvc.exe
           if-no-files-found: error
-
-      - name: Upload to GitHub Release
-        if: startsWith(github.ref, 'refs/tags/v')
-        uses: softprops/action-gh-release@v3
-        with:
-          files: MarinExplorer-x64-msvc.exe
 
   build-msvc-arm64:
     name: Windows ARM64 (MSVC)
@@ -191,8 +179,37 @@ jobs:
           path: installer/Output/*.exe
           if-no-files-found: error
 
-      - name: Upload installer to GitHub Release
-        if: startsWith(github.ref, 'refs/tags/v')
+  # Publish everything exactly once.
+  #
+  # Why a separate job: several jobs uploading to the same release race each
+  # other for the same asset list, and one of them silently loses. Collecting
+  # all artifacts and attaching them from a single place is deterministic.
+  publish:
+    name: Publish release assets
+    runs-on: ubuntu-latest
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs:
+      - build-gnu-x86_64
+      - build-msvc-x86_64
+      - build-msvc-arm64
+      - installer
+    permissions:
+      contents: write
+    steps:
+      - name: Collect artifacts
+        uses: actions/download-artifact@v7
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: Show what we collected
+        run: ls -la dist
+
+      - name: Upload to GitHub Release
         uses: softprops/action-gh-release@v3
         with:
-          files: installer/Output/*.exe
+          files: |
+            dist/MarinExplorer-x64-gnu.exe
+            dist/MarinExplorer-x64-msvc.exe
+            dist/MarinExplorer-arm64.exe
+            dist/MarinExplorer-Setup-*.exe
