@@ -2,6 +2,9 @@
 /target/
 **/*.rs.bk
 
+# ---- Machine-specific cargo config (local mingw paths; never commit) ----
+.cargo/config.toml
+
 # ---- Built binaries / objects (release artifacts) ----
 *.exe
 *.o
