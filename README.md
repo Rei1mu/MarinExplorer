@@ -17,18 +17,26 @@
 
 ### 项目由来（Vibe Coding）
 
-MarinExplorer 是一个典型的 **vibe coding** 产物——它不是一个先画好架构图再填代码的工程，而是在 AI 结对的快速迭代里「长」出来的。
+MarinExplorer 是一个典型的 **vibe coding** 产物：没有先画好架构图再往里填代码，而是在与 AI 结对的快速迭代里「长」出来的。
 
-起点只是很朴素的一个念头：系统自带的文件管理器要么太重、要么不顺手，而主流第三方工具又塞了太多用不上的功能。于是就这么一句话开始，在 AI 辅助下一次次打磨：
+起点很朴素——作者的 **Windows 11 ARM64 设备内存吃紧**，而系统自带的资源管理器本身就不算轻量。多开几个窗口、再挂几个后台服务，机器就开始喘。于是一切从一句话开始：「能不能有个占资源少点的文件管理器。」然后在这个念头下一次次打磨：
 
 > 「这个按钮点了没反应」
 > 「图标带黑底，alpha 没取对」
 > 「回收站一打开就卡死」
 > 「这行字太灰，看不清」
 
-代码里保留了大量中文注释，因为作者和 AI 全程用中文交流。功能优先级永远是**易用性 > 精度**：宁可牺牲一点严谨，也要让第一次打开的人不用看说明书。
+代码里保留了大量中文注释，因为作者和 AI 全程用中文交流。功能优先级永远是 **易用性 > 精度**：宁可牺牲一点严谨，也要让第一次打开的人不用看说明书。
 
-当前形态：一个基于 Rust + egui 的 Windows 桌面文件管理器，专注「能用、顺手」而非功能堆砌，并原生支持 Windows on ARM64（msvc）。
+### 它解决了什么
+
+1. **资源占用太大** — 资源管理器偏重。MarinExplorer 用 Rust + egui 自绘 UI，常驻内存远低于系统资源管理器，在内存吃紧的 ARM64 设备上差别尤其明显。
+2. **回收站卡死** — 回收站里堆到数万文件时，资源管理器要花特别久才能读出列表，删除更是近乎不可用。这里把 `$Recycle.Bin` 里 `$I` 文件的解析丢到**后台线程**，界面不等它、全程可操作；清空后自动刷新，侧边栏图标随「满 / 空」变化。
+3. **图片预览各自为政** — 每台设备装了不同的看图软件，双击一张 PNG 会拉起不同的程序，各自再占一份内存。内置预览面板在同一个窗口里直接看图，不必再启动别的应用。
+4. **图片转 ICO 麻烦** — 开发软件要给应用做图标时，往往得去找在线转换站或额外装工具。在预览器里右键「转换为 ICO」，直接把当前图片（可拖拽框选方形裁切区域）导出成**一个**多尺寸 `.ico`（16 / 24 / 32 / 48 / 64 / 128 / 256 任选），落回原图所在目录。
+5. **图片压缩 / 转 PNG** — 右键「转换为 PNG」，可选 0–9 的压缩级别（0 = 不压缩，9 = 最小），导出到新文件夹，避免同名覆盖源文件。
+
+当前形态：一个基于 Rust + egui 的 Windows 桌面文件管理器，专注「能用、顺手」而非功能堆砌，原生支持 Windows on ARM64（msvc）。
 
 ### 功能
 
@@ -41,10 +49,11 @@ MarinExplorer 是一个典型的 **vibe coding** 产物——它不是一个先�
 - 固定磁盘列表，带**剩余 / 总量**空间显示。
 - 主页（Home）快捷入口。
 
-**预览与缩略图**
+**预览与图片工具**
 - 内置图片预览面板，支持 PNG / JPEG / BMP / ICO / TIFF / WebP / GIF。
 - 缩略图网格视图。
-- 「转换为 PNG」对话框（PNG 编码带真实压缩级别）。
+- **转换为 ICO**：拖拽框选方形区域，勾选需要的尺寸（16 / 24 / 32 / 48 / 64 / 128 / 256），导出**单个**多尺寸 `.ico` 到原图所在目录（Vista+ 格式，内嵌 PNG 载荷）。
+- **转换为 PNG**：可选 0–9 压缩级别（0 = 不压缩，9 = 最小），导出到新文件夹，不会覆盖同名源文件。
 
 **拖拽与外壳集成**
 - 从面板**拖出文件**到外部程序。
@@ -141,9 +150,9 @@ The only design goal: **usable by anyone, out of the box**. No fancy architectur
 
 ### Origin (Vibe Coding)
 
-MarinExplorer is a textbook **vibe coding** artifact — not a project that started from an architecture diagram, but one that *grew* out of rapid, AI-paired iteration.
+MarinExplorer is a textbook **vibe coding** artifact: it did not start from an architecture diagram that got filled in with code — it *grew* out of rapid, AI-paired iteration.
 
-It started from a simple thought: the built-in file manager is either too heavy or too clunky, while most third-party tools pile on features nobody asked for. From that one line, it was refined again and again with AI assistance:
+The starting point was plain enough: the author's **Windows 11 ARM64 machine is short on RAM**, and the built-in Explorer is not exactly light. A few windows, a few background services, and the device starts gasping. So it all began with one line — "can there be a file manager that costs less memory?" — and was polished again and again from there:
 
 > "This button does nothing when I click it"
 > "The icon has a black background — wrong alpha"
@@ -151,6 +160,14 @@ It started from a simple thought: the built-in file manager is either too heavy 
 > "This text is too grey, I can't read it"
 
 The code keeps plenty of Chinese comments because the author and the AI talked in Chinese the whole way. Feature priority is always **usability > precision**: we'd rather give up a little rigour than make a first-time user read a manual.
+
+### What It Fixes
+
+1. **Too much resource usage** — Explorer is heavy. MarinExplorer draws its own UI with Rust + egui and stays resident for far less memory than Explorer, which is especially noticeable on memory-tight ARM64 devices.
+2. **A frozen Recycle Bin** — once the bin holds tens of thousands of entries, Explorer takes ages just to list it, and deleting is close to unusable. Here the `$I` file parsing inside `$Recycle.Bin` runs on a **background thread**: the UI never waits for it and stays usable the whole time. Emptying auto-refreshes the listing, and the sidebar icon tracks full/empty.
+3. **Every machine previews images differently** — each device has its own photo viewer installed, so double-clicking a PNG launches a different program each time, each costing another slice of memory. The built-in preview panel shows images inside the same window; nothing else needs to start.
+4. **Image-to-ICO is a hassle** — shipping an app means shipping an icon, which usually means hunting for an online converter or installing extra tooling. Right-click in the viewer → "Convert to ICO" exports the current picture (optionally cropped to a dragged square region) as **one** multi-size `.ico` (pick from 16 / 24 / 32 / 48 / 64 / 128 / 256), written next to the source image.
+5. **Image compression / PNG export** — "Convert to PNG" offers deflate levels 0–9 (0 = none, 9 = smallest) and writes into a new folder, so it can never overwrite the same-named source.
 
 Current form: a Rust + egui Windows desktop file manager focused on "works and feels right" rather than feature count, with native support for Windows on ARM64 (MSVC).
 
@@ -165,10 +182,11 @@ Current form: a Rust + egui Windows desktop file manager focused on "works and f
 - Fixed drive list with **free / total** space.
 - Home shortcut.
 
-**Preview & thumbnails**
+**Preview & image tools**
 - Built-in image preview: PNG / JPEG / BMP / ICO / TIFF / WebP / GIF.
 - Thumbnail grid view.
-- "Convert to PNG" dialog (real compression level).
+- **Convert to ICO**: drag a square crop region, tick the sizes you need (16 / 24 / 32 / 48 / 64 / 128 / 256), and export a **single** multi-size `.ico` next to the source (Vista+ format, PNG payloads inside).
+- **Convert to PNG**: choose a deflate level 0–9 (0 = none, 9 = smallest); output goes into a new folder so the same-named source is never overwritten.
 
 **Drag & shell integration**
 - Drag files **out** of a panel into other apps.
