@@ -1,5 +1,7 @@
 # MarinExplorer
 
+<p align="center"><img src="docs/logo.png" alt="MarinExplorer logo" width="200"></p>
+
 一个轻量、支持 Windows on ARM64、基于 Rust + egui 的双栏文件管理器 / A lightweight, Windows-on-ARM64-capable, Rust + egui based two-pane file manager.
 
 - 中文文档 ↓ [中文文档](#中文文档)
@@ -30,6 +32,10 @@
 💡 **建议以管理员身份运行**：访问受保护的系统目录、写入系统路径时，管理员权限能避免因权限不足导致的功能受限。
 
 🔒 **安全提醒**：请只从本仓库的 **Releases** 或官方构建渠道获取 `MarinExplorer.exe`。不要从不明来源下载，以免被植入木马或后门。
+
+### 截图
+
+<p align="center"><img src="docs/3c042e0d7c3f2cda3d05820a4f9bb9ce.png" alt="回收站界面截图" width="720"></p>
 
 ### 它解决了什么
 
@@ -159,6 +165,10 @@ The first open reads and caches disk info; afterwards it's fast.
 💡 **Run as Administrator** is recommended: it avoids permission errors when reaching protected system folders or writing to system paths.
 
 🔒 **Security**: only download `MarinExplorer.exe` from this repo's **Releases** or official build artifacts. Do not fetch it from unknown sources — that's how trojans and backdoors get in.
+
+### Screenshot
+
+<p align="center"><img src="docs/3c042e0d7c3f2cda3d05820a4f9bb9ce.png" alt="Recycle Bin view" width="720"></p>
 
 ### What It Fixes
 
