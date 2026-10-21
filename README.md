@@ -17,7 +17,7 @@
 
 ### 运行
 
-**安装包（推荐）**：从 **Releases** 下载 `MarinExplorer-Setup-<版本>.exe`，一路「下一步」即可。安装向导提供三个选项：
+**安装包（推荐）**：从 **Releases** 下载 `MarinExplorer-Setup-Windows-<架构>-<版本>.exe`（x64 选 `x64-msvc`，ARM64 选 `arm64`），一路「下一步」即可。安装向导提供三个选项：
 
 - ☑ 加入开始菜单（默认勾选）
 - ☑ 在右键菜单中加入「通过 MarinExplorer 打开」（默认勾选）
@@ -131,7 +131,7 @@ cargo build --release --target aarch64-pc-windows-msvc
 - `x86_64-pc-windows-msvc`（标准 Windows x64，MSVC）
 - `aarch64-pc-windows-msvc`（Windows on ARM64，MSVC）
 
-工作流见 [`.github/workflows/build.yml`](.github/workflows/build.yml)。裸 `.exe` 产物（`MarinExplorer-x64-msvc.exe` / `MarinExplorer-arm64.exe`）可在 **Actions → 对应运行 → Artifacts** 下载；打 `v*` 标签推送时，会把两个 Inno Setup 安装包（`MarinExplorer-Setup-x64-msvc-<版本>.exe` / `MarinExplorer-Setup-arm64-<版本>.exe`）发布到 **Releases**——Releases 只提供安装包，不提供裸 exe。
+工作流见 [`.github/workflows/build.yml`](.github/workflows/build.yml)。裸 `.exe` 产物（`MarinExplorer-x64-msvc.exe` / `MarinExplorer-arm64.exe`）可在 **Actions → 对应运行 → Artifacts** 下载；打 `v*` 标签推送时，会把两个 Inno Setup 安装包（`MarinExplorer-Setup-Windows-x64-msvc-<版本>.exe` / `MarinExplorer-Setup-Windows-arm64-<版本>.exe`）发布到 **Releases**——Releases 只提供安装包，不提供裸 exe。
 
 ### 许可证
 
@@ -149,7 +149,7 @@ A **lightweight, Windows-on-ARM64-capable, Rust + [egui](https://github.com/emil
 
 ### Usage
 
-**Installer (recommended)**: download `MarinExplorer-Setup-<version>.exe` from **Releases** and click through. The wizard offers three options:
+**Installer (recommended)**: download `MarinExplorer-Setup-Windows-<arch>-<version>.exe` from **Releases** (`x64-msvc` for x64, `arm64` for ARM64) and click through. The wizard offers three options:
 
 - ☑ Add to Start menu (checked by default)
 - ☑ Add "Open with MarinExplorer" to the right-click menu (checked by default)
@@ -263,7 +263,7 @@ On every push to `main`, GitHub Actions automatically builds **two Windows editi
 - `x86_64-pc-windows-msvc` (standard Windows x64, MSVC)
 - `aarch64-pc-windows-msvc` (Windows on ARM64, MSVC)
 
-Workflow: [`.github/workflows/build.yml`](.github/workflows/build.yml). The bare `.exe` artifacts (`MarinExplorer-x64-msvc.exe` / `MarinExplorer-arm64.exe`) are downloadable from **Actions → run → Artifacts**; pushing a `v*` tag publishes the two Inno Setup installers (`MarinExplorer-Setup-x64-msvc-<version>.exe` / `MarinExplorer-Setup-arm64-<version>.exe`) to **Releases** — Releases carries installers only, no bare exes.
+Workflow: [`.github/workflows/build.yml`](.github/workflows/build.yml). The bare `.exe` artifacts (`MarinExplorer-x64-msvc.exe` / `MarinExplorer-arm64.exe`) are downloadable from **Actions → run → Artifacts**; pushing a `v*` tag publishes the two Inno Setup installers (`MarinExplorer-Setup-Windows-x64-msvc-<version>.exe` / `MarinExplorer-Setup-Windows-arm64-<version>.exe`) to **Releases** — Releases carries installers only, no bare exes.
 
 ### License
 

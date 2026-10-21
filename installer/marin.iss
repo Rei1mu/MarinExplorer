@@ -80,7 +80,7 @@ WizardStyle=modern
 DisableDirPage=no
 DisableProgramGroupPage=yes
 OutputDir=Output
-OutputBaseFilename={#MyAppName}-Setup-{#MyAppArch}-{#MyAppVersion}
+OutputBaseFilename={#MyAppName}-Setup-Windows-{#MyAppArch}-{#MyAppVersion}
 ; A per-user install still gets its own Add/Remove Programs entry.
 CreateUninstallRegKey=yes
 UninstallDisplayName={#MyAppName} {#MyAppVersion}
@@ -112,7 +112,10 @@ Source: "{#MyAppExe}"; DestDir: "{app}"; DestName: "MarinExplorer.exe"; Flags: i
 
 [Icons]
 Name: "{group}\{#MyAppName}"; Filename: "{app}\MarinExplorer.exe"; Tasks: startmenu
-Name: "{group}\卸载 {#MyAppName} / Uninstall {#MyAppName}"; Filename: "{uninstallexe}"; Tasks: startmenu
+; NOTE: the shortcut name must not contain "/" — it is an illegal filename
+; character on Windows, and IPersistFile::Save then fails with 0x80070003
+; (path not found) because "A / B.lnk" parses as "B.lnk" inside dir "A ".
+Name: "{group}\卸载 {#MyAppName}"; Filename: "{uninstallexe}"; Tasks: startmenu
 Name: "{autodesktop}\{#MyAppName}"; Filename: "{app}\MarinExplorer.exe"; Flags: createonlyiffileexists; Tasks: desktopicon
 
 ; ---------------------------------------------------------------------------
