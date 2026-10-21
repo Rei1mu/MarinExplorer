@@ -117,12 +117,20 @@ jobs:
           path: MarinExplorer-arm64.exe
           if-no-files-found: error
 
-  # Packages the GNU x64 build into a real Windows installer with Inno Setup.
-  # It needs no local tooling — the runner installs Inno Setup via winget.
+  # Packages each build into a real Windows installer with Inno Setup.
+  # It needs no local tooling — the runner installs Inno Setup via winget, and the
+  # installers are produced here in CI only (never built locally).
+  #
+  # One installer per architecture: the payload exe is not interchangeable.
+  # Inno Setup 7 supports the arm64 architecture identifier natively, so ARM64
+  # Windows 11 gets its own installer instead of relying on x64 emulation:
+  #   - x64       → GNU  x64 build   (ArchitecturesAllowed=x64os)
+  #   - x64-msvc  → MSVC x64 build   (ArchitecturesAllowed=x64os)
+  #   - arm64     → MSVC ARM64 build (ArchitecturesAllowed=arm64)
   installer:
     name: Windows installer
     runs-on: windows-latest
-    needs: build-gnu-x86_64
+    needs: [build-gnu-x86_64, build-msvc-x86_64, build-msvc-arm64]
     steps:
       - uses: actions/checkout@v7
 
@@ -132,16 +140,34 @@ jobs:
           name: MarinExplorer-x64-gnu
           path: target/x86_64-pc-windows-gnu/release
 
-      # The artifact keeps the published name; the .iss expects MarinExplorer.exe.
-      - name: Stage payload
+      - name: Download the MSVC x64 build
+        uses: actions/download-artifact@v7
+        with:
+          name: MarinExplorer-x64-msvc
+          path: target/x86_64-pc-windows-msvc/release
+
+      - name: Download the ARM64 build
+        uses: actions/download-artifact@v7
+        with:
+          name: MarinExplorer-arm64
+          path: target/aarch64-pc-windows-msvc/release
+
+      # The artifacts keep the published names; the .iss expects MarinExplorer.exe
+      # in each target's release dir.
+      - name: Stage payloads
         shell: pwsh
         run: |
-          $d = "target\x86_64-pc-windows-gnu\release"
-          Get-ChildItem $d | Select-Object -ExpandProperty Name
-          Get-ChildItem $d -Filter *.exe | ForEach-Object {
-            Rename-Item $_.FullName -NewName MarinExplorer.exe -Force
+          $dirs = @(
+            "target\x86_64-pc-windows-gnu\release",
+            "target\x86_64-pc-windows-msvc\release",
+            "target\aarch64-pc-windows-msvc\release"
+          )
+          foreach ($d in $dirs) {
+            Get-ChildItem $d -Filter *.exe | ForEach-Object {
+              Rename-Item $_.FullName -NewName MarinExplorer.exe -Force
+            }
+            if (-not (Test-Path "$d\MarinExplorer.exe")) { throw "payload exe missing in $d" }
           }
-          if (-not (Test-Path "$d\MarinExplorer.exe")) { throw "payload exe missing" }
 
       - name: Install Inno Setup
         run: winget install --id JRSoftware.InnoSetup.7 -e --accept-source-agreements --accept-package-agreements --disable-interactivity
@@ -154,10 +180,10 @@ jobs:
           $v = if ($env:GITHUB_REF -like 'refs/tags/v*') { $env:GITHUB_REF -replace 'refs/tags/v','' } else { '0.0.0' }
           "version=$v" >> $env:GITHUB_OUTPUT
 
-      - name: Build installer
+      - name: Build installers
         shell: pwsh
         run: |
-          # The runner ships Inno Setup 6, whose default install lacks the
+          # The runner may ship Inno Setup 6, whose default install lacks the
           # Chinese/Japanese language files that marin.iss compiles in. Prefer
           # Inno Setup 7 (installed above), or any build that actually has them.
           $cands = Get-ChildItem "$env:LOCALAPPDATA\Programs","${env:ProgramFiles(x86)}","$env:ProgramFiles" `
@@ -170,9 +196,18 @@ jobs:
           Write-Output "using $($iscc.FullName)"
           Get-ChildItem (Join-Path $iscc.DirectoryName "Languages") -Filter *.isl -ErrorAction SilentlyContinue |
             Select-Object -ExpandProperty Name
-          & $iscc.FullName installer/marin.iss "/DMyAppVersion=${{ steps.ver.outputs.version }}" "/Oinstaller\Output"
+          # x64 installer (GNU payload).
+          & $iscc.FullName installer/marin.iss "/DMyAppVersion=${{ steps.ver.outputs.version }}" "/DMyAppArch=x64" "/Oinstaller\Output"
+          if ($LASTEXITCODE -ne 0) { throw "ISCC failed for x64 (exit $LASTEXITCODE)" }
+          # x64 installer (MSVC payload).
+          & $iscc.FullName installer/marin.iss "/DMyAppVersion=${{ steps.ver.outputs.version }}" "/DMyAppArch=x64-msvc" "/Oinstaller\Output"
+          if ($LASTEXITCODE -ne 0) { throw "ISCC failed for x64-msvc (exit $LASTEXITCODE)" }
+          # ARM64 installer (MSVC payload). Inno Setup 7 supports the arm64
+          # architecture natively, so no x64-emulation fallback is needed.
+          & $iscc.FullName installer/marin.iss "/DMyAppVersion=${{ steps.ver.outputs.version }}" "/DMyAppArch=arm64" "/Oinstaller\Output"
+          if ($LASTEXITCODE -ne 0) { throw "ISCC failed for arm64 (exit $LASTEXITCODE)" }
 
-      - name: Upload installer artifact
+      - name: Upload installer artifacts
         uses: actions/upload-artifact@v7
         with:
           name: MarinExplorer-Setup

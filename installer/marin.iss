@@ -1,9 +1,13 @@
 ; ---------------------------------------------------------------------------
 ; MarinExplorer installer
 ;
-; Built by GitHub Actions (see .github/workflows/build.yml) with Inno Setup 7:
+; Built by GitHub Actions (see .github/workflows/build.yml) with Inno Setup 7.
+; One architecture per installer — the payload exe is not interchangeable, so
+; each setup ships the build that matches the machine it will run on:
 ;
-;   ISCC.exe marin.iss /DMyAppVersion=1.2.3
+;   ISCC.exe marin.iss /DMyAppVersion=1.2.3 /DMyAppArch=x64       (GNU  x64)
+;   ISCC.exe marin.iss /DMyAppVersion=1.2.3 /DMyAppArch=x64-msvc  (MSVC x64)
+;   ISCC.exe marin.iss /DMyAppVersion=1.2.3 /DMyAppArch=arm64    (MSVC ARM64)
 ;
 ; The version can also be edited here for local builds.
 ; ---------------------------------------------------------------------------
@@ -24,9 +28,33 @@
 #define MyAppName "MarinExplorer"
 #define MyAppPublisher "Rei1mu"
 #define MyAppURL "https://github.com/Rei1mu/MarinExplorer"
-; The exe bundled into the installer is the x64 GNU build.
-#ifndef MyAppExe
-  #define MyAppExe "..\target\x86_64-pc-windows-gnu\release\MarinExplorer.exe"
+; Target architecture: "x64" or "arm64".
+#ifndef MyAppArch
+  #define MyAppArch "x64"
+#endif
+
+#if MyAppArch == "arm64"
+  ; Refuse to install the ARM64 payload on an x64 machine (and vice versa) —
+  ; a mismatched exe fails at launch with an unhelpful OS error, so block it
+  ; during setup instead.
+  #define MyArchAllowed "arm64"
+  #ifndef MyAppExe
+    #define MyAppExe "..\target\aarch64-pc-windows-msvc\release\MarinExplorer.exe"
+  #endif
+#elif MyAppArch == "x64-msvc"
+  ; `x64os` = a genuine 64-bit x86 Windows (refuses ARM64, like the GNU x64 build).
+  #define MyArchAllowed "x64os"
+  ; The exe bundled into the installer is the x64 MSVC build.
+  #ifndef MyAppExe
+    #define MyAppExe "..\target\x86_64-pc-windows-msvc\release\MarinExplorer.exe"
+  #endif
+#else
+  ; `x64os` = a genuine 64-bit x86 Windows.
+  #define MyArchAllowed "x64os"
+  ; The exe bundled into the installer is the x64 GNU build.
+  #ifndef MyAppExe
+    #define MyAppExe "..\target\x86_64-pc-windows-gnu\release\MarinExplorer.exe"
+  #endif
 #endif
 
 [Setup]
@@ -58,11 +86,13 @@ WizardStyle=modern
 DisableDirPage=no
 DisableProgramGroupPage=yes
 OutputDir=Output
-OutputBaseFilename={#MyAppName}-Setup-{#MyAppVersion}
+OutputBaseFilename={#MyAppName}-Setup-{#MyAppArch}-{#MyAppVersion}
 ; A per-user install still gets its own Add/Remove Programs entry.
 CreateUninstallRegKey=yes
 UninstallDisplayName={#MyAppName} {#MyAppVersion}
 SolidCompression=yes
+; Refuse to launch on a machine that cannot run this payload.
+ArchitecturesAllowed={#MyArchAllowed}
 ArchitecturesInstallIn64BitMode=x64os arm64
 SetupIconFile=..\logo.ico
 UninstallDisplayIcon={app}\MarinExplorer.exe,0
