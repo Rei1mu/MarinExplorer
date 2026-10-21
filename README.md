@@ -25,7 +25,7 @@
 
 安装目录可自行更改，默认是 `%LOCALAPPDATA%\Programs\MarinExplorer`。之所以不用 Program Files：MarinExplorer 把文件夹大小缓存写在**自己的安装目录**里以保持自包含，而 Program Files 没有管理员权限就写不进去。若希望完全不碰 C 盘，安装时改成 `D:\Programs\MarinExplorer` 之类即可。
 
-**绿色免安装**：也可以直接下载 `MarinExplorer-x64-gnu.exe`，放到任意位置运行。右键菜单的开关就摆在**设置**里，随时可以自己打开或关掉。
+**绿色免安装**：Releases 只提供安装包。若想要单个 `.exe`，可到 **Actions → 对应运行 → Artifacts** 下载 `MarinExplorer-x64-msvc.exe`（x64）或 `MarinExplorer-arm64.exe`（ARM64），放到任意位置运行。右键菜单的开关就摆在**设置**里，随时可以自己打开或关掉。
 
 首次打开会读取并缓存磁盘信息，之后都很快。
 
@@ -122,17 +122,16 @@ cargo build --release --target aarch64-pc-windows-msvc
 - 发布构建已为体积优化（`opt-level = "z"` + LTO + strip）。
 - 应用图标由 `build.rs` 编进 Windows 资源，三个产物都带：**GNU 版用 MinGW 的 `windres` 生成 `.o`，MSVC 版用 Windows SDK 的 `rc.exe` 生成 `.res`**。找不到资源编译器时编译照常通过，只是没有文件图标。
 - 代码签名（可选）见 `sign.ps1`：用受信任 CA 的 `.pfx` 给 exe 签名 + 时间戳，消除 SmartScreen 拦截。
-- 普通用户直接用 **GNU 版**即可（有文件图标、无运行时依赖）。只有要接入 MSVC 编译的库、或要用 VS / WinDbg 调试时，才必须选 MSVC 版。
+- **Releases 只提供 MSVC 构建的安装包**（已静态链接 C 运行时，无需安装 VC++ 运行库）；GNU 版仅在有 MinGW 库依赖、或偏好 GCC 工具链时值得本地构建。
 
 ### 自动构建（GitHub Actions）
 
-仓库已在每次推送 `main` 时通过 GitHub Actions 自动编译 **三个 Windows 版本**（GNU x64 在 Linux 上用 MinGW-w64（GCC）交叉编译；两个 MSVC 版本在 Windows runner 上用原生 MSVC 工具链编译，产物全是 Windows `.exe`）：
+仓库已在每次推送 `main` 时通过 GitHub Actions 自动编译 **两个 Windows 版本**（均在 Windows runner 上用原生 MSVC 工具链编译，静态链接 C 运行时，目标机器无需安装 VC++ 可再发行组件）：
 
-- `x86_64-pc-windows-gnu`（标准 Windows x64，GNU）
 - `x86_64-pc-windows-msvc`（标准 Windows x64，MSVC）
 - `aarch64-pc-windows-msvc`（Windows on ARM64，MSVC）
 
-工作流见 [`.github/workflows/build.yml`](.github/workflows/build.yml)。三个产物名为 `MarinExplorer-x64-gnu.exe`、`MarinExplorer-x64-msvc.exe` 与 `MarinExplorer-arm64.exe`，可在 **Actions → 对应运行 → Artifacts** 下载；打 `v*` 标签推送时会自动发布到 **Releases**。
+工作流见 [`.github/workflows/build.yml`](.github/workflows/build.yml)。裸 `.exe` 产物（`MarinExplorer-x64-msvc.exe` / `MarinExplorer-arm64.exe`）可在 **Actions → 对应运行 → Artifacts** 下载；打 `v*` 标签推送时，会把两个 Inno Setup 安装包（`MarinExplorer-Setup-x64-msvc-<版本>.exe` / `MarinExplorer-Setup-arm64-<版本>.exe`）发布到 **Releases**——Releases 只提供安装包，不提供裸 exe。
 
 ### 许可证
 
@@ -158,7 +157,7 @@ A **lightweight, Windows-on-ARM64-capable, Rust + [egui](https://github.com/emil
 
 You may change the install directory; the default is `%LOCALAPPDATA%\Programs\MarinExplorer`. Program Files is deliberately not the default: MarinExplorer keeps its folder-size cache **inside its own install directory** to stay self-contained, and Program Files is not writable without elevation. If you want nothing on `C:`, point the installer at something like `D:\Programs\MarinExplorer`.
 
-**Portable**: you can also just download `MarinExplorer-x64-gnu.exe` and run it from anywhere. The context-menu switch lives in **Settings**, so you can turn it on or off at any time.
+**Portable**: Releases only ship the installer. If you want a bare `.exe`, grab `MarinExplorer-x64-msvc.exe` (x64) or `MarinExplorer-arm64.exe` (ARM64) from **Actions → run → Artifacts** and run it from anywhere. The context-menu switch lives in **Settings**, so you can turn it on or off at any time.
 
 The first open reads and caches disk info; afterwards it's fast.
 
@@ -255,17 +254,16 @@ Notes:
 - Release builds are size-optimized (`opt-level = "z"` + LTO + strip).
 - The app icon is embedded by `build.rs` in all three builds: MinGW's `windres` for the GNU target, Windows SDK `rc.exe` for the MSVC targets. If no resource compiler is found the build still succeeds, just without a file icon.
 - Optional code signing lives in `sign.ps1`.
-- For everyday use just take the **GNU build** (file icon, no runtime dependency). You only need the MSVC build to link MSVC-compiled libraries, or to debug with VS / WinDbg.
+- **Releases ship MSVC installers only** (statically linked C runtime — no VC++ redistributable needed). Build the GNU edition locally only if you need to link MinGW-compiled libraries or prefer the GCC toolchain.
 
 ### Automated Builds (GitHub Actions)
 
-On every push to `main`, GitHub Actions automatically builds **three Windows editions** (GNU x64 is cross-compiled on Linux with MinGW-w64 (GCC); both MSVC editions are built on a Windows runner with the native MSVC toolchain — every artifact is a Windows `.exe`):
+On every push to `main`, GitHub Actions automatically builds **two Windows editions** (both compiled on a Windows runner with the native MSVC toolchain and a statically linked C runtime — no "Visual C++ Redistributable" needed on the target machine):
 
-- `x86_64-pc-windows-gnu` (standard Windows x64, GNU)
 - `x86_64-pc-windows-msvc` (standard Windows x64, MSVC)
 - `aarch64-pc-windows-msvc` (Windows on ARM64, MSVC)
 
-Workflow: [`.github/workflows/build.yml`](.github/workflows/build.yml). The three artifacts are `MarinExplorer-x64-gnu.exe`, `MarinExplorer-x64-msvc.exe` and `MarinExplorer-arm64.exe`, downloadable from **Actions → run → Artifacts**; pushing a `v*` tag also publishes them to **Releases**.
+Workflow: [`.github/workflows/build.yml`](.github/workflows/build.yml). The bare `.exe` artifacts (`MarinExplorer-x64-msvc.exe` / `MarinExplorer-arm64.exe`) are downloadable from **Actions → run → Artifacts**; pushing a `v*` tag publishes the two Inno Setup installers (`MarinExplorer-Setup-x64-msvc-<version>.exe` / `MarinExplorer-Setup-arm64-<version>.exe`) to **Releases** — Releases carries installers only, no bare exes.
 
 ### License
 
