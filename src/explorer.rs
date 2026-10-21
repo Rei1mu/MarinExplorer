@@ -7,7 +7,7 @@ use std::sync::mpsc::{Receiver, Sender, channel};
 use std::thread;
 use std::time::Instant;
 
-use crate::app::{Clip, Panel};
+use crate::app::{Clip, Entry, Panel};
 use crate::cache::Store;
 use crate::fs_util::{self, DriveInfo};
 
@@ -20,23 +20,13 @@ pub enum JobMsg {
     Failed(String),
 }
 
-/// A running background job (empty recycle bin, big copy/move).
+/// A running background job (empty recycle bin, big copy/move, delete batch).
 pub struct Job {
-    pub kind: JobKind,
     pub label: String,
     pub progress: f32,
     pub note: Option<(&'static str, String)>,
     pub err: Option<String>,
     pub rx: Receiver<JobMsg>,
-}
-
-/// What a `Job` is doing. Only used to trigger the right follow-up work
-/// (the Recycle Bin glyph flips full/empty, so its cached icon must be
-/// dropped when a job empties the bin).
-#[derive(Clone, Copy, PartialEq, Eq)]
-pub enum JobKind {
-    CopyMove,
-    EmptyRecycle,
 }
 
 impl Job {
@@ -105,6 +95,9 @@ pub struct Explorer {
     pub size_tx: Sender<PathBuf>,
     pub size_rx: Receiver<(PathBuf, u64, u64)>, // (path, dir_mtime, size)
     pub pending_sizes: HashSet<PathBuf>,
+    // directory listings (read on a worker so a huge folder can't freeze the UI)
+    pub list_tx: Sender<(PathBuf, u64)>,
+    pub list_rx: Receiver<(PathBuf, u64, Vec<Entry>)>,
     // background job
     pub job: Option<Job>,
     // dialogs
@@ -221,6 +214,17 @@ impl Explorer {
         size_rx: Receiver<(PathBuf, u64, u64)>,
     ) -> Self {
         let (rec_tx, rec_rx) = channel::<(PathBuf, Vec<fs_util::RecItem>)>();
+        // Directory-listing worker: one persistent thread. A folder with tens
+        // of thousands of entries blocks for seconds when read inline, so the
+        // panels hand their cwd over here and adopt the result later.
+        let (list_tx, list_rx) = channel::<(PathBuf, u64, Vec<Entry>)>();
+        let (list_req_tx, list_req_rx) = channel::<(PathBuf, u64)>();
+        thread::spawn(move || {
+            while let Ok((dir, generation)) = list_req_rx.recv() {
+                let entries = crate::app::read_entries(&dir);
+                list_tx.send((dir, generation, entries)).ok();
+            }
+        });
         let fallback = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
         let split = store.meta("split").map(|s| s == "1").unwrap_or(false);
         let split_frac = store
@@ -312,6 +316,8 @@ impl Explorer {
             size_tx,
             size_rx,
             pending_sizes: HashSet::new(),
+            list_tx: list_req_tx,
+            list_rx,
             job: None,
             delete_open: false,
             delete_targets: Vec::new(),
@@ -358,6 +364,13 @@ impl Explorer {
         };
         me.restore_layout();
         me.restore_columns();
+        // From here on every navigation reads its listing on the worker
+        // thread (the construction-time loads above ran inline).
+        for tab in &mut me.tabs {
+            for p in &mut tab.panes {
+                p.list_tx = Some(me.list_tx.clone());
+            }
+        }
         me.status = format!(
             "{} {}",
             crate::lang::tr("就绪。", me.lang),
@@ -515,6 +528,12 @@ impl Explorer {
         self.active_tab += 1;
         self.active_pane = 0;
         self.sync_new_tab_prefs(self.active_tab);
+        // The new panels were built with `list_tx: None` (inline load); wire
+        // them to the worker like every other panel.
+        let tx = self.list_tx.clone();
+        for p in &mut self.tabs[self.active_tab].panes {
+            p.list_tx = Some(tx.clone());
+        }
         self.status = format!("{} {id}", crate::lang::tr("新标签页", self.lang));
         self.persist_layout();
     }
@@ -1076,9 +1095,35 @@ impl Explorer {
         }
     }
 
+    /// Adopt directory listings that finished on the worker thread.
+    ///
+    /// A result is only used when the panel still shows the same folder *and*
+    /// the same generation: the user may have navigated on (or reloaded) while
+    /// the worker was reading, and a stale listing must not overwrite the
+    /// newer one. `generation` is bumped by every `load()`, so this check is
+    /// exact, not a heuristic.
+    pub fn poll_listings(&mut self) {
+        let mut got = false;
+        while let Ok((dir, generation, entries)) = self.list_rx.try_recv() {
+            for tab in &mut self.tabs {
+                for p in &mut tab.panes {
+                    if p.loading && p.cwd == dir && p.generation == generation {
+                        p.adopt_listing(entries.clone());
+                        got = true;
+                    }
+                }
+            }
+        }
+        if got {
+            // The rows just arrived: cached folder sizes apply immediately and
+            // the rest get requested from the size worker.
+            self.apply_cached_sizes();
+            self.request_folder_sizes();
+        }
+    }
+
     /// Fill in cached sizes for the current listings (called after loads).
-    pub fn apply_cached_sizes(&mut self) {
-        for i in 0..2 {
+    pub fn apply_cached_sizes(&mut self) {        for i in 0..2 {
             let panel = &mut self.tabs[self.active_tab].panes[i];
             for e in panel.entries.iter_mut() {
                 if e.is_dir && !e.size_known {
@@ -1189,9 +1234,9 @@ impl Explorer {
 
         // Plain files are handled synchronously; directories go to a
         // background job (a big tree would freeze the UI thread).
-        let mut ok = 0usize;
+        let ok = 0usize;
         let mut skip = 0usize;
-        let mut fail = 0usize;
+        let fail = 0usize;
         let mut renamed = 0usize;
         let mut dirs: Vec<(PathBuf, PathBuf)> = Vec::new();
         for src in &paths {
@@ -1218,22 +1263,9 @@ impl Explorer {
             } else {
                 plain
             };
-            if src.is_file() {
-                let res: std::io::Result<()> = if is_move {
-                    match fs::rename(src, &dest) {
-                        Ok(()) => Ok(()),
-                        Err(_) => fs::copy(src, &dest).and_then(|_| fs::remove_file(src).map(|_| ())),
-                    }
-                } else {
-                    fs::copy(src, &dest).map(|_| ())
-                };
-                match res {
-                    Ok(_) => ok += 1,
-                    Err(_) => fail += 1,
-                }
-            } else {
-                dirs.push((src.clone(), dest));
-            }
+            // Files go to the worker as well: a multi-gigabyte fs::copy on the
+            // UI thread freezes the window until it finishes.
+            dirs.push((src.clone(), dest));
         }
 
         if !dirs.is_empty() {
@@ -1406,7 +1438,70 @@ impl Explorer {
         });
         self.status = format!("{}: {label}", crate::lang::tr("正在运行", self.lang));
         self.job = Some(Job {
-            kind: JobKind::CopyMove,
+            label,
+            progress: 0.0,
+            note: None,
+            err: None,
+            rx,
+        });
+    }
+
+    /// Delete a batch on a worker thread (see `delete_paths`). Progress is
+    /// per-item; the finish message carries the same counts as the sync path.
+    fn spawn_delete_job(&mut self, paths: Vec<PathBuf>, permanent: bool) {
+        let (tx, rx) = channel();
+        let n = paths.len();
+        let lang = self.lang;
+        thread::spawn(move || {
+            let total = paths.len().max(1) as f32;
+            let mut done = 0f32;
+            let mut ok = 0usize;
+            let mut fail = 0usize;
+            let mut first_err: Option<(String, String)> = None;
+            for p in &paths {
+                let res: Result<(), String> = if permanent {
+                    let is_dir = fs::metadata(p).map(|m| m.is_dir()).unwrap_or(false);
+                    let r = if is_dir { fs::remove_dir_all(p) } else { fs::remove_file(p) };
+                    r.map_err(|e| e.to_string())
+                } else {
+                    fs_util::move_to_recycle_bin(p)
+                };
+                match res {
+                    Ok(()) => ok += 1,
+                    Err(e) => {
+                        fail += 1;
+                        if first_err.is_none() {
+                            let name = p
+                                .file_name()
+                                .map(|s| s.to_string_lossy().into_owned())
+                                .unwrap_or_else(|| p.to_string_lossy().into_owned());
+                            first_err = Some((name, e));
+                        }
+                    }
+                }
+                done += 1.0;
+                tx.send(JobMsg::Progress(done / total)).ok();
+            }
+            let verb = crate::lang::tr(if permanent { "已永久删除" } else { "已移到回收站" }, lang);
+            let line = match first_err {
+                None => format!("{} {} {}", verb, ok, crate::lang::tr("项", lang)),
+                Some((name, why)) => format!(
+                    "{} {} {}，{} {}：{}（{}）",
+                    verb,
+                    ok,
+                    crate::lang::tr("项", lang),
+                    fail,
+                    crate::lang::tr("个失败", lang),
+                    name,
+                    why
+                ),
+            };
+            tx.send(JobMsg::Done("", line)).ok();
+        });
+        let verb = crate::lang::tr(if permanent { "正在删除" } else { "正在移到回收站" }, self.lang);
+        let label = format!("{} {n} {}…", verb, crate::lang::tr("项", self.lang));
+        self.status = format!("{}: {label}", crate::lang::tr("正在运行", self.lang));
+        self.job = Some(Job {
             label,
             progress: 0.0,
             note: None,
@@ -1417,8 +1512,6 @@ impl Explorer {
 
     /// Drain job messages; returns a final status line when the job finishes.
     pub fn poll_job(&mut self) -> Option<String> {
-        let Some(job) = self.job.as_ref() else { return None };
-        let kind = job.kind;
         let Some(job) = self.job.as_mut() else { return None };
         let mut finished: Option<String> = None;
         while let Ok(m) = job.rx.try_recv() {
@@ -1447,12 +1540,10 @@ impl Explorer {
         }
         if let Some(line) = finished {
             self.job = None;
-            if kind == JobKind::EmptyRecycle {
-                // The bin just changed full → empty: drop the cached glyph so
-                // the left-rail entry re-queries the shell (and re-reads the
-                // listing through the normal reload below).
-                self.icons.invalidate(&crate::shellicon::Kind::Recycle);
-            }
+            // Every job kind can change what the Recycle Bin holds (a move
+            // puts items *in*, a delete or empty takes them *out*), so the
+            // cached full/empty glyph is dropped for all of them.
+            self.icons.invalidate(&crate::shellicon::Kind::Recycle);
             self.refresh_both();
             Some(line)
         } else {
@@ -1486,11 +1577,9 @@ impl Explorer {
         if paths.is_empty() {
             return;
         }
-        if paths.len() == 1 {
-            self.delete_path(paths[0].clone(), false);
-        } else {
-            self.delete_paths(paths, false);
-        }
+        // One code path for both: `delete_paths` keeps a lone *file*
+        // synchronous (instant) and sends everything heavier to a worker.
+        self.delete_paths(paths, false);
     }
 
     /// Shift+Delete: permanent deletion, guarded by a confirmation dialog.
@@ -1563,7 +1652,6 @@ impl Explorer {
             tx.send(JobMsg::Done("已清空回收站（删除 %s 个文件）", files.len().to_string())).ok();
         });
         self.job = Some(Job {
-            kind: JobKind::EmptyRecycle,
             label: crate::lang::tr("清空回收站…", self.lang).into(),
             progress: 0.0,
             note: None,
@@ -1724,33 +1812,19 @@ impl Explorer {
             .unwrap_or_else(|| path.to_string_lossy().into_owned())
     }
 
-    /// Delete a path, either to the Recycle Bin or permanently.
-    pub fn delete_path(&mut self, path: PathBuf, permanent: bool) {
-        let res: Result<(), String> = if permanent {
-            let is_dir = fs::metadata(&path).map(|m| m.is_dir()).unwrap_or(false);
-            let r = if is_dir { fs::remove_dir_all(&path) } else { fs::remove_file(&path) };
-            r.map_err(|e| e.to_string())
-        } else {
-            fs_util::move_to_recycle_bin(&path)
-        };
-        self.status = match res {
-            Ok(_) => format!(
-                "{} {}",
-                crate::lang::tr(if permanent { "已永久删除" } else { "已移到回收站" }, self.lang),
-                path.display()
-            ),
-            Err(e) => format!("{}: {e}", crate::lang::tr("删除失败", self.lang)),
-        };
-        // Either way the bin's contents (and therefore its full/empty glyph)
-        // just changed.
-        self.icons.invalidate(&crate::shellicon::Kind::Recycle);
-        self.reload_both();
-    }
-
     /// Delete several paths at once (Delete / Shift+Delete with a multi-
     /// selection, or the context menu acting on the whole selection). One bad
     /// item must not abort the rest, so failures are counted, not thrown.
+    ///
+    /// More than two items — or anything that contains a folder — goes to a
+    /// worker thread: `remove_dir_all` / `move_to_recycle_bin` on a big tree
+    /// blocks the UI thread for seconds otherwise.
     pub fn delete_paths(&mut self, paths: Vec<PathBuf>, permanent: bool) {
+        let heavy = paths.len() > 2 || paths.iter().any(|p| p.is_dir());
+        if heavy {
+            self.spawn_delete_job(paths, permanent);
+            return;
+        }
         let mut ok = 0usize;
         let mut fail = 0usize;
         // Remember the first failure (file + reason) so a locked or read-only

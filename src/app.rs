@@ -9,6 +9,7 @@
 
 use std::fs;
 use std::path::PathBuf;
+use std::sync::mpsc::Sender;
 
 use crate::fs_util::{self, RecItem};
 
@@ -167,6 +168,14 @@ pub struct Panel {
     /// duration of a frame and only put it back when no reload happened
     /// meanwhile (see `render_list`), avoiding a per-frame deep clone.
     pub generation: u64,
+    /// True while the directory listing is being read on a worker thread (a
+    /// folder with tens of thousands of entries used to freeze the UI thread
+    /// for seconds; now the panel shows 加载中… until the entries arrive).
+    pub loading: bool,
+    /// Set once by `Explorer::new`; from then on `load()` reads the listing on
+    /// a worker thread instead of on the UI thread. `None` during the initial
+    /// (synchronous) construction load.
+    pub list_tx: Option<Sender<(PathBuf, u64)>>,
     /// True while the recycle-bin listing is being read on a worker thread
     /// (a bin can hold thousands of `$I` files; parsing them on the UI
     /// thread used to freeze the whole app).
@@ -192,6 +201,8 @@ impl Panel {
             history: vec![cwd.clone()],
             index: 0,
             generation: 0,
+            loading: false,
+            list_tx: None,
             rec_loading: false,
         };
         p.load(&cwd);
@@ -215,6 +226,11 @@ impl Panel {
     /// takes seconds and would block the UI thread. Instead the panel is
     /// flagged `rec_loading` and `Explorer` reads the listing on a worker
     /// thread (see `Explorer::request_recycle_listings`).
+    ///
+    /// Once a `list_tx` is installed (always, except during construction) the
+    /// normal listing is *also* read on a worker thread: a folder with tens of
+    /// thousands of entries blocks the UI thread for seconds otherwise. The
+    /// panel shows 加载中… until `Explorer::poll_listings` adopts the result.
     pub fn load(&mut self, dir: &std::path::Path) {
         self.generation = self.generation.wrapping_add(1);
         self.cwd = dir.to_path_buf();
@@ -225,10 +241,29 @@ impl Panel {
         if self.in_recycle {
             self.recycle_items.clear();
             self.rec_loading = true;
+            self.loading = false;
         } else {
             self.rec_loading = false;
-            self.read_listing();
+            self.entries.clear();
+            self.loading = true;
+            let requested = self
+                .list_tx
+                .as_ref()
+                .map(|tx| tx.send((self.cwd.clone(), self.generation)).is_ok())
+                .unwrap_or(false);
+            if !requested {
+                // No worker wired up yet (initial construction): read inline
+                // so the first frame already has a listing.
+                self.adopt_listing(read_entries(&self.cwd));
+            }
         }
+    }
+
+    /// Take a worker's listing result (already sorted by the caller's key).
+    pub fn adopt_listing(&mut self, entries: Vec<Entry>) {
+        self.entries = entries;
+        self.loading = false;
+        self.resort();
     }
 
     /// Change directory, recording it in the history.
@@ -273,48 +308,6 @@ impl Panel {
 
     pub fn can_forward(&self) -> bool {
         self.index < self.history.len() - 1
-    }
-
-    fn read_listing(&mut self) {
-        self.entries.clear();
-        let Ok(rd) = fs::read_dir(&self.cwd) else {
-            return;
-        };
-        for e in rd.flatten() {
-            let name = e.file_name().to_string_lossy().into_owned();
-            let path = e.path();
-            let ext = path
-                .extension()
-                .map(|x| x.to_string_lossy().to_lowercase())
-                .unwrap_or_default();
-            let (is_dir, size, mtime, ctime, size_known) = match e.metadata() {
-                Ok(md) => {
-                    let t = md
-                        .modified()
-                        .ok()
-                        .and_then(|mt| mt.duration_since(std::time::UNIX_EPOCH).ok())
-                        .map(|d| d.as_secs())
-                        .unwrap_or(0);
-                    // Creation time: available on Windows; other platforms
-                    // return Err, which we surface as 0 ("—").
-                    let c = md
-                        .created()
-                        .ok()
-                        .and_then(|ct| ct.duration_since(std::time::UNIX_EPOCH).ok())
-                        .map(|d| d.as_secs())
-                        .unwrap_or(0);
-                    let is_dir = md.is_dir() || path.is_dir();
-                    if is_dir {
-                        (true, 0, t, c, false) // size filled in by the background worker
-                    } else {
-                        (false, md.len(), t, c, true)
-                    }
-                }
-                Err(_) => (false, 0, 0, 0, false),
-            };
-            self.entries.push(Entry { name, is_dir, size, mtime, ctime, size_known, ext });
-        }
-        self.resort();
     }
 
     /// Apply the current sort key/direction to the normal listing.
@@ -498,6 +491,53 @@ impl Panel {
         }
         None
     }
+}
+
+/// Read one directory into unsorted `Entry` rows.
+///
+/// Kept as a free function so the *worker* thread can build a listing without
+/// touching a `Panel` (which lives on the UI thread). Folder sizes are left
+/// unknown here; the size worker fills them in (see `Explorer`).
+pub fn read_entries(cwd: &std::path::Path) -> Vec<Entry> {
+    let mut out = Vec::new();
+    let Ok(rd) = fs::read_dir(cwd) else {
+        return out;
+    };
+    for e in rd.flatten() {
+        let name = e.file_name().to_string_lossy().into_owned();
+        let path = e.path();
+        let ext = path
+            .extension()
+            .map(|x| x.to_string_lossy().to_lowercase())
+            .unwrap_or_default();
+        let (is_dir, size, mtime, ctime, size_known) = match e.metadata() {
+            Ok(md) => {
+                let t = md
+                    .modified()
+                    .ok()
+                    .and_then(|mt| mt.duration_since(std::time::UNIX_EPOCH).ok())
+                    .map(|d| d.as_secs())
+                    .unwrap_or(0);
+                // Creation time: available on Windows; other platforms
+                // return Err, which we surface as 0 ("—").
+                let c = md
+                    .created()
+                    .ok()
+                    .and_then(|ct| ct.duration_since(std::time::UNIX_EPOCH).ok())
+                    .map(|d| d.as_secs())
+                    .unwrap_or(0);
+                let is_dir = md.is_dir() || path.is_dir();
+                if is_dir {
+                    (true, 0, t, c, false) // size filled in by the background worker
+                } else {
+                    (false, md.len(), t, c, true)
+                }
+            }
+            Err(_) => (false, 0, 0, 0, false),
+        };
+        out.push(Entry { name, is_dir, size, mtime, ctime, size_known, ext });
+    }
+    out
 }
 
 /// Read the user's per-drive recycle folder (`...\$Recycle.Bin\<SID>`),

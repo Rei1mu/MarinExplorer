@@ -1,9 +1,9 @@
 //! Windows system tray for MarinExplorer.
 //!
 //! A background thread owns a hidden, message-only window and a notify icon
-//! with a two-item menu: 打开 (Open) and 重启 (Restart). The main window HWND
-//! is shared through a static so the tray can show / restart it. The icon is
-//! taken from this executable's embedded RT_GROUP_ICON.
+//! with a three-item menu: 打开 (Open) / 重启 (Restart) / 退出 (Quit). The main
+//! window HWND is shared through a static so the tray can show / restart /
+//! close it. The icon is taken from this executable's embedded RT_GROUP_ICON.
 //!
 //! Only compiled on Windows; other platforms get empty stubs so the call
 //! sites stay platform-agnostic.
@@ -23,6 +23,11 @@ mod imp {
     const WM_TRAY_QUIT: u32 = WM_USER + 2;
     const ID_OPEN: u32 = 1;
     const ID_RESTART: u32 = 2;
+    const ID_QUIT: u32 = 3;
+    /// Standard "please close" for the main window. eframe's window procedure
+    /// turns it into the same flow as the X button (which runs `App::save`),
+    /// so the tray's 退出 persists settings just like closing by hand.
+    const WM_CLOSE: u32 = 0x0010;
 
     const NIM_ADD: u32 = 0;
     const NIM_DELETE: u32 = 2;
@@ -199,8 +204,10 @@ mod imp {
             }
             let open_w = wide("打开");
             let restart_w = wide("重启");
+            let quit_w = wide("退出");
             append_menu(menu, MF_STRING, ID_OPEN, open_w.as_ptr());
             append_menu(menu, MF_STRING, ID_RESTART, restart_w.as_ptr());
+            append_menu(menu, MF_STRING, ID_QUIT, quit_w.as_ptr());
             set_foreground_window(hwnd);
             let pt = get_cursor_pos();
             let cmd = track_popup_menu(menu, TPM_RETURNCMD, pt.0, pt.1, hwnd);
@@ -210,8 +217,25 @@ mod imp {
             match cmd {
                 ID_OPEN => open_main(),
                 ID_RESTART => restart_main(hwnd),
+                ID_QUIT => quit_app(hwnd),
                 _ => {}
             }
+        }
+    }
+
+    /// Tray "退出": drop the icon first (a process that dies with a live
+    /// notify icon leaves a ghost in the tray until the mouse hovers over it),
+    /// then ask the main window to close the normal way so settings flush,
+    /// then stop this thread's message loop.
+    fn quit_app(tray_hwnd: isize) {
+        delete_icon(tray_hwnd);
+        if let Some(hwnd) = *MAIN_HWND.lock().unwrap() {
+            unsafe {
+                post_message(hwnd, WM_CLOSE, 0, 0);
+            }
+        }
+        unsafe {
+            post_message(tray_hwnd, WM_TRAY_QUIT, 0, 0);
         }
     }
 
@@ -461,22 +485,12 @@ mod imp {
     pub fn start() {
         std::thread::spawn(|| run());
     }
-
-    pub fn quit() {
-        if let Some(hwnd) = *TRAY_HWND.lock().unwrap() {
-            unsafe {
-                post_message(hwnd, WM_TRAY_QUIT, 0, 0);
-            }
-        }
-    }
 }
 
 #[cfg(target_os = "windows")]
-pub use imp::{quit, set_main_hwnd, start};
+pub use imp::{set_main_hwnd, start};
 
 #[cfg(not(target_os = "windows"))]
 pub fn set_main_hwnd(_hwnd: isize) {}
 #[cfg(not(target_os = "windows"))]
 pub fn start() {}
-#[cfg(not(target_os = "windows"))]
-pub fn quit() {}

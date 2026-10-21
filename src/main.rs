@@ -14,6 +14,10 @@
 //!   ↑/↓ select · Enter open · Home/End · Delete delete ·
 //!   Alt+←/→ back/forward · Escape close dialogs.
 
+// A GUI app: without this, Windows allocates a console window that flashes
+// open (and swallows panics) on every launch.
+#![windows_subsystem = "windows"]
+
 mod app;
 mod cache;
 mod convert;
@@ -266,6 +270,13 @@ fn icon_menu<R>(
 }
 
 impl eframe::App for Explorer {
+    /// Called by eframe when the window closes (X button, tray quit, …).
+    /// Without this the size cache and any setting changed in the last few
+    /// seconds would be lost, because `maybe_flush` only writes every 5s.
+    fn save(&mut self, _storage: &mut dyn eframe::Storage) {
+        self.flush_now();
+    }
+
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         // Light / dark theme, applied every frame so a toggle is instant.
         let mut visuals = if self.dark {
@@ -324,6 +335,8 @@ impl eframe::App for Explorer {
         // are still loading, then adopt whatever finished.
         self.request_recycle_listings();
         self.poll_recycle();
+        // Same dance for the normal directory listings.
+        self.poll_listings();
         self.refresh_quick_access();
         self.poll_quick_access();
         if let Some(line) = self.poll_job() {
@@ -385,21 +398,20 @@ impl eframe::App for Explorer {
                     }
                     ui.separator();
                     ui.label(t("语言"));
-                    egui::ComboBox::from_id_salt("lang_select")
-                        .selected_text(
-                            crate::lang::Lang::names()
-                                .iter()
-                                .find(|(l, _)| *l == self.lang)
-                                .map(|(_, n)| *n)
-                                .unwrap_or(""),
-                        )
-                        .show_ui(ui, |ui| {
-                            for (l, name) in crate::lang::Lang::names() {
-                                if ui.selectable_value(&mut self.lang, l, name).clicked() {
-                                    self.set_lang(l);
-                                }
+                    // Plain buttons, one per language — a ComboBox nested
+                    // inside this popup swallowed clicks (and could close the
+                    // whole window), so the choice is now a direct hit target.
+                    ui.horizontal_wrapped(|ui| {
+                        for (l, name) in crate::lang::Lang::names() {
+                            if ui
+                                .selectable_label(self.lang == l, name)
+                                .clicked()
+                                && self.lang != l
+                            {
+                                self.set_lang(l);
                             }
-                        });
+                        }
+                    });
                 });
                 if icons::button(ui, &icons::BACK, &t("后退"), can_back, "").clicked() {
                     self.active_panel().back();
@@ -867,6 +879,11 @@ impl eframe::App for Explorer {
                     self.lang,
                 );
                 if n == 1 {
+                    let target = self
+                        .delete_targets
+                        .first()
+                        .map(|p| p.display().to_string())
+                        .unwrap_or_default();
                     crate::lang::tr(
                         if perm {
                             "删除 “%s”？\n（永久删除，不进回收站）"
@@ -875,7 +892,7 @@ impl eframe::App for Explorer {
                         },
                         self.lang,
                     )
-                    .replace("%s", &self.delete_targets[0].display().to_string())
+                    .replace("%s", &target)
                 } else {
                     format!(
                         "{} {} {}",
@@ -2382,6 +2399,7 @@ impl Explorer {
         }
 
         let show_hidden = self.show_hidden;
+        let loading = get_panel(self, is_left).loading;
         let vis = get_panel(self, is_left).visible(show_hidden);
         // Multi-selection membership, cloned once per frame: rows read it for
         // their highlight, clicks update it through `click_select`.
@@ -2412,7 +2430,11 @@ impl Explorer {
                 // instead of a dashed stack of 20px stubs.
                 ui.spacing_mut().item_spacing.y = 0.0;
                 if vis.is_empty() {
-                    weak(ui, crate::lang::tr("空目录", self.lang));
+                    if loading {
+                        weak(ui, crate::lang::tr("加载中…", self.lang));
+                    } else {
+                        weak(ui, crate::lang::tr("空目录", self.lang));
+                    }
                 }
                 for (k, &i) in vis.iter().enumerate() {
                     let e = &entries[i];
@@ -2610,6 +2632,7 @@ impl Explorer {
 
     fn render_grid(&mut self, ui: &mut egui::Ui, is_left: bool) {
         let show_hidden = self.show_hidden;
+        let loading = get_panel(self, is_left).loading;
         let vis = get_panel(self, is_left).visible(show_hidden);
         // Multi-selection membership, cloned once per frame (see render_list).
         let multi = get_panel(self, is_left).multi.clone();
@@ -2628,7 +2651,11 @@ impl Explorer {
             .auto_shrink([false, false])
             .show(ui, |ui| {
                 if vis.is_empty() {
-                    weak(ui, crate::lang::tr("空目录", self.lang));
+                    if loading {
+                        weak(ui, crate::lang::tr("加载中…", self.lang));
+                    } else {
+                        weak(ui, crate::lang::tr("空目录", self.lang));
+                    }
                 }
                 let mut start = 0usize;
                 while start < vis.len() {
@@ -2751,13 +2778,38 @@ impl Explorer {
                         // click/double-click on the thumbnail name.
                         let cap_rect = ui
                             .allocate_exact_size(
-                                egui::vec2(CELL_W - 18.0, 16.0),
+                                egui::vec2(CELL_W - 18.0, 30.0),
                                 egui::Sense::hover(),
                             )
                             .0;
                         let font_id = egui::TextStyle::Small.resolve(ui.style());
                         let color = ui.visuals().text_color();
-                        cell_text_with(ui, cap_rect, name.clone(), font_id, color);
+                        // Name on the first line, size on the second — folders
+                        // show their computed total once the size worker has
+                        // it ("…" while it is still being walked).
+                        let name_rect =
+                            egui::Rect::from_min_size(cap_rect.min, egui::vec2(cap_rect.width(), 16.0));
+                        cell_text_with(ui, name_rect, name.clone(), font_id.clone(), color);
+                        let size_txt = if e.is_dir {
+                            if e.size_known {
+                                human_size(e.size)
+                            } else {
+                                "…".to_string()
+                            }
+                        } else {
+                            human_size(e.size)
+                        };
+                        let size_rect = egui::Rect::from_min_size(
+                            cap_rect.min + egui::vec2(0.0, 16.0),
+                            egui::vec2(cap_rect.width(), 13.0),
+                        );
+                        cell_text_with(
+                            ui,
+                            size_rect,
+                            size_txt,
+                            font_id,
+                            ui.visuals().weak_text_color(),
+                        );
                     },
                 );
             });
@@ -2936,7 +2988,24 @@ impl Explorer {
         }
         if let Some(m) = &md {
             if is_dir {
-                weak(ui, crate::lang::tr("文件夹", self.lang));
+                // Folders show their computed total too (from the size worker),
+                // so the preview pane agrees with the 大小 column.
+                let sz = self
+                    .active_panel()
+                    .sel_entry()
+                    .filter(|e| e.size_known)
+                    .map(|e| human_size(e.size));
+                match sz {
+                    Some(s) => weak(
+                        ui,
+                        format!(
+                            "{} · {} {s}",
+                            crate::lang::tr("文件夹", self.lang),
+                            crate::lang::tr("大小", self.lang)
+                        ),
+                    ),
+                    None => weak(ui, crate::lang::tr("文件夹", self.lang)),
+                };
             } else {
                 weak(ui, format!("{} {}", crate::lang::tr("大小", self.lang), human_size(m.len())));
             }

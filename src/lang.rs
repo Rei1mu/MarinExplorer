@@ -102,6 +102,7 @@ fn lookup(key: &str) -> Option<(&'static str, &'static str, &'static str)> {
         ("列表", "List", "リスト", "列表"),
         ("缩略图", "Thumbnails", "サムネイル", "縮圖"),
         ("空目录", "(empty folder)", "(空のフォルダ)", "（空目錄）"),
+        ("加载中…", "Loading…", "読み込み中…", "載入中…"),
         ("回收站为空", "(Recycle Bin empty)", "(ゴミ箱は空)", "（資源回收筒為空）"),
         ("选中:", "Selected:", "選択:", "選取:"),
         ("项", "items", "項目", "項"),

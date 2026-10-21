@@ -1,13 +1,12 @@
 name: Build
 
-# MarinExplorer targets Windows only, and ships three editions:
-#   - x86_64-pc-windows-gnu    standard Windows x64, MinGW-w64/GCC, built on Linux
+# MarinExplorer targets Windows only, and ships two MSVC editions:
 #   - x86_64-pc-windows-msvc   standard Windows x64, MSVC, built on a Windows runner
 #   - aarch64-pc-windows-msvc  Windows on ARM64, MSVC, built on a Windows runner
 #
-# Both x64 editions run on any ordinary 64-bit Windows PC. They differ only in
-# how they were compiled: GNU links the MinGW runtime, MSVC links Microsoft's
-# (statically here — see the RUSTFLAGS below, so no redistributable needed).
+# Both link the Microsoft C runtime statically (see the RUSTFLAGS below), so no
+# "Visual C++ Redistributable" is needed on the target machine. Only the two
+# setup.exe installers are published; bare exes are not.
 on:
   push:
     branches: [main]
@@ -25,36 +24,6 @@ env:
   CARGO_TARGET_AARCH64_PC_WINDOWS_MSVC_RUSTFLAGS: "-C target-feature=+crt-static"
 
 jobs:
-  build-gnu-x86_64:
-    name: Windows x64 (GNU)
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v7
-
-      - name: Install MinGW-w64 toolchain (GCC-based, matches the local build)
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y gcc-mingw-w64-x86-64 binutils-mingw-w64-x86-64
-
-      - name: Set up Rust
-        uses: dtolnay/rust-toolchain@v1
-        with:
-          toolchain: stable
-          targets: x86_64-pc-windows-gnu
-
-      - name: Build release
-        run: cargo build --release --target x86_64-pc-windows-gnu
-
-      - name: Stage artifact
-        run: cp "target/x86_64-pc-windows-gnu/release/MarinExplorer.exe" "MarinExplorer-x64-gnu.exe"
-
-      - name: Upload build artifact
-        uses: actions/upload-artifact@v7
-        with:
-          name: MarinExplorer-x64-gnu
-          path: MarinExplorer-x64-gnu.exe
-          if-no-files-found: error
-
   build-msvc-x86_64:
     name: Windows x64 (MSVC)
     runs-on: windows-latest
@@ -124,21 +93,14 @@ jobs:
   # One installer per architecture: the payload exe is not interchangeable.
   # Inno Setup 7 supports the arm64 architecture identifier natively, so ARM64
   # Windows 11 gets its own installer instead of relying on x64 emulation:
-  #   - x64       → GNU  x64 build   (ArchitecturesAllowed=x64os)
   #   - x64-msvc  → MSVC x64 build   (ArchitecturesAllowed=x64os)
   #   - arm64     → MSVC ARM64 build (ArchitecturesAllowed=arm64)
   installer:
     name: Windows installer
     runs-on: windows-latest
-    needs: [build-gnu-x86_64, build-msvc-x86_64, build-msvc-arm64]
+    needs: [build-msvc-x86_64, build-msvc-arm64]
     steps:
       - uses: actions/checkout@v7
-
-      - name: Download the GNU x64 build
-        uses: actions/download-artifact@v7
-        with:
-          name: MarinExplorer-x64-gnu
-          path: target/x86_64-pc-windows-gnu/release
 
       - name: Download the MSVC x64 build
         uses: actions/download-artifact@v7
@@ -158,7 +120,6 @@ jobs:
         shell: pwsh
         run: |
           $dirs = @(
-            "target\x86_64-pc-windows-gnu\release",
             "target\x86_64-pc-windows-msvc\release",
             "target\aarch64-pc-windows-msvc\release"
           )
@@ -196,9 +157,6 @@ jobs:
           Write-Output "using $($iscc.FullName)"
           Get-ChildItem (Join-Path $iscc.DirectoryName "Languages") -Filter *.isl -ErrorAction SilentlyContinue |
             Select-Object -ExpandProperty Name
-          # x64 installer (GNU payload).
-          & $iscc.FullName installer/marin.iss "/DMyAppVersion=${{ steps.ver.outputs.version }}" "/DMyAppArch=x64" "/Oinstaller\Output"
-          if ($LASTEXITCODE -ne 0) { throw "ISCC failed for x64 (exit $LASTEXITCODE)" }
           # x64 installer (MSVC payload).
           & $iscc.FullName installer/marin.iss "/DMyAppVersion=${{ steps.ver.outputs.version }}" "/DMyAppArch=x64-msvc" "/Oinstaller\Output"
           if ($LASTEXITCODE -ne 0) { throw "ISCC failed for x64-msvc (exit $LASTEXITCODE)" }
@@ -224,7 +182,6 @@ jobs:
     runs-on: ubuntu-latest
     if: startsWith(github.ref, 'refs/tags/v')
     needs:
-      - build-gnu-x86_64
       - build-msvc-x86_64
       - build-msvc-arm64
       - installer
@@ -243,8 +200,6 @@ jobs:
       - name: Upload to GitHub Release
         uses: softprops/action-gh-release@v3
         with:
+          # Only the two setup.exe installers — no bare exes.
           files: |
-            dist/MarinExplorer-x64-gnu.exe
-            dist/MarinExplorer-x64-msvc.exe
-            dist/MarinExplorer-arm64.exe
             dist/MarinExplorer-Setup-*.exe
