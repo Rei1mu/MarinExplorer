@@ -12,7 +12,7 @@
 ; ---------------------------------------------------------------------------
 
 #ifndef MyAppVersion
-  #define MyAppVersion "0.1.7"
+  #define MyAppVersion "0.1.8"
 #endif
 
 ; `VersionInfoVersion` must be strictly numeric (x[.x.x.x]), while a display
@@ -62,18 +62,30 @@ AppSupportURL={#MyAppURL}/issues
 AppUpdatesURL={#MyAppURL}/releases
 VersionInfoVersion={#MyNumericVersion}
 
-; Default install location: the per-user "Programs" directory.
-; Why not Program Files: MarinExplorer keeps its own store (folder-size cache)
-; next to the executable so the install stays self-contained. Program Files is
-; not writable without elevation, which would silently push the cache back
-; into %LOCALAPPDATA% — exactly what we want to avoid. This location needs no
-; administrator rights and is writable by the installing user.
+; Per-user install location, but the installer itself runs elevated.
+; Why not Program Files: MarinExplorer keeps its own store (folder-size
+; cache) next to the executable so the install stays self-contained, and
+; the app runs unelevated whenever its UAC prompt is declined — Program
+; Files would not be writable then, silently pushing the cache into
+; %LOCALAPPDATA%. {localappdata} is always writable by this user.
+; Why the installer is elevated anyway: since v0.1.5 the app relaunches
+; itself with "runas" (the Recycle Bin can hold other accounts' items,
+; which only an elevated process can delete). An unelevated installer
+; cannot close an elevated process — UIPI blocks the close request — so
+; upgrading while the app runs used to fail with "DeleteFile failed;
+; error code 5" (file in use). Elevated, Setup's CloseApplications works
+; and the old instance is shut down silently before the exe is replaced.
+; Cost: one UAC prompt per install/upgrade — the same prompt the app
+; itself shows on every launch.
 DefaultDirName={localappdata}\Programs\{#MyAppName}
-; Install for the current user only; never ask for elevation.
-PrivilegesRequired=lowest
-PrivilegesRequiredOverridesAllowed=dialog
+PrivilegesRequired=admin
+; Inno 7 closes apps that lock files being replaced (the default, made
+; explicit here): this is what shuts the running elevated instance down.
+CloseApplications=yes
 
-DefaultGroupName={#MyAppName}
+; Start-menu entry stays in the *current user's* group: administrative
+; install mode would otherwise default it to the all-users group.
+DefaultGroupName={userprograms}\{#MyAppName}
 LicenseFile=..\LICENSE
 WizardStyle=modern
 ; Let the user pick another drive/directory.
@@ -81,7 +93,9 @@ DisableDirPage=no
 DisableProgramGroupPage=yes
 OutputDir=Output
 OutputBaseFilename={#MyAppName}-Setup-Windows-{#MyAppArch}-{#MyAppVersion}
-; A per-user install still gets its own Add/Remove Programs entry.
+; Add/Remove Programs entry. In administrative mode (PrivilegesRequired=
+; admin) Inno writes it under HKLM, so every user of this machine sees it;
+; uninstalling then also needs the same one UAC prompt.
 CreateUninstallRegKey=yes
 UninstallDisplayName={#MyAppName} {#MyAppVersion}
 SolidCompression=yes

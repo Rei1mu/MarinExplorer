@@ -11,6 +11,12 @@
 
 ## 更新日志 / Changelog
 
+### v0.1.8 — 2026-10-23
+- **安装包修复（升级不再被占用文件卡住）**：应用自 v0.1.5 起以管理员身份自提权运行，而安装包此前是「不提权」安装——中完整性的安装程序关不掉提权的旧实例（UIPI 拦截），覆盖安装时报「DeleteFile 失败；错误代码 5」。安装包现在同样以管理员身份运行（每次安装/升级一次 UAC 确认，与应用每次启动的自提权一致），升级时 Inno 会自动关闭正在运行的旧版，不再弹文件占用对话框。安装位置仍是每用户目录，开始菜单条目也仍只属当前用户。
+
+**English**
+- **Installer fix (upgrades no longer stall on a locked file)**: the app has self-elevated (runas) since v0.1.5, while the installer ran unelevated — a medium-integrity setup cannot close an elevated instance (UIPI blocks it), so upgrading over a running app failed with "DeleteFile failed; error code 5". The installer now runs elevated too (one UAC prompt per install/upgrade, same as the app's own self-elevation), and Inno's CloseApplications shuts the running old version down before replacing the exe — no more file-in-use dialog. The install location stays per-user, and the Start-menu entry stays in the current user's group.
+
 ### v0.1.7 — 2026-10-23
 - **单实例守卫**：重复启动不再打开第二个窗口——新进程把路径交给已运行的实例并激活它的窗口（用文件投递代替 `WM_COPYDATA`，绕过 UIPI 对提权窗口的拦截）。托盘「重启」改为接管模式（`--take-over`）：重启后直接替换旧窗口，不再留下一个空窗口。
 - **大小计算框常驻**：手动点「重新计算大小」后，左下角的框不再中途消失——完成后固定显示「大小计算完成 · 耗时 X · 已扫 Y」，直到下一次计算；也不再覆盖最左侧的操作日志。
@@ -56,6 +62,8 @@
 - ☑ 加入开始菜单（默认勾选）
 - ☑ 在右键菜单中加入「通过 MarinExplorer 打开」（默认勾选）
 - ☐ 创建桌面快捷方式
+
+安装程序会请求一次管理员确认（UAC）：升级时靠它自动关闭正在运行的旧版，避免「文件被占用、替换失败」。安装位置仍是每用户目录，开始菜单条目也只属当前用户。
 
 安装目录可自行更改，默认是 `%LOCALAPPDATA%\Programs\MarinExplorer`。之所以不用 Program Files：MarinExplorer 把文件夹大小缓存写在**自己的安装目录**里以保持自包含，而 Program Files 没有管理员权限就写不进去。若希望完全不碰 C 盘，安装时改成 `D:\Programs\MarinExplorer` 之类即可。
 
@@ -173,6 +181,8 @@ A **lightweight, Windows-on-ARM64-capable, Rust + [egui](https://github.com/emil
 - ☑ Add to Start menu (checked by default)
 - ☑ Add "Open with MarinExplorer" to the right-click menu (checked by default)
 - ☐ Create a desktop shortcut
+
+Setup asks for one administrator confirmation (UAC): on upgrades it is used to close the running old version automatically, so the exe is never "in use". The install location stays per-user, and the Start-menu entry stays in the current user's group.
 
 You may change the install directory; the default is `%LOCALAPPDATA%\Programs\MarinExplorer`. Program Files is deliberately not the default: MarinExplorer keeps its folder-size cache **inside its own install directory** to stay self-contained, and Program Files is not writable without elevation. If you want nothing on `C:`, point the installer at something like `D:\Programs\MarinExplorer`.
 
