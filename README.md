@@ -11,6 +11,14 @@
 
 ## 更新日志 / Changelog
 
+### v0.1.6 — 2026-10-23
+- **清空回收站重构**：不再调用 `SHEmptyRecycleBin`（系统会在删除前枚举并重新计算总大小，数万乃至数十万文件时正是资源管理器卡死/无法删除的根因）。改为直接遍历自己 SID 下的 `$Recycle.Bin\{SID}`，边删 `$I`/`$R` 边计数，底部进度条显示真实百分比 + 「已删除 N」，不再卡顿，也不会因系统枚举失败而删不掉。
+- **下载指引**：普通 Windows x64 用户请下载 `MarinExplorer-Setup-Windows-x64-msvc-0.1.6.exe`；ARM 架构的 Windows（如 Surface、骁龙平板/笔记本）请下载 `MarinExplorer-Setup-Windows-arm64-0.1.6.exe`。两者不可混用，安装包已按架构限制。
+
+**English**
+- **Recycle Bin empty reworked**: no longer calls `SHEmptyRecycleBin` (which enumerates and recomputes total size before deleting — the exact cause of File Explorer's freeze / failure at tens-to-hundreds of thousands of items). It now walks your own `$Recycle.Bin\{SID}` and deletes the `$I`/`$R` pairs while counting, with a real percentage + "deleted N" in the bottom bar — no stall, and it can't fail to delete because of the shell's enumeration.
+- **Download note**: regular Windows x64 users grab `MarinExplorer-Setup-Windows-x64-msvc-0.1.6.exe`; ARM Windows (e.g. Surface, Snapdragon tablet/laptop) grab `MarinExplorer-Setup-Windows-arm64-0.1.6.exe`. They are not interchangeable — each installer is architecture-locked.
+
 ### v0.1.5 — 2026-10-23
 - 左侧「快速访问」已固定的桌面 / 下载 / 文档等条目改用系统真实（彩色）图标，与文件夹主区域一致；移除了冗余的「常用位置」分组。
 - 顶部工具栏「移动」改为「剪贴」，图标换成剪刀，相关提示文案同步更新。

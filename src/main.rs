@@ -720,7 +720,10 @@ impl eframe::App for Explorer {
                         } else {
                             ui.add(
                                 egui::ProgressBar::new(job.progress.clamp(0.0, 1.0))
-                                    .text(format!("{} {:.0}%", job.label, job.progress * 100.0)),
+                                    .text(format!(
+                                        "{} 已删除 {} · {:.0}%",
+                                        job.label, job.deleted, job.progress * 100.0
+                                    )),
                             );
                         }
                     });

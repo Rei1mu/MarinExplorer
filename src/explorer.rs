@@ -14,6 +14,10 @@ use crate::fs_util::{self, DriveInfo};
 /// Messages from background work.
 pub enum JobMsg {
     Progress(f32),
+    /// Live count of items already deleted by a streaming job (e.g. the
+    /// Recycle-Bin empty). Carries no language, so job threads stay agnostic;
+    /// the UI renders it as "已删除 N".
+    Deleted(u64),
     /// `(key, arg)`: `key` is a translation key (may contain `%s`), `arg` is
     /// substituted for `%s` when non-empty. Lets job threads stay language-agnostic.
     Done(&'static str, String),
@@ -37,6 +41,10 @@ pub struct Job {
     /// Recycle-Bin empty, where `SHEmptyRecycleBin` gives no per-file progress
     /// and we must avoid the shell's own (stall-prone) modal dialog.
     pub indeterminate: bool,
+    /// Live count of items already deleted (Recycle-Bin empty). Shown in the
+    /// progress bar as "已删除 N" so the user gets concrete progress without
+    /// the shell's stall-prone enumeration.
+    pub deleted: u64,
     pub note: Option<(&'static str, String)>,
     pub err: Option<String>,
     pub rx: Receiver<JobMsg>,
@@ -46,6 +54,7 @@ impl Job {
     fn finish(&mut self, m: JobMsg) {
         match m {
             JobMsg::Progress(p) => self.progress = p,
+            JobMsg::Deleted(n) => self.deleted = n,
             JobMsg::Done(k, a) => self.note = Some((k, a)),
             JobMsg::Failed(e) => self.err = Some(e),
         }
@@ -1871,6 +1880,7 @@ impl Explorer {
         self.job = Some(Job {
             label,
             progress: 0.0,
+            deleted: 0,
             indeterminate: false,
             note: None,
             err: None,
@@ -1936,6 +1946,7 @@ impl Explorer {
         self.job = Some(Job {
             label,
             progress: 0.0,
+            deleted: 0,
             indeterminate: false,
             note: None,
             err: None,
@@ -2119,73 +2130,71 @@ fn remove_tree(p: &std::path::Path) -> std::io::Result<()> {
     }
 }
 
-/// `C:\$Recycle.Bin\S-1-…` -> `Some("C:\")`, used to scope the shell call.
-fn drive_root(dir: &std::path::Path) -> Option<String> {
-    let s = dir.to_string_lossy();
-    let mut chars = s.chars();
-    let letter = chars.next()?;
-    if chars.next() == Some(':') {
-        Some(format!("{letter}:\\"))
-    } else {
-        None
-    }
-}
-
-/// Empty the active recycle-bin view in the background (no UI stall).
+    /// Empty the active recycle bin in the background, with real per-file
+    /// progress and no shell enumeration — so it cannot hit the Explorer freeze.
     pub fn spawn_empty_recycle(&mut self) {
-        let dir = self.active_panel().cwd.clone();
+        let target = Self::recycle_target(self);
         let (tx, rx) = channel();
         thread::spawn(move || {
-            // Preferred: hand it to the shell. It is the only thing that
-            // reliably removes read-only entries, names past MAX_PATH and
-            // items from another account — exactly the cases where "empty"
-            // used to look like it did nothing.
-            // Scope the shell call to this drive: NULL means "every drive",
-            // and one unreachable volume then fails the whole call.
-            let root = Self::drive_root(&dir);
-            if crate::shell::empty_recycle_bin(root.as_deref()) {
-                tx.send(JobMsg::Done("已清空回收站", String::new())).ok();
-                return;
-            }
-            // Fallback: delete the $I / $R pairs ourselves.
-            let mut files: Vec<PathBuf> = vec![];
-            if let Ok(rd) = fs::read_dir(&dir) {
+            let target = match target {
+                Some(d) => d,
+                None => {
+                    // No per-user `$Recycle.Bin\{SID}` resolvable — essentially
+                    // never, but fall back to the shell so the bin can clear.
+                    let _ = crate::shell::empty_recycle_bin(None);
+                    tx.send(JobMsg::Done("已清空回收站", String::new())).ok();
+                    return;
+                }
+            };
+            // Streaming self-delete. We deliberately avoid `SHEmptyRecycleBin`
+            // / `SHQueryRecycleBin`: the shell enumerates the bin and recomputes
+            // total size up front, and at tens-to-hundreds of thousands of items
+            // that is exactly what makes File Explorer hang / fail to empty.
+            // Instead we walk the names (cheap, no size calc) and delete each
+            // `$I`/`$R` pair as we go, so the count emerges from the delete
+            // itself — no pre-read of "how many files", and the work *is* the
+            // actual deletion (zero extra overhead). We keep the full path list
+            // up front only so every entry is guaranteed removed (an in-iterator
+            // delete can skip under directory churn).
+            let mut entries: Vec<std::path::PathBuf> = vec![];
+            if let Ok(rd) = fs::read_dir(&target) {
                 for e in rd.flatten() {
                     let n = e.file_name().to_string_lossy().into_owned();
-                    if n.starts_with("$") {
-                        files.push(e.path());
+                    if n.starts_with('$') {
+                        entries.push(e.path());
                     }
                 }
             }
-            let total = files.len().max(1) as f32;
-            let mut n = 0f32;
-            let mut failed = 0usize;
-            for p in &files {
-                if Self::force_remove(p).is_err() {
+            let total = entries.len().max(1) as f32;
+            let mut deleted = 0u64;
+            let mut failed = 0u64;
+            for p in &entries {
+                if Self::force_remove(p).is_ok() {
+                    deleted += 1;
+                } else {
                     failed += 1;
                 }
-                n += 1.0;
-                tx.send(JobMsg::Progress(n / total)).ok();
+                tx.send(JobMsg::Deleted(deleted)).ok();
+                tx.send(JobMsg::Progress(deleted as f32 / total)).ok();
             }
             if failed > 0 {
                 // Say so instead of claiming success: a silent partial empty
                 // is what made this look broken.
                 tx.send(JobMsg::Done(
-                    "回收站已清空，但 %s 项无法删除（可尝试以管理员身份运行后重试）",
+                    "回收站已清空，但 %s 项未能删除（可尝试以管理员身份运行后重试）",
                     failed.to_string(),
                 ))
                 .ok();
             } else {
-                tx.send(JobMsg::Done("已清空回收站（删除 %s 个文件）", files.len().to_string())).ok();
+                tx.send(JobMsg::Done("已清空回收站（删除 %s 个文件）", deleted.to_string())).ok();
             }
         });
         self.job = Some(Job {
             label: crate::lang::tr("清空回收站…", self.lang).into(),
             progress: 0.0,
-            // The shell owns the real work and only signals at the end, so we
-            // cannot show a percentage. Draw an indeterminate (animated) bar
-            // instead of the shell's own stall-prone modal dialog.
-            indeterminate: true,
+            // We now drive a real percentage, so the bar is determinate.
+            indeterminate: false,
+            deleted: 0,
             note: None,
             err: None,
             rx,
