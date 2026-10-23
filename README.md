@@ -9,6 +9,20 @@
 
 ---
 
+## 更新日志 / Changelog
+
+### v0.1.5 — 2026-10-23
+- 左侧「快速访问」已固定的桌面 / 下载 / 文档等条目改用系统真实（彩色）图标，与文件夹主区域一致；移除了冗余的「常用位置」分组。
+- 顶部工具栏「移动」改为「剪贴」，图标换成剪刀，相关提示文案同步更新。
+- 清空回收站不再弹出系统进度框（数万文件下会卡顿），改为后台线程执行 + 底部不确定的动画进度条，系统调用返回后自动消失。
+
+**English**
+- Quick-access pinned items (Desktop / Downloads / Documents…) now use the system's real (full-colour) icons, matching the main pane; the redundant "Common locations" group was removed.
+- Toolbar "Move" renamed to "Cut" with a scissors icon; status text updated accordingly.
+- Emptying the Recycle Bin no longer shows the system progress dialog (which can hang with tens of thousands of files); it runs on a background thread with an indeterminate animated progress bar at the bottom and disappears once the system call returns.
+
+---
+
 ## 中文文档
 
 一个**轻量、支持 Windows on ARM64、基于 Rust + [egui](https://github.com/emilk/egui) 的双栏文件管理器**。
