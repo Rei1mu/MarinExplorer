@@ -62,7 +62,7 @@
 ### 它解决了什么
 
 1. **资源占用太大** — 资源管理器偏重。MarinExplorer 用 Rust + egui 自绘 UI，常驻内存远低于系统资源管理器，在内存吃紧的 ARM64 设备上差别尤其明显。
-2. **回收站卡死** — 回收站里堆到数万文件时，资源管理器要花特别久才能读出列表，删除更是近乎不可用。这里把 `$Recycle.Bin` 里 `$I` 文件的解析丢到**后台线程**，界面不等它、全程可操作；清空后自动刷新，侧边栏图标随「满 / 空」变化。
+2. **回收站卡死** — 回收站里堆到数万文件时，资源管理器要花特别久才能读出列表，删除更是近乎不可用。这里把 `$Recycle.Bin` 里 `$I` 文件的解析丢到**后台线程**，界面不等它、全程可操作；清空后自动刷新，侧边栏图标随「满 / 空」变化。清空回收站也重写过：不再调用系统的 `SHEmptyRecycleBin`（它要先枚举并重算总大小，数十万文件时正是资源管理器卡死/删不掉的根因），而是直接遍历自己账户的 `$Recycle.Bin` 流式删除，底部进度条显示**真实百分比 + 已删除数量**，全程不卡、也不会删不掉。
 3. **图片预览各自为政** — 每台设备装了不同的看图软件，双击一张 PNG 会拉起不同的程序，各自再占一份内存。内置预览面板在同一个窗口里直接看图，不必再启动别的应用。
 4. **图片转 ICO 麻烦** — 开发软件要给应用做图标时，往往得去找在线转换站或额外装工具。在预览器里右键「转换为 ICO」，直接把当前图片（可拖拽框选方形裁切区域）导出成**一个**多尺寸 `.ico`（16 / 24 / 32 / 48 / 64 / 128 / 256 任选），落回原图所在目录。
 5. **图片压缩 / 转 PNG** — 右键「转换为 PNG」，可选 0–9 的压缩级别（0 = 不压缩，9 = 最小），导出到新文件夹，避免同名覆盖源文件。
@@ -76,7 +76,7 @@
 - 顶部工具栏：`返回 / 前进 / 上级 / 刷新 / 复制 / 移动 / 粘贴 / 删除 / 新建文件夹 / 跳转 / 终端 / 显示隐藏文件`。
 
 **侧边栏**
-- 回收站入口（列表后台异步加载，不卡 UI；清空后自动刷新，图标随满/空状态变化）。
+- 回收站入口（列表后台异步加载，不卡 UI；清空后自动刷新，图标随满/空状态变化；清空为流式自删，底部显示真实进度）。
 - 固定磁盘列表，带**剩余 / 总量**空间显示。
 - 主页（Home）快捷入口。
 
@@ -103,18 +103,14 @@
 
 ### 构建
 
-需要 Rust 工具链。本项目只产出 **Windows** 可执行文件，三个目标：
+需要 Rust 工具链。本项目只产出 **Windows** 可执行文件，两个目标：
 
-- `x86_64-pc-windows-gnu` —— 标准 Windows x64，使用 MinGW-w64（GCC）。
 - `x86_64-pc-windows-msvc` —— 标准 Windows x64，使用 MSVC。
 - `aarch64-pc-windows-msvc` —— Windows on ARM64（如 Surface / 骁龙笔记本），使用 MSVC。
 
 ```bash
 # 默认目标
 cargo build --release
-
-# Windows x64（gnu）
-cargo build --release --target x86_64-pc-windows-gnu
 
 # Windows x64（msvc）
 cargo build --release --target x86_64-pc-windows-msvc
@@ -124,27 +120,14 @@ cargo build --release --target aarch64-pc-windows-msvc
 ```
 
 产物：
-- `target/x86_64-pc-windows-gnu/release/MarinExplorer.exe`
 - `target/x86_64-pc-windows-msvc/release/MarinExplorer.exe`
 - `target/aarch64-pc-windows-msvc/release/MarinExplorer.exe`
 
-**GNU 版和 MSVC 版有什么区别？**
-
-两个 x64 版本能在同一台普通 64 位 Windows 上跑，功能完全一致，区别只在"怎么编出来的"：
-
-| | GNU（MinGW-w64） | MSVC |
-|---|---|---|
-| C 运行时 | MinGW 自带（libgcc / winpthread + 系统 msvcrt） | 微软运行时，CI 已静态链接（`-C target-feature=+crt-static`） |
-| 要装 VC++ 运行库吗 | 不需要 | 不需要（已静态链接进去） |
-| exe 文件图标 | 有（`build.rs` 用 windres 内嵌） | 有（`build.rs` 用 rc.exe 内嵌） |
-| 调试生态 | GCC / DWARF | Visual Studio / WinDbg / PDB |
-| 与 C 库互操作 | 只能链 MinGW 的 `.a` | 只能链 MSVC 的 `.lib` |
-
 说明：
 - 发布构建已为体积优化（`opt-level = "z"` + LTO + strip）。
-- 应用图标由 `build.rs` 编进 Windows 资源，三个产物都带：**GNU 版用 MinGW 的 `windres` 生成 `.o`，MSVC 版用 Windows SDK 的 `rc.exe` 生成 `.res`**。找不到资源编译器时编译照常通过，只是没有文件图标。
+- 应用图标由 `build.rs` 用 Windows SDK 的 `rc.exe` 编进 Windows 资源，产物自带文件图标；找不到资源编译器时编译照常通过，只是没有文件图标。
 - 代码签名（可选）见 `sign.ps1`：用受信任 CA 的 `.pfx` 给 exe 签名 + 时间戳，消除 SmartScreen 拦截。
-- **Releases 只提供 MSVC 构建的安装包**（已静态链接 C 运行时，无需安装 VC++ 运行库）；GNU 版仅在有 MinGW 库依赖、或偏好 GCC 工具链时值得本地构建。
+- **Releases 只提供 MSVC 构建的安装包**（已静态链接 C 运行时，无需安装 VC++ 运行库）。
 
 ### 自动构建（GitHub Actions）
 
@@ -194,7 +177,7 @@ The first open reads and caches disk info; afterwards it's fast.
 ### What It Fixes
 
 1. **Too much resource usage** — Explorer is heavy. MarinExplorer draws its own UI with Rust + egui and stays resident for far less memory than Explorer, which is especially noticeable on memory-tight ARM64 devices.
-2. **A frozen Recycle Bin** — once the bin holds tens of thousands of entries, Explorer takes ages just to list it, and deleting is close to unusable. Here the `$I` file parsing inside `$Recycle.Bin` runs on a **background thread**: the UI never waits for it and stays usable the whole time. Emptying auto-refreshes the listing, and the sidebar icon tracks full/empty.
+2. **A frozen Recycle Bin** — once the bin holds tens of thousands of entries, Explorer takes ages just to list it, and deleting is close to unusable. Here the `$I` file parsing inside `$Recycle.Bin` runs on a **background thread**: the UI never waits for it and stays usable the whole time. Emptying auto-refreshes the listing, and the sidebar icon tracks full/empty. Emptying was reworked too: it no longer calls `SHEmptyRecycleBin` (which enumerates and recomputes total size first — the exact cause of the freeze / delete-failure at hundreds of thousands of items); it streams the deletion of your own `$Recycle.Bin` directly, with a **real percentage + deleted count** in the bottom bar, so it never stalls and never fails to delete.
 3. **Every machine previews images differently** — each device has its own photo viewer installed, so double-clicking a PNG launches a different program each time, each costing another slice of memory. The built-in preview panel shows images inside the same window; nothing else needs to start.
 4. **Image-to-ICO is a hassle** — shipping an app means shipping an icon, which usually means hunting for an online converter or installing extra tooling. Right-click in the viewer → "Convert to ICO" exports the current picture (optionally cropped to a dragged square region) as **one** multi-size `.ico` (pick from 16 / 24 / 32 / 48 / 64 / 128 / 256), written next to the source image.
 5. **Image compression / PNG export** — "Convert to PNG" offers deflate levels 0–9 (0 = none, 9 = smallest) and writes into a new folder, so it can never overwrite the same-named source.
@@ -208,7 +191,7 @@ Current form: a Rust + egui Windows desktop file manager focused on "works and f
 - Toolbar: back / forward / up / refresh / copy / move / paste / delete / new folder / jump / terminal / show hidden.
 
 **Sidebar**
-- Recycle Bin entry (loaded async in the background; auto-refreshes after emptying, icon reflects full/empty).
+- Recycle Bin entry (loaded async in the background; auto-refreshes after emptying, icon reflects full/empty; emptying streams the delete with a real progress bar).
 - Fixed drive list with **free / total** space.
 - Home shortcut.
 
@@ -235,18 +218,14 @@ Current form: a Rust + egui Windows desktop file manager focused on "works and f
 
 ### Build
 
-Requires the Rust toolchain. This project builds **Windows** executables only, for three targets:
+Requires the Rust toolchain. This project builds **Windows** executables only, for two targets:
 
-- `x86_64-pc-windows-gnu` — standard Windows x64, built with MinGW-w64 (GCC).
 - `x86_64-pc-windows-msvc` — standard Windows x64, built with MSVC.
 - `aarch64-pc-windows-msvc` — Windows on ARM64 (e.g. Surface / Snapdragon laptops), built with MSVC.
 
 ```bash
 # default target
 cargo build --release
-
-# Windows x64 (gnu)
-cargo build --release --target x86_64-pc-windows-gnu
 
 # Windows x64 (msvc)
 cargo build --release --target x86_64-pc-windows-msvc
@@ -256,27 +235,14 @@ cargo build --release --target aarch64-pc-windows-msvc
 ```
 
 Artifacts:
-- `target/x86_64-pc-windows-gnu/release/MarinExplorer.exe`
 - `target/x86_64-pc-windows-msvc/release/MarinExplorer.exe`
 - `target/aarch64-pc-windows-msvc/release/MarinExplorer.exe`
 
-**How do the GNU and MSVC builds differ?**
-
-Both x64 editions run on the same ordinary 64-bit Windows PC and are functionally identical — they differ only in how they were compiled:
-
-| | GNU (MinGW-w64) | MSVC |
-|---|---|---|
-| C runtime | MinGW's own (libgcc / winpthread + system msvcrt) | Microsoft's, linked **statically** in CI (`-C target-feature=+crt-static`) |
-| Needs VC++ redistributable | No | No (statically linked in) |
-| exe file icon | Yes (embedded by `build.rs` via `windres`) | Yes (embedded by `build.rs` via `rc.exe`) |
-| Debug ecosystem | GCC / DWARF | Visual Studio / WinDbg / PDB |
-| C interop | Links MinGW `.a` only | Links MSVC `.lib` only |
-
 Notes:
 - Release builds are size-optimized (`opt-level = "z"` + LTO + strip).
-- The app icon is embedded by `build.rs` in all three builds: MinGW's `windres` for the GNU target, Windows SDK `rc.exe` for the MSVC targets. If no resource compiler is found the build still succeeds, just without a file icon.
+- The app icon is embedded by `build.rs` via the Windows SDK `rc.exe`, so the exe carries a file icon; if no resource compiler is found the build still succeeds, just without a file icon.
 - Optional code signing lives in `sign.ps1`.
-- **Releases ship MSVC installers only** (statically linked C runtime — no VC++ redistributable needed). Build the GNU edition locally only if you need to link MinGW-compiled libraries or prefer the GCC toolchain.
+- **Releases ship MSVC installers only** (statically linked C runtime — no VC++ redistributable needed).
 
 ### Automated Builds (GitHub Actions)
 
