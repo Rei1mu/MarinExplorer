@@ -11,6 +11,12 @@
 
 ## 更新日志 / Changelog
 
+### v0.1.9 — 2026-10-23
+- **修复 v0.1.8 安装失败**：v0.1.8 把 `DefaultGroupName` 误写成路径（`{userprograms}\MarinExplorer`）。管理安装模式下 Inno 会把它拼到 `{commonprograms}` 后面，展开的绝对路径里带冒号，`CreateDirectory` 直接报「文件名称不能包含下列任何字符」导致安装中断。现改为：`DefaultGroupName` 只用纯名称；开始菜单快捷方式在 `[Icons]` 里直写 `{userprograms}`，保证条目留在当前用户的开始菜单（与每用户安装位置一致），不再依赖 `{group}`。
+
+**English**
+- **Fixed the v0.1.8 install failure**: v0.1.8 mistakenly set `DefaultGroupName` to a path (`{userprograms}\MarinExplorer`). In administrative install mode Inno appends that value to `{commonprograms}`, so the expanded absolute path embedded a `:` in a directory name and `CreateDirectory` failed with "A filename cannot contain any of the following characters", aborting the install. Now `DefaultGroupName` is a plain name only, and the Start-menu shortcuts are written explicitly to `{userprograms}` in `[Icons]` — the entry stays in the installing user's Start Menu (matching the per-user install location) and no longer depends on `{group}`.
+
 ### v0.1.8 — 2026-10-23
 - **安装包修复（升级不再被占用文件卡住）**：应用自 v0.1.5 起以管理员身份自提权运行，而安装包此前是「不提权」安装——中完整性的安装程序关不掉提权的旧实例（UIPI 拦截），覆盖安装时报「DeleteFile 失败；错误代码 5」。安装包现在同样以管理员身份运行（每次安装/升级一次 UAC 确认，与应用每次启动的自提权一致），升级时 Inno 会自动关闭正在运行的旧版，不再弹文件占用对话框。安装位置仍是每用户目录，开始菜单条目也仍只属当前用户。
 

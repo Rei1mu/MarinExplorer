@@ -12,7 +12,7 @@
 ; ---------------------------------------------------------------------------
 
 #ifndef MyAppVersion
-  #define MyAppVersion "0.1.8"
+  #define MyAppVersion "0.1.9"
 #endif
 
 ; `VersionInfoVersion` must be strictly numeric (x[.x.x.x]), while a display
@@ -83,9 +83,16 @@ PrivilegesRequired=admin
 ; explicit here): this is what shuts the running elevated instance down.
 CloseApplications=yes
 
-; Start-menu entry stays in the *current user's* group: administrative
-; install mode would otherwise default it to the all-users group.
-DefaultGroupName={userprograms}\{#MyAppName}
+; Start-menu shortcuts: the location is written explicitly in [Icons] as
+; {userprograms}\... — never via {group}. In administrative install mode
+; {group} would resolve to {commonprograms} (all users), which is wrong for
+; a per-user install: other users would get a shortcut into this user's
+; profile. DefaultGroupName below is only a *name* (never a path): in admin
+; mode Inno appends it to {commonprograms}, and a path here embeds a ":"
+; in a directory name, which fails CreateDirectory with ERROR_INVALID_NAME
+; ("文件名称不能包含下列任何字符"). The group page is disabled, so this
+; value is effectively unused.
+DefaultGroupName={#MyAppName}
 LicenseFile=..\LICENSE
 WizardStyle=modern
 ; Let the user pick another drive/directory.
@@ -125,11 +132,13 @@ Name: "desktopicon"; Description: "创建桌面快捷方式 / Create a desktop s
 Source: "{#MyAppExe}"; DestDir: "{app}"; DestName: "MarinExplorer.exe"; Flags: ignoreversion
 
 [Icons]
-Name: "{group}\{#MyAppName}"; Filename: "{app}\MarinExplorer.exe"; Tasks: startmenu
+; {userprograms} on purpose — see the DefaultGroupName comment: the entry
+; must live in the *installing user's* Start Menu, not {commonprograms}.
+Name: "{userprograms}\{#MyAppName}"; Filename: "{app}\MarinExplorer.exe"; Tasks: startmenu
 ; NOTE: the shortcut name must not contain "/" — it is an illegal filename
 ; character on Windows, and IPersistFile::Save then fails with 0x80070003
 ; (path not found) because "A / B.lnk" parses as "B.lnk" inside dir "A ".
-Name: "{group}\卸载 {#MyAppName}"; Filename: "{uninstallexe}"; Tasks: startmenu
+Name: "{userprograms}\{#MyAppName}\卸载 {#MyAppName}"; Filename: "{uninstallexe}"; Tasks: startmenu
 Name: "{autodesktop}\{#MyAppName}"; Filename: "{app}\MarinExplorer.exe"; Flags: createonlyiffileexists; Tasks: desktopicon
 
 ; ---------------------------------------------------------------------------
