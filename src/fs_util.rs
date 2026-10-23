@@ -234,21 +234,26 @@ pub fn open_terminal(dir: &Path) {
 
 /// Show `path` selected inside Windows Explorer.
 ///
+/// `explorer.exe /select,` is the documented switch, but the command line has
+/// to reach the shell **verbatim**. `std::process::Command` cannot do that: it
+/// escapes the quotes inside `/select,"…"` into `\"`, and explorer.exe's own
+/// command-line parser reads the backslash as part of the path — the parent
+/// folder then opens and the item is never selected (the "it showed the
+/// folder, not my file" bug). So the line is built by hand and handed to
+/// `CreateProcessW`, which is the form every other program uses:
+/// `explorer.exe /select,"D:\dir\file.txt"`.
+///
 /// `explorer.exe /select,` only selects *files*; directories are opened
-/// instead. The path must also be quoted — unquoted paths with spaces make
-/// Explorer mis-parse the argument and open the file rather than select it
-/// (the old "opens the document instead of the folder" bug).
+/// instead.
 pub fn reveal_in_explorer(path: &Path) {
     #[cfg(target_os = "windows")]
     {
-        if path.is_dir() {
-            Command::new("explorer.exe").arg(path).spawn().ok();
+        let line = if path.is_dir() {
+            format!("explorer.exe \"{}\"", path.display())
         } else {
-            Command::new("explorer.exe")
-                .arg(format!("/select,\"{}\"", path.display()))
-                .spawn()
-                .ok();
-        }
+            format!("explorer.exe /select,\"{}\"", path.display())
+        };
+        spawn_line(&line);
     }
     #[cfg(not(target_os = "windows"))]
     {
@@ -258,6 +263,102 @@ pub fn reveal_in_explorer(path: &Path) {
             open_default_file(p);
         }
     }
+}
+
+/// Start a process from a **pre-built** command line, byte for byte.
+///
+/// Needed for `explorer.exe /select,"…"`: `Command::arg` re-quotes every
+/// argument that contains a space and backslash-escapes the quotes we put in,
+/// which explorer.exe cannot read. Returns false when the shell refuses to
+/// start anything.
+#[cfg(target_os = "windows")]
+fn spawn_line(line: &str) -> bool {
+    use std::os::windows::ffi::OsStrExt;
+
+    #[repr(C)]
+    struct StartupInfoW {
+        cb: u32,
+        reserved: *const u16,
+        desktop: *const u16,
+        title: *const u16,
+        x: u32,
+        y: u32,
+        x_size: u32,
+        y_size: u32,
+        x_chars: u32,
+        y_chars: u32,
+        fill: u32,
+        flags: u32,
+        show_window: u16,
+        cb_reserved2: u16,
+        reserved2: *const u8,
+        std_in: *mut core::ffi::c_void,
+        std_out: *mut core::ffi::c_void,
+        std_err: *mut core::ffi::c_void,
+    }
+
+    #[repr(C)]
+    struct ProcessInformation {
+        process: *mut core::ffi::c_void,
+        thread: *mut core::ffi::c_void,
+        pid: u32,
+        tid: u32,
+    }
+
+    // Renamed through `link_name`: `tray.rs` and `explorer.rs` already declare
+    // these two with different (handle-as-integer) signatures, and a second
+    // declaration under the same name is a `clashing_extern_declarations`
+    // warning.
+    #[link(name = "kernel32")]
+    extern "system" {
+        #[link_name = "CreateProcessW"]
+        fn create_process_w(
+            app: *const u16,
+            cmd: *mut u16,
+            pa: *const core::ffi::c_void,
+            ta: *const core::ffi::c_void,
+            inherit: i32,
+            flags: u32,
+            env: *const core::ffi::c_void,
+            dir: *const u16,
+            si: *const StartupInfoW,
+            pi: *mut ProcessInformation,
+        ) -> i32;
+        #[link_name = "CloseHandle"]
+        fn close_handle(h: *mut core::ffi::c_void) -> i32;
+    }
+
+    let mut wide: Vec<u16> = std::ffi::OsStr::new(line)
+        .encode_wide()
+        .chain(std::iter::once(0))
+        .collect();
+    let mut si: StartupInfoW = unsafe { std::mem::zeroed() };
+    si.cb = std::mem::size_of::<StartupInfoW>() as u32;
+    let mut pi: ProcessInformation = unsafe { std::mem::zeroed() };
+    let ok = unsafe {
+        create_process_w(
+            std::ptr::null(),
+            wide.as_mut_ptr(),
+            std::ptr::null(),
+            std::ptr::null(),
+            0,
+            0,
+            std::ptr::null(),
+            std::ptr::null(),
+            &si,
+            &mut pi,
+        )
+    };
+    if ok == 0 {
+        return false;
+    }
+    // The handles are ours the moment the process exists — drop them, or every
+    // "show in Explorer" click would leak two kernel handles.
+    unsafe {
+        close_handle(pi.process);
+        close_handle(pi.thread);
+    }
+    true
 }
 
 /// Open a *folder* in the native file explorer (Windows Explorer).

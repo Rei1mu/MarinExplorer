@@ -38,10 +38,11 @@ use std::sync::mpsc::channel;
 use std::time::{Duration, Instant};
 
 use app::{
-    Clip, SortKey, View, human_clock, human_datetime, human_size, human_time, path_segments,
+    Clip, SortKey, View, human_clock, human_datetime, human_size, human_size_est, human_time,
+    path_segments,
 };
 use cache::Store;
-use explorer::{Explorer, RecInfo};
+use explorer::{Explorer, QaKind, RecInfo, TextColor};
 
 // ---- table geometry (list view) ----
 // Defaults for the resizable columns (name/type/size/time). The 创建时间
@@ -79,17 +80,33 @@ struct Cols {
 }
 // ---- grid geometry (thumbnail view) ----
 const CELL_W: f32 = 108.0;
-const CELL_H: f32 = 120.0;
+const CELL_H: f32 = 134.0;
 
 fn main() -> eframe::Result {
+    // Run elevated. Emptying the Recycle Bin has to delete entries that belong
+    // to other accounts or sit in protected folders — an unelevated process
+    // cannot remove those no matter how the delete is attempted, which is why
+    // "empty" could leave thousands of items behind.
+    //
+    // The relaunch is a soft failure on purpose: if the UAC prompt is declined
+    // the app still starts, just without those rights.
+    let elevation_tried = std::env::args().any(|a| a == "--elevated");
+    if !elevation_tried && !crate::shell::is_elevated() {
+        if crate::shell::relaunch_elevated() {
+            // The elevated copy owns the window from here on.
+            return Ok(());
+        }
+    }
+
     let store = Store::load();
 
     // Folder-size worker: one persistent thread, unbounded queue.
     let (size_tx, size_rx) = channel::<PathBuf>();
-    let (back_tx, back_rx) = channel::<(PathBuf, u64, u64)>();
+    let (back_tx, back_rx) = channel::<(PathBuf, u64, u64, bool)>();
     std::thread::spawn(move || {
         while let Ok(path) = size_rx.recv() {
-            let size = explorer::total_size(&path);
+            // Bulk enumeration with a budget: `(bytes, complete)`.
+            let (size, complete) = explorer::scan_dir_size(&path);
             let mtime = match std::fs::metadata(&path) {
                 Ok(m) => m
                     .modified()
@@ -99,7 +116,7 @@ fn main() -> eframe::Result {
                     .unwrap_or(0),
                 Err(_) => 0,
             };
-            back_tx.send((path, mtime, size)).ok();
+            back_tx.send((path, mtime, size, complete)).ok();
         }
     });
 
@@ -113,22 +130,11 @@ fn main() -> eframe::Result {
 
     // 中文字体：运行时从 Windows 字体目录加载系统自带字体（微软雅黑优先）。
     // 不把字体文件打包进 exe（省掉 ~8MB），中文观感也与 Windows 原生 UI 一致。
-    let mut fonts = egui::FontDefinitions::default();
-    if let Some((_name, data)) = load_windows_cjk_font() {
-        fonts
-            .font_data
-            .insert("cjk".to_owned(), std::sync::Arc::new(data));
-        fonts
-            .families
-            .get_mut(&egui::FontFamily::Proportional)
-            .unwrap()
-            .push("cjk".to_owned());
-        fonts
-            .families
-            .get_mut(&egui::FontFamily::Monospace)
-            .unwrap()
-            .push("cjk".to_owned());
-    }
+    // Honour the persisted "省内存字体" setting on the very first frame: the
+    // font file is the single biggest allocation the app keeps (see
+    // `font_definitions`), so it is worth not loading the large one at all.
+    let small_font = store.meta("small_font").map_or(false, |v| v == "1");
+    let fonts = font_definitions(small_font);
 
     // The native window handle, grabbed once here: it is what lets us repaint
     // the OS title bar to match the in-app dark theme.
@@ -152,7 +158,8 @@ fn main() -> eframe::Result {
             // A path handed over on the command line (context menu, drag onto
             // the exe, `MarinExplorer.exe D:\foo`) opens that folder — or, for
             // a file, its parent with the file selected.
-            if let Some(arg) = std::env::args().nth(1) {
+            // Skip the elevation marker: it is a flag, not a path to open.
+            if let Some(arg) = std::env::args().skip(1).find(|a| a != "--elevated") {
                 ex.open_arg(&arg);
             }
             ex.hwnd = hwnd;
@@ -168,40 +175,109 @@ fn main() -> eframe::Result {
     )
 }
 
+/// egui's own font set plus the CJK face.
+///
+/// `small` picks the smallest system CJK font instead of the nicest one. The
+/// font file is the single biggest allocation the app keeps: it stays in the
+/// heap for the whole session (see [`font_bytes`] for why it is exactly one
+/// copy — a 19 MB `msyh.ttc` would cost ~38 MB if it were cloned).
+pub fn font_definitions(small: bool) -> egui::FontDefinitions {
+    let mut fonts = egui::FontDefinitions::default();
+    if let Some((_name, data)) = load_windows_cjk_font(small) {
+        fonts
+            .font_data
+            .insert("cjk".to_owned(), std::sync::Arc::new(data));
+        fonts
+            .families
+            .get_mut(&egui::FontFamily::Proportional)
+            .unwrap()
+            .push("cjk".to_owned());
+        fonts
+            .families
+            .get_mut(&egui::FontFamily::Monospace)
+            .unwrap()
+            .push("cjk".to_owned());
+    }
+    fonts
+}
+
+/// Font file bytes that live for the whole process, handed out as
+/// `&'static [u8]`.
+///
+/// Why the leak: `egui::FontData::from_owned` stores the bytes as
+/// `Cow::Owned`, and epaint then **clones the whole file** into `ab_glyph`
+/// (`FontVec::try_from_vec_and_index(bytes.clone(), ..)`) while its
+/// `FontDefinitions` keeps the original too — so a 19 MB `msyh.ttc` costs
+/// ~38 MB of heap for the whole session. `FontData::from_static` instead
+/// stores `Cow::Borrowed`, and epaint builds a zero-copy `FontRef` from it,
+/// so exactly one copy of the font ever lives in the heap.
+///
+/// The bytes would stay resident for the process lifetime anyway, so leaking
+/// them changes nothing in practice. The cache matters for the font toggle:
+/// without it, switching 雅黑 → 省内存 → 雅黑 would leak a fresh copy of every
+/// font it touches. Keyed by path, each file is leaked at most once.
+fn font_bytes(path: &std::path::Path) -> Option<&'static [u8]> {
+    static CACHE: std::sync::OnceLock<
+        std::sync::Mutex<std::collections::HashMap<std::path::PathBuf, &'static [u8]>>,
+    > = std::sync::OnceLock::new();
+    let cache = CACHE.get_or_init(Default::default);
+    let mut guard = cache.lock().ok()?;
+    if let Some(bytes) = guard.get(path) {
+        return Some(*bytes);
+    }
+    let bytes: &'static [u8] = Box::leak(std::fs::read(path).ok()?.into_boxed_slice());
+    guard.insert(path.to_path_buf(), bytes);
+    Some(bytes)
+}
+
 /// CJK font, loaded at runtime from the Windows font directory — Microsoft YaHei
-/// first. We deliberately do *not* bundle a font file: that costs ~8MB of exe
-/// size, and the system font also matches the native Windows look.
+/// first (SimHei first when `small`). We deliberately do *not* bundle a font
+/// file: that costs ~8MB of exe size, and the system font also matches the
+/// native Windows look.
 ///
 /// egui ships no CJK glyphs at all (only Ubuntu-Light / Hack / NotoEmoji), so
 /// without this every Chinese character renders as an empty box.
 ///
 /// epaint *panics* when handed a font file it cannot parse, so every candidate
 /// is validated with `ttf-parser` before it reaches egui; a missing or broken
-/// file simply moves us on to the next candidate.
-fn load_windows_cjk_font() -> Option<(&'static str, egui::FontData)> {
+/// file simply moves us on to the next candidate. The bytes go through
+/// [`font_bytes`], which keeps the font to a single heap copy.
+fn load_windows_cjk_font(small: bool) -> Option<(&'static str, egui::FontData)> {
     // (display name, file name inside %WINDIR%\Fonts, face index within a .ttc)
-    const CANDIDATES: &[(&str, &str, u32)] = &[
+    // Ordered by looks; the `small` list is ordered by size instead, because a
+    // full CJK face stays in the heap for the whole session.
+    const NICE: &[(&str, &str, u32)] = &[
         ("Microsoft YaHei", "msyh.ttc", 0),
         ("Microsoft YaHei UI", "msyhui.ttc", 0),
         ("DengXian", "Deng.ttf", 0),
         ("SimHei", "simhei.ttf", 0),
         ("SimSun", "simsun.ttc", 0),
     ];
+    const SMALL: &[(&str, &str, u32)] = &[
+        ("SimHei", "simhei.ttf", 0),        // 9.3 MB
+        ("KaiTi", "simkai.ttf", 0),         // 11.2 MB
+        ("Microsoft YaHei Light", "msyhl.ttc", 0), // 11.6 MB
+        ("DengXian", "Deng.ttf", 0),        // 15.6 MB
+        ("Microsoft YaHei", "msyh.ttc", 0), // 18.8 MB — last resort
+    ];
+    let candidates = if small { SMALL } else { NICE };
 
     let windir = std::env::var("WINDIR")
         .or_else(|_| std::env::var("SystemRoot"))
         .unwrap_or_else(|_| "C:\\Windows".to_owned());
     let dir = std::path::PathBuf::from(windir).join("Fonts");
 
-    for &(name, file, index) in CANDIDATES {
+    for &(name, file, index) in candidates {
         let path = dir.join(file);
-        let Ok(bytes) = std::fs::read(&path) else {
+        let Some(bytes) = font_bytes(&path) else {
             continue;
         };
-        if ttf_parser::Face::parse(&bytes, index).is_err() {
+        if ttf_parser::Face::parse(bytes, index).is_err() {
             continue;
         }
-        let mut data = egui::FontData::from_owned(bytes);
+        // `from_static` (not `from_owned`) — see `font_bytes`: this is what
+        // keeps the font at one copy instead of two.
+        let mut data = egui::FontData::from_static(bytes);
         data.index = index;
         eprintln!("[font] CJK: {name} ({file})");
         return Some((name, data));
@@ -278,43 +354,86 @@ impl eframe::App for Explorer {
     }
 
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
-        // Light / dark theme, applied every frame so a toggle is instant.
-        let mut visuals = if self.dark {
-            egui::Visuals::dark()
-        } else {
-            egui::Visuals::light()
-        };
-        if self.dark {
-            // The stock dark palette uses greyish text that is hard to read on
-            // the dark panels. `override_text_color` (the only writable text
-            // colour in egui 0.31) brightens every text role toward white.
-            visuals.override_text_color = Some(egui::Color32::from_gray(240));
-            visuals.hyperlink_color = egui::Color32::from_rgb(120, 180, 255);
-        }
-        ctx.set_visuals(visuals);
-        // Font-size setting: scale every text style off egui's *default* sizes
-        // (not last frame's, which would compound) so the slider is stable.
-        if self.font_scale != 1.0 {
-            let mut style = (*ctx.style()).clone();
-            let base = egui::Style::default().text_styles;
-            for (key, base_font) in base.iter() {
-                if let Some(f) = style.text_styles.get_mut(key) {
-                    f.size = base_font.size * self.font_scale;
-                }
+        // Light / dark theme. Only re-applied when `dark` changes — rebuilding
+        // the whole `Visuals` every frame was pure waste (the toggle is still
+        // instant because `set_dark` flips `self.dark` and the next frame
+        // re-applies).
+        if self.applied_dark != Some(self.dark) {
+            let mut visuals = if self.dark {
+                egui::Visuals::dark()
+            } else {
+                egui::Visuals::light()
+            };
+            if self.dark {
+                // Custom main text colour for the active theme. `override_text_color`
+                // drives the primary body/label colour across every widget.
+                visuals.override_text_color = Some(self.text_color());
+                // Brighten links so they stay visible on the dark panels.
+                visuals.hyperlink_color = egui::Color32::from_rgb(120, 180, 255);
+            } else {
+                visuals.override_text_color = Some(self.text_color());
             }
-            ctx.set_style(style);
+            ctx.set_visuals(visuals);
+            self.applied_dark = Some(self.dark);
+        }
+        // Font-size setting: only re-applied when the scale changes (and reset
+        // to the default style when it returns to 1.0, which the old code
+        // never did).
+        if self.font_scale != self.applied_font_scale {
+            if self.font_scale == 1.0 {
+                // Reset font sizes to the defaults WITHOUT wiping the custom
+                // visuals — `Style::default()` would discard `override_text_color`
+                // and revert the configured text colour to egui's stock grey.
+                let mut style = (*ctx.style()).clone();
+                let base = egui::Style::default().text_styles;
+                for (key, base_font) in base.iter() {
+                    if let Some(f) = style.text_styles.get_mut(key) {
+                        f.size = base_font.size;
+                    }
+                }
+                ctx.set_style(style);
+            } else {
+                let mut style = (*ctx.style()).clone();
+                let base = egui::Style::default().text_styles;
+                for (key, base_font) in base.iter() {
+                    if let Some(f) = style.text_styles.get_mut(key) {
+                        f.size = base_font.size * self.font_scale;
+                    }
+                }
+                ctx.set_style(style);
+            }
+            self.applied_font_scale = self.font_scale;
+        }
+        // 次要文字（面板信息栏的"N 项"计数、网格缩略图下方的大小、左栏分组
+        // 小标题）一律走 `TextStyle::Body`，与左栏条目主文字同字号，不再用
+        // 极小的 `Small`，保证清晰、全界面一致。
+        // "省内存字体" was just toggled: rebuild the font definitions here,
+        // where the egui context exists. Dropping the old set frees the big
+        // font file (both copies of it).
+        if self.reload_font {
+            self.reload_font = false;
+            ctx.set_fonts(crate::font_definitions(self.small_font));
         }
         self.text_focus = false;
         // Each frame starts fresh: set when the address editor consumes Enter.
         self.enter_consumed = false;
         // ----- drain background channels -----
-        while let Ok((p, m, s)) = self.size_rx.try_recv() {
-            self.apply_size_result(p, m, s);
+        let mut sizes_arrived = false;
+        while let Ok((p, m, s, complete)) = self.size_rx.try_recv() {
+            self.apply_size_result(p, m, s, complete);
+            sizes_arrived = true;
         }
+        if sizes_arrived {
+            self.resort_size_sorted_panels();
+        }
+        // One flag for "a background result landed this frame": it has to be
+        // raised outside the borrows above, which hold `&self.drives_rx` etc.
+        let mut bg = sizes_arrived;
         if let Some(rx) = &self.drives_rx {
             while let Ok(d) = rx.try_recv() {
                 self.drives = d;
                 self.drives_at = Some(Instant::now());
+                bg = true;
             }
         }
         if let Some(rx) = &self.sid_rx {
@@ -322,8 +441,12 @@ impl eframe::App for Explorer {
                 if let Some(sid) = s {
                     self.sid = Some(sid.clone());
                     self.store.set_meta("sid", &sid);
+                    bg = true;
                 }
             }
+        }
+        if bg {
+            self.mark_bg_activity();
         }
         if self.drives.is_empty() {
             self.refresh_drives();
@@ -342,8 +465,8 @@ impl eframe::App for Explorer {
         if let Some(line) = self.poll_job() {
             self.status = line;
         }
-        self.apply_cached_sizes();
-        self.request_folder_sizes();
+        // Throttled (once a second), not per frame: see the comment there.
+        self.refresh_folder_sizes_throttled();
         self.maybe_flush();
         self.previews.poll(ctx);
 
@@ -386,6 +509,36 @@ impl eframe::App for Explorer {
                         }
                     });
                     ui.separator();
+                    ui.label(t("字体颜色"));
+                    ui.collapsing(t("深色模式"), |ui| {
+                        ui.horizontal(|ui| {
+                            ui.label(t("主文字"));
+                            if ui.color_edit_button_srgba(&mut self.text_dark).changed() {
+                                self.set_text_color(TextColor::TextDark, self.text_dark);
+                            }
+                        });
+                        ui.horizontal(|ui| {
+                            ui.label(t("次要文字"));
+                            if ui.color_edit_button_srgba(&mut self.weak_dark).changed() {
+                                self.set_text_color(TextColor::WeakDark, self.weak_dark);
+                            }
+                        });
+                    });
+                    ui.collapsing(t("浅色模式"), |ui| {
+                        ui.horizontal(|ui| {
+                            ui.label(t("主文字"));
+                            if ui.color_edit_button_srgba(&mut self.text_light).changed() {
+                                self.set_text_color(TextColor::TextLight, self.text_light);
+                            }
+                        });
+                        ui.horizontal(|ui| {
+                            ui.label(t("次要文字"));
+                            if ui.color_edit_button_srgba(&mut self.weak_light).changed() {
+                                self.set_text_color(TextColor::WeakLight, self.weak_light);
+                            }
+                        });
+                    });
+                    ui.separator();
                     ui.label(t("集成"));
                     // A real on/off switch: writes HKCU\Software\Classes, which
                     // needs no administrator rights and never prompts UAC.
@@ -395,6 +548,31 @@ impl eframe::App for Explorer {
                         .clicked()
                     {
                         self.set_ctx_menu(self.ctx_menu);
+                    }
+                    ui.separator();
+                    // Icon source. The two lighter modes never ask the shell,
+                    // which keeps its namespace/COM stack (and one texture per
+                    // file type) out of the process entirely.
+                    ui.label(t("图标"));
+                    ui.horizontal_wrapped(|ui| {
+                        for (id, name) in [
+                            (0u8, "系统图标"),
+                            (1u8, "矢量图标"),
+                            (2u8, "Emoji"),
+                        ] {
+                            if ui.selectable_label(self.icon_mode == id, name).clicked()
+                                && self.icon_mode != id
+                            {
+                                self.set_icon_mode(id);
+                            }
+                        }
+                    });
+                    if ui
+                        .checkbox(&mut self.small_font, t("省内存字体"))
+                        .on_hover_text(t("改用体积最小的中文字体；完整字体文件会常驻内存两份，换小字体可省约 19MB"))
+                        .clicked()
+                    {
+                        self.set_small_font(self.small_font);
                     }
                     ui.separator();
                     ui.label(t("语言"));
@@ -431,15 +609,28 @@ impl eframe::App for Explorer {
                     self.apply_cached_sizes();
                     self.refresh_drives();
                 }
+                // Manual override for the size cache: 刷新 re-reads the listing
+                // but happily reuses a cached (possibly stale or `~`) size.
+                if icons::button(
+                    ui,
+                    &icons::SIZE,
+                    &t("重新计算大小"),
+                    true,
+                    &t("忽略缓存，重新扫描面板里所有文件夹的大小"),
+                )
+                .clicked()
+                {
+                    self.recompute_sizes();
+                }
                 ui.separator();
                 if icons::button(ui, &icons::COPY, &t("复制"), true, "").clicked() { self.do_copy(); }
-                if icons::button(ui, &icons::MOVE, &t("移动"), true, "").clicked() { self.do_move(); }
+                if icons::button(ui, &icons::CUT, &t("剪贴"), true, "").clicked() { self.do_move(); }
                 if icons::button(ui, &icons::PASTE, &t("粘贴"), true, "").clicked() { self.do_paste(); }
                 if icons::button(ui, &icons::TRASH, &t("删除"), true, "").clicked() { self.do_delete(); }
                 ui.separator();
                 if icons::button(ui, &icons::FOLDER_PLUS, &t("新建"), true, "").clicked() { self.new_folder_open = true; }
                 if icons::button(ui, &icons::PLUS, &t("标签页"), true, "Ctrl+T").clicked() { self.new_tab(); }
-                if icons::button(ui, &icons::PIN, &t("固定"), true, &t("把当前目录加入左侧“快速访问”")).clicked() { self.pin_current(); }
+                if icons::button(ui, &icons::HEART, &t("收藏"), true, &t("把当前目录加入左侧“收藏”")).clicked() { self.favorite_current(); }
                 if icons::button(ui, &icons::NAV, &t("跳转"), true, "").clicked() {
                     self.go_path = self.active_panel().cwd.to_string_lossy().into_owned();
                     self.go_open = true;
@@ -521,10 +712,17 @@ impl eframe::App for Explorer {
                 }
                 if let Some(job) = &self.job {
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        ui.add(
-                            egui::ProgressBar::new(job.progress.clamp(0.0, 1.0))
-                                .text(format!("{} {:.0}%", job.label, job.progress * 100.0)),
-                        );
+                        if job.indeterminate {
+                            // Animated, percentage-free bar: the shell does the
+                            // real work and only reports at the end, so a NaN
+                            // fill keeps the UI alive without a system dialog.
+                            ui.add(egui::ProgressBar::new(f32::NAN).text(job.label.clone()));
+                        } else {
+                            ui.add(
+                                egui::ProgressBar::new(job.progress.clamp(0.0, 1.0))
+                                    .text(format!("{} {:.0}%", job.label, job.progress * 100.0)),
+                            );
+                        }
                     });
                 }
             });
@@ -544,32 +742,6 @@ impl eframe::App for Explorer {
                 .id_salt("rail_scroll")
                 .auto_shrink([false, false])
                 .show(ui, |ui| {
-            icons::label(ui, &icons::MAP_PIN, &t("位置"));
-            ui.separator();
-
-            // Common known folders (Desktop / Downloads / Documents / …):
-            // drawn with the shell's own (full-colour) folder icons.
-            // Every rail address opens in the *active* pane (dual-pane rule):
-            // click a pane to select it, then any address navigates it.
-            icons::label(ui, &icons::FOLDER, &t("常用位置"));
-            let folders = known_folders(self.lang);
-            let texs: Vec<Option<egui::TextureId>> = folders
-                .iter()
-                .map(|(_, p)| self.icons.get(ctx, shellicon::Kind::Path(p.clone())))
-                .collect();
-            for (i, (label, p)) in folders.iter().enumerate() {
-                let cur = self.active_panel().cwd == *p;
-                let glyph = match texs[i] {
-                    Some(id) => icons::Glyph::Tex(id),
-                    None => icons::Glyph::Svg(&icons::FOLDER),
-                };
-                if icons::entry(ui, glyph, label, cur, &p.to_string_lossy(), row_w).clicked() {
-                    self.active_panel().navigate(p.clone());
-                    self.apply_cached_sizes();
-                }
-            }
-            ui.separator();
-
             let rec = self.recycle_target();
             let rec_glyph = match self.icons.get(ctx, shellicon::Kind::Recycle) {
                 Some(id) => icons::Glyph::Tex(id),
@@ -629,81 +801,59 @@ impl eframe::App for Explorer {
             }
             ui.separator();
 
-            // Quick Access: the user's own pins first, then Windows' own.
-            // Sits below the drives on purpose (the most-used rail entries —
-            // drives and known folders — stay within reach without scrolling).
+            // Quick Access, split the way Windows Explorer splits its own:
+            // the folders the user pinned under "已固定", Windows' jump-list
+            // entries under "最近使用". Sits below the drives on purpose (the
+            // most-used rail entries stay within reach without scrolling).
             icons::label(ui, &icons::STAR, &t("快速访问"));
             let qa = self.quick_access_list();
-            if qa.is_empty() {
-                weak(ui, t("暂无；点工具栏“固定”"));
-            } else {
-                // Resolve the native icons up front: the borrow of `self.icons`
-                // must not overlap the `self.active_panel()` calls inside the loop.
-                let texs: Vec<Option<egui::TextureId>> = qa
-                    .iter()
-                    .map(|(p, _)| self.icons.get(ctx, shellicon::Kind::Path(p.clone())))
-                    .collect();
-                for (i, (path, is_pin)) in qa.iter().enumerate() {
-                    let label = path
-                        .file_name()
-                        .map(|n| n.to_string_lossy().into_owned())
-                        .unwrap_or_else(|| path.to_string_lossy().into_owned());
-                    let glyph = match texs[i] {
-                        Some(id) => icons::Glyph::Tex(id),
-                        None => icons::Glyph::Svg(&icons::FOLDER),
-                    };
-                    ui.horizontal(|ui| {
-                        let r = icons::entry(
-                            ui,
-                            glyph,
-                            &label,
-                            false,
-                            &path.to_string_lossy(),
-                            row_w,
-                        );
-                        if r.clicked() {
-                            self.active_panel().navigate(path.clone());
-                            self.apply_cached_sizes();
-                        }
-                        // Right-click a Quick-Access folder: open it in a new
-                        // tab / in the right pane, reveal, copy path, unpin.
-                        let _ = r.context_menu(|ui| {
-                            if ui
-                                .button(t("在新标签页打开"))
-                                .on_hover_text(path.to_string_lossy().to_string())
-                                .clicked()
-                            {
-                                self.open_path_in_new_tab(path.clone());
-                                ui.close_menu();
-                            }
-                            if ui
-                                .button(t("在右栏打开"))
-                                .on_hover_text(t("两个文件栏并排（记忆）"))
-                                .clicked()
-                            {
-                                self.open_path_in_right_pane(path.clone());
-                                ui.close_menu();
-                            }
-                            ui.separator();
-                            if ui.button(t("在资源管理器中显示")).clicked() {
-                                crate::fs_util::reveal_in_explorer(path);
-                                ui.close_menu();
-                            }
-                            if ui.button(t("复制路径")).clicked() {
-                                ui.ctx().copy_text(path.to_string_lossy().into_owned());
-                                ui.close_menu();
-                            }
-                            if *is_pin && ui.button(t("取消固定")).clicked() {
-                                self.unpin(path);
-                                ui.close_menu();
-                            }
-                        });
-                        if *is_pin {
-                            if icons::small_button(ui, &icons::X, &t("取消固定")).clicked() {
-                                self.unpin(path);
-                            }
-                        }
-                    });
+            {
+                // Three groups: Marin's own favourites, then the two kinds
+                // Windows hands us. "收藏" is always drawn — it is the group
+                // the user fills themselves, so an empty one shows a hint
+                // instead of vanishing. The Windows groups are skipped when
+                // Explorer has nothing to offer.
+                for (heading, ic, kind, always) in [
+                    (t("收藏"), &icons::HEART, QaKind::Favorite, true),
+                    (t("已固定"), &icons::PIN, QaKind::WinPin, false),
+                    (t("最近使用"), &icons::CLOCK, QaKind::Recent, false),
+                ] {
+                    let paths: Vec<PathBuf> = qa
+                        .iter()
+                        .filter(|(_, k)| *k == kind)
+                        .map(|(p, _)| p.clone())
+                        .collect();
+                    if paths.is_empty() && !always {
+                        continue;
+                    }
+                    icons::sub_label(ui, ic, &heading, self.weak_color());
+                    if paths.is_empty() {
+                        weak(ui, t("暂无；右键或工具栏“收藏”添加"));
+                        continue;
+                    }
+                    // Resolve the native icons up front: the borrow of
+                    // `self.icons` must not overlap the `&mut self` row calls.
+                    // Use `Kind::Path` (the same call the old "常用位置" section
+                    // and the drive/home rows use) so known folders such as
+                    // Desktop / Downloads / Documents get their *real* shell
+                    // glyph instead of the generic folder icon — the pinned
+                    // group now matches 常用位置 exactly, after 常用位置 itself
+                    // was removed.
+                    let texs: Vec<Option<egui::TextureId>> = paths
+                        .iter()
+                        .map(|p| self.icons.get(ctx, shellicon::Kind::Path(p.clone())))
+                        .collect();
+                    for (i, path) in paths.iter().enumerate() {
+                        let glyph = match texs[i] {
+                            Some(id) => icons::Glyph::Tex(id),
+                            None => icons::Glyph::Svg(if path.is_dir() {
+                                &icons::FOLDER
+                            } else {
+                                &icons::FILE
+                            }),
+                        };
+                        self.qa_row(ui, path, glyph, row_w, kind);
+                    }
                 }
             }
             ui.separator();
@@ -1260,11 +1410,80 @@ impl eframe::App for Explorer {
         }
         self.status_fresh =
             !self.status.is_empty() && self.status_at.elapsed() < Duration::from_secs(8);
-        ctx.request_repaint();
+        // Only repaint while something actually changes. Unconditional
+        // repainting keeps egui in continuous mode and burns a whole core on
+        // an idle window; when there *is* a reason, 10 fps is plenty for a
+        // progress bar or a status highlight.
+        if self.needs_repaint() {
+            ctx.request_repaint_after(Duration::from_millis(100));
+        }
     }
 }
 
 impl Explorer {
+    /// One Quick-Access row in the left rail: click or double-click navigates,
+    /// right-click opens the folder menu (open / new tab / VS Code / terminal /
+    /// reveal / copy path / properties / favourite), and the favourites also
+    /// get a small × to drop them without opening the menu.
+    ///
+    /// `glyph` is resolved by the caller: `self.icons` must be borrowed *before*
+    /// this runs, otherwise it collides with the `&mut self` navigation below.
+    fn qa_row(
+        &mut self,
+        ui: &mut egui::Ui,
+        path: &std::path::Path,
+        glyph: icons::Glyph,
+        row_w: f32,
+        kind: QaKind,
+    ) {
+        // Only Marin's own favourites are ours to remove: Windows' pins live in
+        // the jump list, and dropping them here would do nothing.
+        let mine = kind == QaKind::Favorite;
+        let label = path
+            .file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_else(|| path.to_string_lossy().into_owned());
+        // Three kinds share the rail, so the hover line says which one this row
+        // came from — and for the read-only ones, why there is no ×.
+        let hint = match kind {
+            QaKind::Favorite => format!(
+                "{}\n{}",
+                path.to_string_lossy(),
+                crate::lang::tr("已收藏", self.lang)
+            ),
+            QaKind::WinPin => format!(
+                "{}\n{}",
+                path.to_string_lossy(),
+                crate::lang::tr("Windows 已固定此文件夹", self.lang)
+            ),
+            QaKind::Recent => path.to_string_lossy().into_owned(),
+        };
+        ui.horizontal(|ui| {
+            let r = icons::entry(ui, glyph, &label, false, &hint, row_w);
+            // Single click already navigates (the rail is a jump target, not a
+            // selection list); double-click does the same so the row also
+            // answers the "open it" reflex.
+            if r.clicked() || r.double_clicked() {
+                if path.is_dir() {
+                    self.active_panel().navigate(path.to_path_buf());
+                    self.apply_cached_sizes();
+                } else {
+                    crate::fs_util::open_default_file(&path);
+                }
+            }
+            let _ = r.context_menu(|ui| {
+                self.qa_context_menu(ui, path);
+            });
+            if mine {
+                if icons::small_button(ui, &icons::X, &crate::lang::tr("取消收藏", self.lang))
+                    .clicked()
+                {
+                    self.unfavorite(path);
+                }
+            }
+        });
+    }
+
     // ----- image conversion dialog (ICO / PNG) -----
 
     /// Window shell for the convert dialog. The state is taken out of
@@ -1443,7 +1662,7 @@ impl Explorer {
         egui::Align2::CENTER_CENTER,
         "加载中…",
         egui::FontId::proportional(18.0),
-        ui.visuals().weak_text_color(),
+        self.weak_color(),
         );
         }
         // Filmstrip: pinned to the very bottom by the vertical flow above.
@@ -1511,7 +1730,7 @@ impl Explorer {
         egui::Align2::CENTER_CENTER,
         "…",
         egui::FontId::proportional(20.0),
-        ui.visuals().weak_text_color(),
+        self.weak_color(),
         );
         }
         if is_cur {
@@ -2071,7 +2290,7 @@ impl Explorer {
         let max = ui.max_rect();
         let mut x = max.min.x;
         let cy = max.center().y;
-        let weak = ui.visuals().weak_text_color();
+        let weak = self.weak_color();
 
         // 1) pane tag — only meaningful while split.
         let is_active_pane = !self.split
@@ -2286,6 +2505,9 @@ impl Explorer {
                         ui.close_menu();
                     }
                     ui.separator();
+                    // Favourite / unfavourite the tab's folder, the same
+                    // affordance as the folder menu and the toolbar button.
+                    self.favorite_menu_item(ui, &cwd);
                     if ui
                         .button(crate::lang::tr("关闭标签页", self.lang))
                         .clicked()
@@ -2401,16 +2623,33 @@ impl Explorer {
         let show_hidden = self.show_hidden;
         let loading = get_panel(self, is_left).loading;
         let vis = get_panel(self, is_left).visible(show_hidden);
-        // Multi-selection membership, cloned once per frame: rows read it for
-        // their highlight, clicks update it through `click_select`.
-        let multi = get_panel(self, is_left).multi.clone();
+        // Multi-selection membership is read per row via `multi.contains`
+        // (below) instead of cloning the whole set every frame — a 10k-item
+        // Ctrl+A would otherwise deep-copy 10k strings each repaint.
         // Borrow the listing for the duration of the frame instead of cloning
         // it: a 5000-entry folder would otherwise deep-clone every frame.
         let generation = get_panel(self, is_left).generation;
+        // Invalidate the per-row text cache (size / type / dates) when the
+        // listing, UI language, or column widths change — all three alter the
+        // formatted strings. Keyed so a mid-generation size update (folder
+        // scan completing) still refreshes the row via `(index, size, est)`.
+        let lang_id = self.lang.num();
+        let sig = generation
+            ^ (lang_id << 40)
+            ^ ((cols.time as u64) << 20)
+            ^ (cols.date as u64);
+        {
+            let p = get_panel(self, is_left);
+            if p.fmt_sig != sig {
+                p.fmt_cache.clear();
+                p.fmt_sig = sig;
+            }
+        }
         let entries = std::mem::take(&mut get_panel(self, is_left).entries);
 
         // Native (full-colour) icons, resolved before the loop: the borrow of
         // `self.icons` must not overlap the `&mut self` work done per row.
+        let emoji_mode = self.icons.mode() == shellicon::IconMode::Emoji;
         let ctx = ui.ctx().clone();
         let texs: Vec<Option<egui::TextureId>> = vis
             .iter()
@@ -2443,22 +2682,44 @@ impl Explorer {
                     // Highlight comes from `multi` alone: a Ctrl+clicked-off
                     // focus row keeps `selected` (preview, Enter) but shows no
                     // highlight, exactly like Explorer.
-                    let is_sel = multi.contains(&name);
+                    let is_sel = get_panel(self, is_left).multi.contains(&name);
                     let tex = texs[k];
-                    let size_txt = if is_dir {
-                        if e.size_known {
-                            human_size(e.size)
-                        } else {
-                            "…".to_string()
-                        }
+                    // "" unless the emoji mode is on: then every row wears a
+                    // font glyph instead of a shell texture.
+                    let emoji = if emoji_mode {
+                        emoji_for(is_dir, &e.ext)
                     } else {
-                        human_size(e.size)
+                        ""
                     };
-                    let type_txt = e.type_label(self.lang);
-                    // 修改时间 / 创建时间: both full date+time stamps, with
-                    // shorter forms when the pane is too narrow to fit them.
-                    let mtime_txt = col_datetime(e.mtime, cols.time);
-                    let ctime_txt = col_datetime(e.ctime, cols.date);
+                    // Per-row text is cached by `(index, size, est)`: re-reading
+                    // `entries` on the worker replaces them, and a size result
+                    // mid-scan bumps `e.size` so the row refreshes. The cache is
+                    // cleared wholesale on nav / language / width change above.
+                    let (size_txt, type_txt, mtime_txt, ctime_txt): (&str, &str, &str, &str) = {
+                        let key = (i, e.size, e.size_est as u8);
+                        let lang = self.lang;
+                        let mtime_w = cols.time;
+                        let ctime_w = cols.date;
+                        let fmt = get_panel(self, is_left)
+                            .fmt_cache
+                            .entry(key)
+                            .or_insert_with(|| {
+                                let size_txt = if is_dir {
+                                    if e.size_known {
+                                        human_size_est(e.size, e.size_est)
+                                    } else {
+                                        "…".to_string()
+                                    }
+                                } else {
+                                    human_size(e.size)
+                                };
+                                let type_txt = e.type_label(lang);
+                                let mtime_txt = col_datetime(e.mtime, mtime_w);
+                                let ctime_txt = col_datetime(e.ctime, ctime_w);
+                                (size_txt, type_txt, mtime_txt, ctime_txt)
+                            });
+                        (fmt.0.as_str(), fmt.1.as_str(), fmt.2.as_str(), fmt.3.as_str())
+                    };
                     let fill = if is_sel {
                         ui.visuals().selection.bg_fill
                     } else {
@@ -2473,6 +2734,7 @@ impl Explorer {
                                 name.clone(),
                                 if is_dir { IconKind::Folder } else { IconKind::File },
                                 tex,
+                                emoji,
                             );
                             table_cell(ui, cols.ty, true, type_txt);
                             table_cell(ui, cols.size, true, size_txt);
@@ -2529,6 +2791,7 @@ impl Explorer {
         let loading = get_panel(self, is_left).rec_loading;
         let rec_items = std::mem::take(&mut get_panel(self, is_left).recycle_items);
         let sel = get_panel(self, is_left).selected.clone();
+        let emoji_mode = self.icons.mode() == shellicon::IconMode::Emoji;
         // Native icons resolved up front (the borrow of `self.icons` must not
         // overlap the `&mut self` work done per row).
         let ctx = ui.ctx().clone();
@@ -2575,9 +2838,27 @@ impl Explorer {
                     // goes in the 修改时间 column, 创建时间 stays blank.
                     let clock = col_datetime(it.deleted_at, cols.time);
 
+                    // Emoji mode: the bin's own glyph for the deleted item's
+                    // type, so a deleted photo still reads as a photo.
+                    let emoji = if emoji_mode {
+                        let ext = std::path::Path::new(&it.name)
+                            .extension()
+                            .map(|x| x.to_string_lossy().to_ascii_lowercase())
+                            .unwrap_or_default();
+                        emoji_for(it.is_dir, &ext)
+                    } else {
+                        ""
+                    };
                     let row = egui::Frame::NONE.fill(fill).show(ui, |ui| {
                         ui.horizontal(|ui| {
-                            name_cell(ui, cols.name, it.name.clone(), IconKind::Recycle, texs[k]);
+                            name_cell(
+                                ui,
+                                cols.name,
+                                it.name.clone(),
+                                IconKind::Recycle,
+                                texs[k],
+                                emoji,
+                            );
                             table_cell(ui, cols.ty, true, type_txt);
                             table_cell(ui, cols.size, true, size_txt);
                             table_cell(ui, cols.time, true, clock);
@@ -2634,11 +2915,23 @@ impl Explorer {
         let show_hidden = self.show_hidden;
         let loading = get_panel(self, is_left).loading;
         let vis = get_panel(self, is_left).visible(show_hidden);
-        // Multi-selection membership, cloned once per frame (see render_list).
-        let multi = get_panel(self, is_left).multi.clone();
+        // Multi-selection membership is read per row (see render_list); no
+        // per-frame clone of the whole set.
         // Borrow the listing for the duration of the frame instead of cloning
         // it: a 5000-entry folder would otherwise deep-clone every frame.
         let generation = get_panel(self, is_left).generation;
+        // Per-row text cache (grid only renders a size string) cleared on nav /
+        // language change — matches the list view's signature scheme minus the
+        // width bits, which the grid does not use.
+        let lang_id = self.lang.num();
+        let sig = generation ^ (lang_id << 40);
+        {
+            let p = get_panel(self, is_left);
+            if p.fmt_sig != sig {
+                p.fmt_cache.clear();
+                p.fmt_sig = sig;
+            }
+        }
         let entries = std::mem::take(&mut get_panel(self, is_left).entries);
         let sp = ui.spacing().item_spacing.x;
         let cols = (((ui.available_width() + sp) / (CELL_W + sp)).floor() as usize).max(1);
@@ -2663,8 +2956,8 @@ impl Explorer {
                     ui.horizontal(|ui| {
                         for &i in &vis[start..end] {
                             let e = &entries[i];
-                            let is_sel = multi.contains(&e.name);
-                            self.grid_cell(ui, is_left, e, is_sel, &vis_names);
+                            let is_sel = get_panel(self, is_left).multi.contains(&e.name);
+                            self.grid_cell(ui, is_left, e, is_sel, &vis_names, i);
                         }
                     });
                     start = end;
@@ -2681,6 +2974,7 @@ impl Explorer {
         e: &app::Entry,
         is_sel: bool,
         vis_names: &[String],
+        idx: usize,
     ) {
         let name = e.name.clone();
         let is_dir = e.is_dir;
@@ -2690,10 +2984,16 @@ impl Explorer {
         } else {
             egui::Color32::TRANSPARENT
         };
-        // Native (full-colour) icon for this cell, at grid size.
+        // Native (full-colour) icon for this cell, at grid size; `None` in both
+        // lighter icon modes, which never ask the shell.
         let tex = self
             .icons
             .get(ui.ctx(), shellicon::Kind::for_entry(is_dir, &e.ext));
+        let emoji = if self.icons.mode() == shellicon::IconMode::Emoji {
+            emoji_for(is_dir, &e.ext)
+        } else {
+            ""
+        };
 
         let cell = egui::Frame::NONE
             .fill(fill)
@@ -2705,21 +3005,19 @@ impl Explorer {
                     egui::Layout::top_down(egui::Align::Center),
                     |ui| {
                         let (rect, _) = ui.allocate_exact_size(
-                            egui::vec2(CELL_W - 18.0, CELL_H - 32.0),
+                            egui::vec2(CELL_W - 18.0, CELL_H - 46.0),
                             egui::Sense::hover(),
                         );
                         if is_dir {
-                            if let Some(id) = tex {
-                                draw_tex(ui.painter(), id, rect, LARGE_ICON);
-                            } else {
-                                draw_icon(
-                                    ui.painter(),
-                                    IconKind::Folder,
-                                    rect,
-                                    egui::Color32::from_rgb(225, 180, 70),
-                                    LARGE_ICON,
-                                );
-                            }
+                            draw_row_icon(
+                                ui.painter(),
+                                tex,
+                                emoji,
+                                IconKind::Folder,
+                                rect,
+                                LARGE_ICON,
+                                egui::Color32::from_rgb(225, 180, 70),
+                            );
                         } else if crate::preview::is_image(&name) {
                             let mut painted = false;
                             if let Some(t) = self.previews.get(&path, preview::THUMB) {
@@ -2748,67 +3046,77 @@ impl Explorer {
                             if !painted {
                                 // Thumbnail still decoding: show the shell's own
                                 // icon for this image type instead of a stub.
-                                if let Some(id) = tex {
-                                    draw_tex(ui.painter(), id, rect, LARGE_ICON);
-                                } else {
-                                    draw_icon(
-                                        ui.painter(),
-                                        IconKind::Image,
-                                        rect,
-                                        ui.visuals().weak_text_color(),
-                                        LARGE_ICON,
-                                    );
-                                }
-                            }
-                        } else {
-                            if let Some(id) = tex {
-                                draw_tex(ui.painter(), id, rect, LARGE_ICON);
-                            } else {
-                                draw_icon(
+                                draw_row_icon(
                                     ui.painter(),
-                                    IconKind::File,
+                                    tex,
+                                    emoji,
+                                    IconKind::Image,
                                     rect,
-                                    ui.visuals().text_color(),
                                     LARGE_ICON,
+                                    self.weak_color(),
                                 );
                             }
+                        } else {
+                            draw_row_icon(
+                                ui.painter(),
+                                tex,
+                                emoji,
+                                IconKind::File,
+                                rect,
+                                LARGE_ICON,
+                                ui.visuals().text_color(),
+                            );
                         }
                         // Painter-drawn caption instead of a `Label`: a selectable
                         // label would be an interactive widget stealing the
                         // click/double-click on the thumbnail name.
                         let cap_rect = ui
                             .allocate_exact_size(
-                                egui::vec2(CELL_W - 18.0, 30.0),
+                                egui::vec2(CELL_W - 18.0, 40.0),
                                 egui::Sense::hover(),
                             )
                             .0;
-                        let font_id = egui::TextStyle::Small.resolve(ui.style());
+                        let font_id = egui::TextStyle::Body.resolve(ui.style());
                         let color = ui.visuals().text_color();
                         // Name on the first line, size on the second — folders
                         // show their computed total once the size worker has
-                        // it ("…" while it is still being walked).
+                        // it ("…" while it is still being walked). The size
+                        // string is cached by `(index, size, est)`.
                         let name_rect =
-                            egui::Rect::from_min_size(cap_rect.min, egui::vec2(cap_rect.width(), 16.0));
+                            egui::Rect::from_min_size(cap_rect.min, egui::vec2(cap_rect.width(), 20.0));
                         cell_text_with(ui, name_rect, name.clone(), font_id.clone(), color);
-                        let size_txt = if e.is_dir {
-                            if e.size_known {
-                                human_size(e.size)
-                            } else {
-                                "…".to_string()
-                            }
-                        } else {
-                            human_size(e.size)
+                        // Clone the cached string out so the `&mut self` borrow
+                        // held by `fmt_cache` ends here; `self.weak_color()`
+                        // below then borrows `self` immutably without a clash.
+                        let size_txt: String = {
+                            let key = (idx, e.size, e.size_est as u8);
+                            let fmt = get_panel(self, is_left)
+                                .fmt_cache
+                                .entry(key)
+                                .or_insert_with(|| {
+                                    let s = if e.is_dir {
+                                        if e.size_known {
+                                            human_size_est(e.size, e.size_est)
+                                        } else {
+                                            "…".to_string()
+                                        }
+                                    } else {
+                                        human_size(e.size)
+                                    };
+                                    (s, String::new(), String::new(), String::new())
+                                });
+                            fmt.0.clone()
                         };
                         let size_rect = egui::Rect::from_min_size(
-                            cap_rect.min + egui::vec2(0.0, 16.0),
-                            egui::vec2(cap_rect.width(), 13.0),
+                            cap_rect.min + egui::vec2(0.0, 20.0),
+                            egui::vec2(cap_rect.width(), 18.0),
                         );
                         cell_text_with(
                             ui,
                             size_rect,
                             size_txt,
                             font_id,
-                            ui.visuals().weak_text_color(),
+                            self.weak_color(),
                         );
                     },
                 );
@@ -3226,34 +3534,35 @@ fn table_cell(ui: &mut egui::Ui, width: f32, draw_divider: bool, text: impl Into
 
 /// Fixed-width cell for the 名称 column: a leading icon + left-padded,
 /// truncated name. Always carries a right divider.
+/// `emoji` is `""` unless the emoji icon mode is on.
 fn name_cell(
     ui: &mut egui::Ui,
     width: f32,
     name: impl Into<String>,
     kind: IconKind,
     tex: Option<egui::TextureId>,
+    emoji: &str,
 ) -> egui::Response {
     let (rect, _) = ui.allocate_exact_size(egui::vec2(width, ROW_H), egui::Sense::hover());
     let icon_rect = egui::Rect::from_min_size(
         egui::pos2(rect.min.x, rect.min.y),
         egui::vec2(ICON_W, ROW_H),
     );
-    // The shell's icon when we have one; the vector glyph is only the fallback
-    // for platforms without a shell (or an unusual file the shell has no
-    // glyph for).
-    let drew = if let Some(id) = tex {
-        draw_tex(ui.painter(), id, icon_rect, LIST_ICON);
-        true
-    } else {
-        false
+    // The shell's icon when we have one; the emoji glyph or the vector shape is
+    // the fallback (lighter icon modes never ask the shell at all).
+    let icon_color = match kind {
+        IconKind::Folder => egui::Color32::from_rgb(225, 180, 70),
+        _ => ui.visuals().text_color(),
     };
-    if !drew {
-        let icon_color = match kind {
-            IconKind::Folder => egui::Color32::from_rgb(225, 180, 70),
-            _ => ui.visuals().text_color(),
-        };
-        draw_icon(ui.painter(), kind, icon_rect, icon_color, LIST_ICON);
-    }
+    draw_row_icon(
+        ui.painter(),
+        tex,
+        emoji,
+        kind,
+        icon_rect,
+        LIST_ICON,
+        icon_color,
+    );
     let text_rect = egui::Rect::from_min_max(
         egui::pos2(rect.min.x + ICON_W, rect.min.y),
         egui::pos2(rect.max.x - CELL_PAD, rect.max.y),
@@ -3261,6 +3570,81 @@ fn name_cell(
     cell_text(ui, text_rect, name, false);
     col_divider(ui, rect);
     ui.interact(rect, egui::Id::new(("name_cell", rect.min.x as i32)), egui::Sense::hover())
+}
+
+/// Emoji glyph for a file type, used by the emoji icon mode.
+///
+/// These come from egui's bundled Noto Emoji face, which is part of the
+/// default font set — no extra font is loaded and the shell is never asked for
+/// an icon. The atlas is alpha-only, so the glyphs are drawn monochrome
+/// (tinted like text) rather than in colour.
+fn emoji_for(is_dir: bool, ext: &str) -> &'static str {
+    if is_dir {
+        return "\u{1F4C1}"; // 📁
+    }
+    match ext {
+        "png" | "jpg" | "jpeg" | "jpe" | "bmp" | "gif" | "webp" | "ico" | "tif" | "tiff"
+        | "tga" | "heic" | "svg" => "\u{1F5BC}", // 🖼
+        "mp3" | "wav" | "flac" | "aac" | "m4a" | "ogg" | "wma" | "opus" => "\u{1F3B5}", // 🎵
+        "mp4" | "mkv" | "avi" | "mov" | "wmv" | "flv" | "webm" | "mpg" | "mpeg" => {
+            "\u{1F3AC}"
+        } // 🎬
+        "zip" | "7z" | "rar" | "tar" | "gz" | "bz2" | "xz" | "iso" => "\u{1F4E6}", // 📦
+        "pdf" => "\u{1F4D5}",                                                      // 📕
+        "doc" | "docx" | "rtf" | "odt" => "\u{1F4D8}",                             // 📘
+        "xls" | "xlsx" | "csv" | "ods" => "\u{1F4CA}",                             // 📊
+        "ppt" | "pptx" | "odp" => "\u{1F4D7}",                                     // 📗
+        "txt" | "md" | "log" | "ini" | "cfg" | "toml" | "json" | "xml" | "yml" | "yaml" => {
+            "\u{1F4DD}"
+        } // 📝
+        "rs" | "c" | "h" | "cpp" | "hpp" | "cc" | "cs" | "java" | "js" | "ts" | "py" | "go"
+        | "rb" | "php" | "html" | "css" | "sh" | "bat" | "ps1" | "sql" => "\u{1F4DC}", // 📜
+        "exe" | "msi" | "dll" | "sys" => "\u{2699}",                                    // ⚙
+        _ => "\u{1F4C4}",                                                               // 📄
+    }
+}
+
+/// Draw an emoji glyph centred in `rect`, `px` on a side.
+///
+/// Painted as text on purpose: the glyph then comes out of egui's font atlas
+/// like any other character, so an emoji costs a few hundred bytes instead of a
+/// texture of its own.
+fn draw_emoji(
+    painter: &egui::Painter,
+    s: &str,
+    rect: egui::Rect,
+    px: f32,
+    color: egui::Color32,
+) {
+    painter.text(
+        rect.center(),
+        egui::Align2::CENTER_CENTER,
+        s.to_string(),
+        egui::FontId::new(px, egui::FontFamily::Proportional),
+        color,
+    );
+}
+
+/// Leading icon of a list row / grid cell: the shell texture when there is one,
+/// else the emoji glyph (emoji mode), else the built-in vector shape.
+///
+/// `emoji` is `""` unless the emoji mode is on.
+fn draw_row_icon(
+    painter: &egui::Painter,
+    tex: Option<egui::TextureId>,
+    emoji: &str,
+    kind: IconKind,
+    rect: egui::Rect,
+    px: f32,
+    color: egui::Color32,
+) {
+    if let Some(id) = tex {
+        draw_tex(painter, id, rect, px);
+    } else if !emoji.is_empty() {
+        draw_emoji(painter, emoji, rect, px, color);
+    } else {
+        draw_icon(painter, kind, rect, color, px);
+    }
 }
 
 /// Draw a (square) icon texture at `px` size, left-anchored and vertically
@@ -3324,7 +3708,7 @@ fn status_cell(
     if avail < 16.0 {
         return x; // too narrow to be worth anything
     }
-    let font = egui::TextStyle::Small.resolve(ui.style());
+    let font = egui::TextStyle::Body.resolve(ui.style());
     let mut job = egui::text::LayoutJob::simple(text, font, color, avail);
     job.wrap = egui::text::TextWrapping::truncate_at_width(avail);
     let galley = ui.painter().layout_job(job);
@@ -3365,27 +3749,3 @@ fn tab_label(cwd: &std::path::Path) -> String {
     }
 }
 
-/// Common user folders that exist (Desktop / Downloads / Documents / …).
-fn known_folders(lang: crate::lang::Lang) -> Vec<(String, PathBuf)> {
-    let up = std::env::var("USERPROFILE")
-        .or_else(|_| std::env::var("HOME"))
-        .map(PathBuf::from)
-        .unwrap_or_default();
-    let mut out = vec![];
-    // No emoji in the label: the row shows the shell's own full-colour folder
-    // icon instead, so the text stays plain and selectable-free.
-    for (word, name) in [
-        ("桌面", "Desktop"),
-        ("下载", "Downloads"),
-        ("文档", "Documents"),
-        ("图片", "Pictures"),
-        ("音乐", "Music"),
-        ("视频", "Videos"),
-    ] {
-        let p = up.join(name);
-        if p.is_dir() {
-            out.push((crate::lang::tr(word, lang).to_string(), p));
-        }
-    }
-    out
-}

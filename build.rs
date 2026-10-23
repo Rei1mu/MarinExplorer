@@ -50,6 +50,10 @@ fn main() {
     if fs::copy(&rc, &tmp_rc).is_err() || fs::copy(dir.join("logo.ico"), &tmp_ico).is_err() {
         return;
     }
+    // NOTE: do not add an RT_MANIFEST resource here. rustc already embeds its
+    // own manifest (id 1) — `asInvoker` + `longPathAware` — and a second one
+    // with the same id loses to it, silently. Elevation is handled at startup
+    // instead (see `shell::relaunch_elevated`).
 
     let out = if gnu {
         // MinGW: windres -> COFF object, handed straight to the linker.

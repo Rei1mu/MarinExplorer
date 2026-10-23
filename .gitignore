@@ -21,6 +21,9 @@ _keep.pid
 # ---- Dev helper scripts (personal tooling, may contain local paths) ----
 _*.py
 _*.ps1
+_*.cmd
+_*.bat
+_*.sh
 icocheck.py
 icodump.py
 peico.py

@@ -35,6 +35,17 @@ impl Lang {
         }
     }
 
+    /// Compact numeric form, used to key per-row text caches that must be
+    /// invalidated when the UI language changes.
+    pub fn num(self) -> u64 {
+        match self {
+            Lang::Zh => 0,
+            Lang::En => 1,
+            Lang::Ja => 2,
+            Lang::ZhTw => 3,
+        }
+    }
+
     /// Parse the persisted id back into a language.
     pub fn from_id(s: &str) -> Lang {
         match s {
@@ -57,13 +68,16 @@ fn lookup(key: &str) -> Option<(&'static str, &'static str, &'static str)> {
         ("刷新", "Refresh", "更新", "重新整理"),
         ("复制", "Copy", "コピー", "複製"),
         ("移动", "Move", "移動", "移動"),
+        ("剪贴", "Cut", "切り取り", "剪貼"),
         ("粘贴", "Paste", "貼り付け", "貼上"),
         ("删除", "Delete", "削除", "刪除"),
         ("新建", "New", "新規", "新建"),
         ("标签页", "Tab", "タブ", "標籤頁"),
-        ("固定", "Pin", "ピン留め", "固定"),
+        ("收藏", "Favorite", "お気に入り", "收藏"),
         ("跳转", "Go to", "移動", "跳轉"),
         ("终端", "Terminal", "ターミナル", "終端機"),
+        ("重新计算大小", "Recompute sizes", "サイズ再計算", "重新計算大小"),
+        ("忽略缓存，重新扫描面板里所有文件夹的大小", "Ignore the cache and rescan every folder size in the pane", "キャッシュを無視して、ペイン内のすべてのフォルダーサイズを再スキャンする", "忽略快取，重新掃描面板中所有資料夾的大小"),
         ("隐藏文件", "Hidden files", "隠しファイル", "隱藏檔案"),
         ("预览窗格", "Preview pane", "プレビュー", "預覽窗格"),
         ("分栏", "Split", "分割", "分欄"),
@@ -79,7 +93,7 @@ fn lookup(key: &str) -> Option<(&'static str, &'static str, &'static str)> {
         // --- left rail ---
         ("位置", "Location", "場所", "位置"),
         ("快速访问", "Quick Access", "クイックアクセス", "快速存取"),
-        ("暂无；点工具栏“固定”", "None yet; use “Pin”", "まだありません", "尚無；點工具列的「固定」"),
+        ("暂无；右键或工具栏“收藏”添加", "None yet — right-click or use “Favorite”", "まだありません。右クリックか「お気に入り」から", "尚無；右鍵或工具列「收藏」新增"),
         ("常用位置", "Common folders", "よく使う場所", "常用位置"),
         ("回收站", "Recycle Bin", "ゴミ箱", "資源回收筒"),
         ("驱动器", "Drives", "ドライブ", "磁碟機"),
@@ -114,6 +128,7 @@ fn lookup(key: &str) -> Option<(&'static str, &'static str, &'static str)> {
         ("预览图片", "Preview image", "画像をプレビュー", "預覽圖片"),
         ("在资源管理器中显示", "Show in Explorer", "エクスプローラーで表示", "在檔案總管中顯示"),
         ("在此打开终端", "Open terminal here", "ここでターミナル", "在此開啟終端機"),
+        ("通过 VS Code 打开", "Open in VS Code", "VS Code で開く", "通過 VS Code 開啟"),
         ("剪切", "Cut", "切り取り", "剪下"),
         ("粘贴到此处", "Paste here", "ここに貼り付け", "貼到此處"),
         ("剪贴板", "Clipboard", "クリップボード", "剪貼簿"),
@@ -126,7 +141,7 @@ fn lookup(key: &str) -> Option<(&'static str, &'static str, &'static str)> {
         ("新建文件夹", "New folder", "新しいフォルダ", "新建資料夾"),
         ("粘贴", "Paste", "貼り付け", "貼上"),
         ("刷新", "Refresh", "更新", "重新整理"),
-        ("固定到快速访问", "Pin to Quick Access", "クイックアクセスに追加", "固定到快速存取"),
+        ("加入收藏", "Add to Favorites", "お気に入りに追加", "加入收藏"),
         ("复制当前目录路径", "Copy folder path", "フォルダパスをコピー", "複製目前目錄路徑"),
         ("在新标签页打开", "Open in new tab", "新しいタブで開く", "在新標籤頁開啟"),
         ("从右栏打开", "Open in right pane", "右ペインで開く", "從右欄開啟"),
@@ -134,7 +149,7 @@ fn lookup(key: &str) -> Option<(&'static str, &'static str, &'static str)> {
         ("在左栏打开", "Open in left pane", "左ペインで開く", "在左欄開啟"),
         ("关闭其他标签页", "Close other tabs", "他のタブを閉じる", "關閉其他標籤頁"),
         ("关闭右侧标签页", "Close tabs to the right", "右側のタブを閉じる", "關閉右側標籤頁"),
-        ("取消固定", "Unpin", "ピン留め解除", "取消固定"),
+        ("取消收藏", "Remove from Favorites", "お気に入りから削除", "取消收藏"),
         ("拖动调整栏宽；双击恢复等宽", "Drag to resize; double-click to even out", "ドラッグで幅調整、ダブルクリックで等分", "拖拽調整欄寬；雙擊恢復等寬"),
         // --- recycle-bin view ---
         ("还原", "Restore", "復元", "還原"),
@@ -168,7 +183,7 @@ fn lookup(key: &str) -> Option<(&'static str, &'static str, &'static str)> {
         ("取消", "Cancel", "キャンセル", "取消"),
         ("确定清空回收站吗？共", "Empty the Recycle Bin? Total ", "ゴミ箱を空にしますか？合計 ", "確定清空資源回收筒嗎？共"),
         ("项。", " items.", " 項目。", " 項。"),
-        ("后台逐个删除 $R/$I 文件，界面不卡顿。", "Background-deletes $R/$I files without freezing.", "バックグラウンドで削除します。", "背景逐個刪除 $R/$I 檔案，介面不卡頓。"),
+        ("后台安全清空，界面不卡顿，无系统弹窗。", "Empties safely in the background with no system dialog.", "バックグラウンドで安全に空にし、システムダイアログは出ません。", "背景安全清空，介面不卡頓，無系統彈窗。"),
         ("清空", "Empty", "空にする", "清空"),
         ("名称:", "Name:", "名前:", "名稱:"),
         ("创建", "Create", "作成", "建立"),
@@ -249,8 +264,8 @@ fn lookup(key: &str) -> Option<(&'static str, &'static str, &'static str)> {
         ("单击选中，双击打开；Alt+←/→ 前进后退；Ctrl+T 新标签页。", "Click to select, double-click to open; Alt+←/→ back/forward; Ctrl+T new tab.", "クリックで選択、ダブルクリックで開く。Alt+←/→ で戻る/進む。Ctrl+T で新規タブ。", "單擊選取，雙擊開啟；Alt+←/→ 前進後退；Ctrl+T 新標籤頁。"),
         ("已复制:", "Copied:", "コピーしました:", "已複製:"),
         ("已复制", "Copied", "コピーしました", "已複製"),
-        ("已准备移动:", "Ready to move:", "移動の準備完了:", "已準備移動:"),
-        ("已准备移动", "Ready to move", "移動の準備完了", "已準備移動"),
+        ("已准备剪贴:", "Ready to cut:", "切り取りの準備完了:", "已準備剪貼:"),
+        ("已准备剪贴", "Ready to cut", "切り取りの準備完了", "已準備剪貼"),
         ("已复制绝对路径", "Copied absolute path", "絶対パスをコピー", "已複製絕對路徑"),
         ("已复制相对路径", "Copied relative path", "相対パスをコピー", "已複製相對路徑"),
         ("已复制文件名", "Copied file name", "ファイル名をコピー", "已複製檔名"),
@@ -271,10 +286,15 @@ fn lookup(key: &str) -> Option<(&'static str, &'static str, &'static str)> {
         ("创建失败:", "Create failed:", "作成失敗:", "建立失敗:"),
         ("已加载", "Loaded", "読み込みました", "已載入"),
         ("个系统快速访问文件夹", " system Quick Access folders", " 個のクイックアクセス", " 個系統快速存取資料夾"),
-        ("已固定到快速访问:", "Pinned to Quick Access:", "クイックアクセスに追加:", "已固定到快速存取:"),
-        ("已固定到快速访问", "Pinned to Quick Access", "クイックアクセスに追加", "已固定到快速存取"),
-        ("该目录已在快速访问中", "Already pinned", "既に追加済み", "該目錄已在快速存取中"),
-        ("已取消固定", "Unpinned", "ピン解除", "已取消固定"),
+        ("已收藏:", "Added to favorites:", "お気に入りに追加:", "已收藏:"),
+        ("已收藏", "Added to favorites", "お気に入りに追加しました", "已收藏"),
+        ("该目录已收藏", "Already in favorites", "既にお気に入り済み", "該目錄已收藏"),
+        ("已取消收藏", "Removed from favorites", "お気に入りから削除しました", "已取消收藏"),
+        ("已固定", "Pinned by Windows", "Windows がピン留め", "已固定"),
+        ("最近使用", "Recent", "最近使用", "最近使用"),
+        ("Windows 已固定此文件夹", "Windows already pins this folder", "Windows が既にピン留めしています", "Windows 已固定此資料夾"),
+        ("收藏数量已达上限", "Favorites limit reached", "お気に入り数の上限に達しました", "收藏數量已達上限"),
+        ("个", "items", "個", "個"),
         ("剪贴板为空", "Clipboard is empty", "クリップボードは空", "剪貼簿為空"),
         ("不能粘贴到回收站", "Cannot paste into the Recycle Bin", "ゴミ箱には貼れません", "不能貼到資源回收筒"),
         ("目标已存在:", "Target already exists:", "既に存在します:", "目標已存在:"),
@@ -302,6 +322,8 @@ fn lookup(key: &str) -> Option<(&'static str, &'static str, &'static str)> {
         ("已复制到 %s", "Copied to %s", "コピー先 %s", "已複製到 %s"),
         ("已清空回收站（删除", "Emptied Recycle Bin (deleted ", "ゴミ箱を空にしました（削除 ", "已清空資源回收筒（刪除"),
         ("已清空回收站（删除 %s 个文件）", "Emptied Recycle Bin (deleted %s files)", "ゴミ箱を空にしました（削除 %s 個）", "已清空資源回收筒（刪除 %s 個檔案）"),
+        ("已清空回收站", "Emptied Recycle Bin", "ゴミ箱を空にしました", "已清空資源回收筒"),
+        ("回收站已清空，但 %s 项无法删除（可尝试以管理员身份运行后重试）", "Recycle Bin emptied, but %s items could not be deleted (try running as administrator)", "ゴミ箱は空にしましたが、%s 項目を削除できませんでした（管理者として実行して再試行してください）", "資源回收筒已清空，但 %s 項無法刪除（可嘗試以管理員身分執行後重試）"),
         ("清空回收站…", "Emptying Recycle Bin…", "ゴミ箱を空にしています…", "清空資源回收筒…"),
         ("已永久删除", "Permanently deleted", "完全削除しました", "已徹底刪除"),
         ("已移到回收站", "Moved to Recycle Bin", "ゴミ箱へ移動しました", "已移到資源回收筒"),
@@ -315,6 +337,17 @@ fn lookup(key: &str) -> Option<(&'static str, &'static str, &'static str)> {
         ("设置", "Settings", "設定", "設定"),
         ("深色模式", "Dark mode", "ダークモード", "深色模式"),
         ("语言", "Language", "言語", "語言"),
+        ("图标", "Icons", "アイコン", "圖示"),
+        ("系统图标", "System icons", "システムアイコン", "系統圖示"),
+        ("矢量图标", "Vector icons", "ベクターアイコン", "向量圖示"),
+        ("省内存字体", "Low-memory font", "省メモリフォント", "省記憶體字型"),
+        (
+            "改用体积最小的中文字体；完整字体文件会常驻内存两份，换小字体可省约 19MB",
+            "Use the smallest Chinese font instead: a full font file is kept twice in memory, so the smaller face saves about 19 MB",
+            "最も小さい中国語フォントを使います。フォントファイルはメモリに2つ保持されるため、小さいものに替えると約19MB節約できます",
+            "改用體積最小的中文字型；完整字型檔會常駐記憶體兩份，換小字型可省約 19MB",
+        ),
+        ("图标模式已切换", "Icon mode changed", "アイコンモードを変更しました", "圖示模式已切換"),
         ("关闭标签页", "Close tab", "タブを閉じる", "關閉標籤頁"),
         // --- shell integration ---
         ("集成", "Integration", "統合", "整合"),

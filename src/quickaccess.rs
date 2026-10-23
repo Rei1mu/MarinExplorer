@@ -18,42 +18,51 @@ const CFB_MAGIC: [u8; 8] = [0xD0, 0xCF, 0x11, 0xE0, 0xA1, 0xB1, 0x1A, 0xE1];
 const END_OF_CHAIN: usize = 0xFFFF_FFFF;
 const FREE_SECTOR: usize = 0xFFFF_FFFE;
 
-/// Load the pinned Quick Access folders from the Windows jump list.
-/// Returns only paths that actually exist as directories (deduped, in order).
+/// One row of Windows Explorer's Quick Access list.
+pub struct QaEntry {
+    pub path: PathBuf,
+    /// `true` = Explorer shows it under "已固定", `false` = recent-only.
+    pub pinned: bool,
+}
+
+/// Load Windows Explorer's Quick Access folders, keeping the pinned/recent
+/// split that Explorer itself shows.
 ///
-/// The `DestList` stream is the authoritative, *ordered* index: Explorer keeps
-/// pinned folders at the front and then the most-recently-used ones. Its
-/// entries carry the folder path inline (UTF-16LE), so scanning it gives us the
-/// same order the user sees in Explorer. The numbered streams are only used as
-/// a fallback when `DestList` is missing or unreadable.
-pub fn load_windows_quick_access() -> Vec<PathBuf> {
+/// The `DestList` stream is the authoritative index. Each entry has a fixed
+/// part followed by a UTF-16 path, and carries an explicit *pin status*
+/// (`-1` = only recent, `>= 0` = pinned; the value doubles as the display
+/// order of the pinned group). Entries whose target is a shell known folder are
+/// stored as `knownfolder:{GUID}` rather than a plain path — half of a default
+/// Windows pin set is exactly that (Desktop / Downloads / Documents / …), so
+/// those must be resolved through `SHGetKnownFolderPath` or the whole pinned
+/// group silently disappears.
+///
+/// Falls back to plain path scanning (everything unpinned) for DestList v1
+/// (Windows 7) or an unparsable stream.
+pub fn load_windows_quick_access() -> Vec<QaEntry> {
     let Some(path) = jump_list_path() else {
         return vec![];
     };
     let Ok(data) = std::fs::read(&path) else {
         return vec![];
     };
-    let streams = match parse_cfb(&data) {
-        Some(s) => s,
-        None => return vec![],
+    let Some(streams) = parse_cfb(&data) else {
+        return vec![];
     };
 
-    let mut out: Vec<PathBuf> = Vec::new();
-    let push = |cand: PathBuf, out: &mut Vec<PathBuf>| {
-        if cand.is_dir() && !out.contains(&cand) {
-            out.push(cand);
-        }
-    };
-
-    // 1) DestList order: pinned first, then most-recent.
     if let Some(dl) = streams.get("DestList") {
-        for p in scan_utf16_paths(dl) {
-            push(PathBuf::from(p), &mut out);
+        let out = parse_dest_list(dl);
+        if !out.is_empty() {
+            return out;
         }
     }
 
-    // 2) Fallback: the numbered `.lnk` streams.
-    if out.is_empty() {
+    // Fallback: scan the numbered `.lnk` streams (or DestList v1) for paths.
+    let mut scanned: Vec<String> = Vec::new();
+    if let Some(dl) = streams.get("DestList") {
+        scanned = scan_utf16_paths(dl);
+    }
+    if scanned.is_empty() {
         let mut names: Vec<&String> = streams
             .keys()
             .filter(|n| !n.is_empty() && n.chars().all(|c| c.is_ascii_hexdigit()))
@@ -62,46 +71,178 @@ pub fn load_windows_quick_access() -> Vec<PathBuf> {
         names.sort_by_key(|n| u64::from_str_radix(n, 16).unwrap_or(u64::MAX));
         for name in names {
             if let Some(target) = lnk_target_path(&streams[name]) {
-                push(PathBuf::from(target), &mut out);
+                scanned.push(target);
             }
         }
     }
 
-    // Explorer's own pins are almost always the user's known folders
-    // (Desktop / Downloads / Documents / …), so float those to the top instead
-    // of letting a long MRU history bury them.
-    if let Ok(profile) = std::env::var("USERPROFILE") {
-        let known: Vec<PathBuf> = [
-            "Desktop",
-            "Downloads",
-            "Documents",
-            "Pictures",
-            "Music",
-            "Videos",
-        ]
-        .iter()
-        .map(|n| Path::new(&profile).join(n))
-        .filter(|p| p.is_dir())
-        .collect();
-        let mut front: Vec<PathBuf> = Vec::new();
-        for k in &known {
-            if let Some(pos) = out.iter().position(|p| p == k) {
-                front.push(out.remove(pos));
-            }
+    let mut out: Vec<QaEntry> = Vec::new();
+    for p in scanned {
+        let pb = PathBuf::from(p);
+        if pb.is_dir() && !out.iter().any(|e| e.path == pb) {
+            out.push(QaEntry { path: pb, pinned: false });
         }
-        front.extend(out);
-        out = front;
     }
-
-    // The jump list is a full MRU history (100+ entries). The sidebar only has
-    // room for the head of it, which is also the part Explorer shows first
-    // (pinned folders, then the most recently used ones).
     out.truncate(MAX_QUICK_ACCESS);
     out
 }
 
+/// Fixed part of a DestList entry (v2+ layout, 0x80 bytes) plus the u16 path
+/// size at `0x80` and the path itself at `0x82`.
+const DL_PIN_OFF: usize = 0x6C;
+const DL_PATH_SIZE_OFF: usize = 0x80;
+const DL_PATH_OFF: usize = 0x82;
+/// Alignment padding after a v2+ path, before the next entry.
+const DL_TRAILING: usize = 4;
+
+/// Walk the DestList entries of a v2+ (Windows 8 and later) jump list.
+fn parse_dest_list(dl: &[u8]) -> Vec<QaEntry> {
+    if dl.len() < 32 {
+        return vec![];
+    }
+    let version = u32::from_le_bytes([dl[0], dl[1], dl[2], dl[3]]);
+    if version < 2 {
+        return vec![]; // v1 (Windows 7) has a different layout — use fallback.
+    }
+    let n_entries = u32::from_le_bytes([dl[4], dl[5], dl[6], dl[7]]) as usize;
+
+    let mut pinned: Vec<(i32, PathBuf)> = Vec::new();
+    let mut recent: Vec<PathBuf> = Vec::new();
+    let mut off = 32usize;
+    for _ in 0..n_entries {
+        if off + DL_PATH_OFF > dl.len() {
+            break;
+        }
+        let pin = i32::from_le_bytes([
+            dl[off + DL_PIN_OFF],
+            dl[off + DL_PIN_OFF + 1],
+            dl[off + DL_PIN_OFF + 2],
+            dl[off + DL_PIN_OFF + 3],
+        ]);
+        let psize = u16::from_le_bytes([dl[off + DL_PATH_SIZE_OFF], dl[off + DL_PATH_SIZE_OFF + 1]])
+            as usize;
+        let pstart = off + DL_PATH_OFF;
+        let pend = pstart + psize * 2;
+        if psize == 0 || pend > dl.len() {
+            break;
+        }
+        let raw = decode_utf16(&dl[pstart..pend]).unwrap_or_default();
+        off = (pend + DL_TRAILING).min(dl.len());
+
+        let Some(path) = resolve_target(&raw) else {
+            continue;
+        };
+        if pinned.iter().any(|(_, p)| *p == path) || recent.contains(&path) {
+            continue;
+        }
+        if pin >= 0 {
+            pinned.push((pin, path));
+        } else {
+            recent.push(path);
+        }
+    }
+
+    // The pin status doubles as the display order of Explorer's pinned group.
+    pinned.sort_by_key(|(p, _)| *p);
+    let mut out: Vec<QaEntry> = pinned
+        .into_iter()
+        .map(|(_, path)| QaEntry { path, pinned: true })
+        .collect();
+    let room = MAX_QUICK_ACCESS.saturating_sub(out.len());
+    out.extend(recent.into_iter().take(room).map(|path| QaEntry { path, pinned: false }));
+    out
+}
+
+/// Turn one DestList path field into an existing directory.
+///
+/// Shell known folders are recorded as `knownfolder:{GUID}`; everything else is
+/// a plain `X:\…` path. Anything that does not resolve to a live directory is
+/// dropped, so a bad parse can never be navigated to.
+fn resolve_target(raw: &str) -> Option<PathBuf> {
+    let raw = raw.trim_end_matches('\0');
+    if let Some(rest) = raw.strip_prefix("knownfolder:") {
+        let p = known_folder_path(rest.trim())?;
+        return p.is_dir().then_some(p);
+    }
+    if !is_plausible_path(raw) {
+        return None;
+    }
+    let p = PathBuf::from(raw);
+    p.is_dir().then_some(p)
+}
+
 /// How many jump-list folders the sidebar shows.
 const MAX_QUICK_ACCESS: usize = 24;
+
+// ---------------------------------------------------------------------------
+// knownfolder:{GUID} — shell known folder resolution
+// ---------------------------------------------------------------------------
+
+#[repr(C)]
+struct Guid {
+    d1: u32,
+    d2: u16,
+    d3: u16,
+    d4: [u8; 8],
+}
+
+#[link(name = "shell32")]
+extern "system" {
+    fn SHGetKnownFolderPath(
+        rfid: *const Guid,
+        flags: u32,
+        token: *mut core::ffi::c_void,
+        path: *mut *mut u16,
+    ) -> i32;
+}
+
+#[link(name = "ole32")]
+extern "system" {
+    fn CoTaskMemFree(p: *mut core::ffi::c_void);
+}
+
+/// `{374DE290-123F-4565-9164-39C4925E467B}` → UTF-8 string.
+fn parse_guid(s: &str) -> Option<Guid> {
+    let s = s.trim().trim_start_matches('{').trim_end_matches('}');
+    let parts: Vec<&str> = s.split('-').collect();
+    if parts.len() != 5 {
+        return None;
+    }
+    let d1 = u32::from_str_radix(parts[0], 16).ok()?;
+    let d2 = u16::from_str_radix(parts[1], 16).ok()?;
+    let d3 = u16::from_str_radix(parts[2], 16).ok()?;
+    if parts[3].len() != 4 || parts[4].len() != 12 {
+        return None;
+    }
+    let mut d4 = [0u8; 8];
+    let tail = format!("{}{}", parts[3], parts[4]);
+    for i in 0..8 {
+        d4[i] = u8::from_str_radix(&tail[i * 2..i * 2 + 2], 16).ok()?;
+    }
+    Some(Guid { d1, d2, d3, d4 })
+}
+
+/// Resolve a KNOWNFOLDERID to its current path (honours OneDrive redirection).
+fn known_folder_path(guid_str: &str) -> Option<PathBuf> {
+    let guid = parse_guid(guid_str)?;
+    let mut buf: *mut u16 = std::ptr::null_mut();
+    // SAFETY: `guid` is a valid GUID, `buf` receives an owned, NUL-terminated
+    // UTF-16 string that we free with `CoTaskMemFree` right after copying it.
+    let hr = unsafe { SHGetKnownFolderPath(&guid, 0, std::ptr::null_mut(), &mut buf) };
+    if hr < 0 || buf.is_null() {
+        return None;
+    }
+    let mut len = 0usize;
+    unsafe {
+        while *buf.add(len) != 0 {
+            len += 1;
+        }
+        let slice = std::slice::from_raw_parts(buf, len);
+        let s = String::from_utf16_lossy(slice);
+        CoTaskMemFree(buf as *mut core::ffi::c_void);
+        Some(PathBuf::from(s))
+    }
+}
 
 /// `%APPDATA%\Microsoft\Windows\Recent\AutomaticDestinations\
 ///   f01b4d95cf55d32a.automaticDestinations-ms`
@@ -555,8 +696,8 @@ mod tests {
         // Should never panic; returns whatever it can (possibly empty).
         let list = load_windows_quick_access();
         println!("windows_qa: {} existing folders", list.len());
-        for p in &list {
-            println!("  qa: {}", p.display());
+        for e in &list {
+            println!("  qa: pinned={} {}", e.pinned, e.path.display());
         }
     }
 

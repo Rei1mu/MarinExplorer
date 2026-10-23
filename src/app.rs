@@ -23,6 +23,9 @@ pub struct Entry {
     /// Creation time, unix seconds (0 when the platform cannot report it).
     pub ctime: u64,
     pub size_known: bool,
+    /// True when a folder's size came from a budget-stopped scan: it is a
+    /// lower bound, so the UI prefixes it with `~`.
+    pub size_est: bool,
     pub ext: String, // lowercased extension ("" for dirs / no extension)
 }
 
@@ -180,6 +183,14 @@ pub struct Panel {
     /// (a bin can hold thousands of `$I` files; parsing them on the UI
     /// thread used to freeze the whole app).
     pub rec_loading: bool,
+    /// Per-row formatted text (size / type / mtime / ctime) cached across
+    /// frames. Keyed by `(index, size, size_est)` and invalidated wholesale
+    /// whenever the generation, UI language, or column widths change (see
+    /// `Explorer::fmt_signature`). This removes the ~4 `String` allocations
+    /// every visible row used to make on every repaint.
+    pub fmt_cache: std::collections::HashMap<(usize, u64, u8), (String, String, String, String)>,
+    /// Last signature under which `fmt_cache` was built; differs → cache cleared.
+    pub fmt_sig: u64,
 }
 
 impl Panel {
@@ -204,6 +215,8 @@ impl Panel {
             loading: false,
             list_tx: None,
             rec_loading: false,
+            fmt_cache: std::collections::HashMap::new(),
+            fmt_sig: 0,
         };
         p.load(&cwd);
         p
@@ -329,8 +342,15 @@ impl Panel {
                     if self.sort_dir == SortDir::Asc { d.then(c) } else { d.then(c.reverse()) }
                 }
                 SortKey::Size => {
+                    // A folder whose recursive size is still being computed
+                    // has no comparable value. Park those at the bottom in
+                    // *both* directions: otherwise they would fill the top of
+                    // an ascending list (their `size` is still 0) and the
+                    // listing would look unsorted until every folder is done.
+                    let unk = (a.is_dir && !a.size_known).cmp(&(b.is_dir && !b.size_known));
                     let c = a.size.cmp(&b.size);
-                    if self.sort_dir == SortDir::Asc { c } else { c.reverse() }
+                    let c = if self.sort_dir == SortDir::Asc { c } else { c.reverse() };
+                    unk.then(c)
                 }
                 SortKey::Time => {
                     let c = a.mtime.cmp(&b.mtime);
@@ -342,6 +362,17 @@ impl Panel {
                 }
             }
         });
+    }
+
+    /// Re-sort after folder sizes arrived (from the cache or the worker).
+    ///
+    /// Only a size-sorted listing can change; every other key is independent
+    /// of the size values, and re-sorting there would only flicker the rows
+    /// for no reason. Selection is stored by name, so a shuffle is safe.
+    pub fn resort_sizes(&mut self) {
+        if self.sort_key == SortKey::Size {
+            self.resort();
+        }
     }
 
     /// Indices into `entries` that pass the hidden-file + text filters.
@@ -535,7 +566,7 @@ pub fn read_entries(cwd: &std::path::Path) -> Vec<Entry> {
             }
             Err(_) => (false, 0, 0, 0, false),
         };
-        out.push(Entry { name, is_dir, size, mtime, ctime, size_known, ext });
+        out.push(Entry { name, is_dir, size, mtime, ctime, size_known, size_est: false, ext });
     }
     out
 }
@@ -632,6 +663,15 @@ pub fn human_size(n: u64) -> String {    const UNITS: [&str; 5] = ["B", "KiB", "
         format!("{} {}", n, UNITS[0])
     } else {
         format!("{:.1} {}", v, UNITS[u])
+    }
+}
+
+/// Human size, prefixed with `~` when the value is a budget-stopped estimate.
+pub fn human_size_est(n: u64, est: bool) -> String {
+    if est {
+        format!("~{}", human_size(n))
+    } else {
+        human_size(n)
     }
 }
 
@@ -779,6 +819,7 @@ mod select_tests {
                 mtime: 0,
                 ctime: 0,
                 size_known: true,
+                size_est: false,
                 ext: "txt".to_string(),
             });
         }

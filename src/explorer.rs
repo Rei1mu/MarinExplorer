@@ -20,10 +20,23 @@ pub enum JobMsg {
     Failed(String),
 }
 
+/// Folders per pane queued for a size scan by default: roughly what fits on
+/// screen — nobody looks at folder 300's size.
+const FOLDERS_PER_PANEL: usize = 24;
+/// Ceiling on in-flight size scans, so one huge listing cannot flood the
+/// single worker thread.
+const MAX_PENDING_SIZES: usize = 64;
+
 /// A running background job (empty recycle bin, big copy/move, delete batch).
 pub struct Job {
     pub label: String,
     pub progress: f32,
+    /// True when the job cannot report real completion (e.g. the shell owns
+    /// the actual work and only signals when it is done). The UI then draws an
+    /// *indeterminate* animated bar instead of a percentage — used for the
+    /// Recycle-Bin empty, where `SHEmptyRecycleBin` gives no per-file progress
+    /// and we must avoid the shell's own (stall-prone) modal dialog.
+    pub indeterminate: bool,
     pub note: Option<(&'static str, String)>,
     pub err: Option<String>,
     pub rx: Receiver<JobMsg>,
@@ -50,6 +63,18 @@ impl Tab {
     fn new(id: u32, left: PathBuf, right: PathBuf) -> Self {
         Self { id, panes: vec![Panel::new(left), Panel::new(right)] }
     }
+}
+
+/// Where a Quick-Access row came from — which group it is listed under and
+/// whether Marin is allowed to remove it.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum QaKind {
+    /// One of Marin's own favourites: stored in `store.txt`, removable here.
+    Favorite,
+    /// Pinned by Windows Explorer: read from the jump list, read-only to us.
+    WinPin,
+    /// Windows' jump-list MRU entry — neither pinned nor ours.
+    Recent,
 }
 
 pub struct Explorer {
@@ -86,15 +111,34 @@ pub struct Explorer {
     pub rec_tx: Sender<(PathBuf, Vec<fs_util::RecItem>)>,
     pub rec_rx: Receiver<(PathBuf, Vec<fs_util::RecItem>)>,
     pub pending_rec: HashSet<PathBuf>,
-    // quick access (system jump-list pins + user's own pins)
-    pub system_qa: Vec<PathBuf>,
-    pub user_pins: Vec<PathBuf>,
-    pub qa_rx: Option<Receiver<Vec<PathBuf>>>,
+    // quick access (system jump-list pins + the user's own favourites)
+    /// Windows' own Quick-Access entries as `(path, pinned)`; `pinned` is
+    /// Explorer's pin flag, so its "已固定" group can be mirrored exactly.
+    pub system_qa: Vec<(PathBuf, bool)>,
+    /// Marin's own list ("收藏"), persisted in `store.txt` under `qa_pins`.
+    ///
+    /// Renamed from "pin" on purpose: these are ours alone and can be added /
+    /// removed anywhere, while Windows' pins live in the jump list and are
+    /// read-only to us.
+    pub favorites: Vec<PathBuf>,
+    pub qa_rx: Option<Receiver<Vec<(PathBuf, bool)>>>,
+    /// Quick-Access list, rebuilt only when `qa_dirty` (a favourite or
+    /// Windows pin changed). The rail used to rebuild it every frame with an
+    /// O(n²) de-dup; now it clones this cached vec instead.
+    pub qa_cache: Vec<(PathBuf, QaKind)>,
+    pub qa_dirty: bool,
     // folder sizes
     pub store: Store,
     pub size_tx: Sender<PathBuf>,
-    pub size_rx: Receiver<(PathBuf, u64, u64)>, // (path, dir_mtime, size)
+    pub size_rx: Receiver<(PathBuf, u64, u64, bool)>, // (path, dir_mtime, size, complete)
     pub pending_sizes: HashSet<PathBuf>,
+    /// Wall clock of the last periodic folder-size top-up (see
+    /// `refresh_folder_sizes_throttled`).
+    pub last_size_poll: Instant,
+    /// Set whenever a background result lands. The UI needs one more repaint
+    /// *after* a queue drains (the last size, the last listing), and egui is
+    /// otherwise idle by then.
+    pub bg_signal: Option<Instant>,
     // directory listings (read on a worker so a huge folder can't freeze the UI)
     pub list_tx: Sender<(PathBuf, u64)>,
     pub list_rx: Receiver<(PathBuf, u64, Vec<Entry>)>,
@@ -140,11 +184,34 @@ pub struct Explorer {
     /// Image → ICO / PNG conversion dialog (opened from the viewer's
     /// right-click menu). Holds the decoded source until it closes.
     pub convert: Option<crate::convert::ConvertState>,
-    // ---- appearance / i18n (persisted) ----
-    pub dark: bool,
+            // ---- appearance / i18n (persisted) ----
+            pub dark: bool,
     pub lang: crate::lang::Lang,
     /// UI font scale (1.0 = default). Persisted as `font_scale`.
     pub font_scale: f32,
+    /// Custom text colours, one pair per theme. Persisted as `text_dark`,
+    /// `weak_dark`, `text_light`, `weak_light` (each "r,g,b,a"). `weak` is the
+    /// dimmer secondary text (counts, hints, captions); `text` is the main
+    /// body / label colour. Defaults keep the old readable look when unset.
+    pub text_dark: egui::Color32,
+    pub weak_dark: egui::Color32,
+    pub text_light: egui::Color32,
+    pub weak_light: egui::Color32,
+    /// Theme / font-scale already pushed to egui this run. `update()` only
+    /// re-applies `set_visuals` / `set_style` when these differ from the
+    /// current setting, instead of rebuilding the whole style every frame.
+    pub applied_dark: Option<bool>,
+    pub applied_font_scale: f32,
+    /// Icon source: 0 = shell, 1 = built-in vector, 2 = font emoji.
+    /// Persisted as `icon_mode`; the two light modes never touch the shell.
+    pub icon_mode: u8,
+    /// Use the smallest CJK font available (a full font file stays in the heap
+    /// *twice* — once in the definitions, once inside ab_glyph — so picking a
+    /// 9 MB face instead of a 19 MB one frees ~19 MB). Persisted `small_font`;
+    /// `reload_font` applies the change on the next frame.
+    pub small_font: bool,
+    /// Set when `small_font` changed: `update()` rebuilds the font definitions.
+    pub reload_font: bool,
     /// Whether the Explorer context-menu entry ("通过 MarinExplorer 打开")
     /// is registered under `HKCU\Software\Classes`. The value is re-read from
     /// the registry whenever the toggle is used, so it reflects reality even
@@ -207,11 +274,20 @@ fn recycle_root(drive: &std::path::Path, sid: &str) -> PathBuf {
     drive.join("$Recycle.Bin").join(sid)
 }
 
+/// Which custom text colour a settings picker is editing.
+#[derive(Clone, Copy)]
+pub enum TextColor {
+    TextDark,
+    WeakDark,
+    TextLight,
+    WeakLight,
+}
+
 impl Explorer {
     pub fn new(
         store: Store,
         size_tx: Sender<PathBuf>,
-        size_rx: Receiver<(PathBuf, u64, u64)>,
+        size_rx: Receiver<(PathBuf, u64, u64, bool)>,
     ) -> Self {
         let (rec_tx, rec_rx) = channel::<(PathBuf, Vec<fs_util::RecItem>)>();
         // Directory-listing worker: one persistent thread. A folder with tens
@@ -285,6 +361,15 @@ impl Explorer {
             .and_then(|v| v.parse::<f32>().ok())
             .unwrap_or(1.0)
             .clamp(0.8, 1.6);
+        let icon_mode = store
+            .meta("icon_mode")
+            .and_then(|v| v.parse::<u8>().ok())
+            .unwrap_or(0);
+        let small_font = store.meta("small_font").map_or(false, |v| v == "1");
+        let text_dark = Self::meta_color(&store, "text_dark").unwrap_or(egui::Color32::from_gray(240));
+        let weak_dark = Self::meta_color(&store, "weak_dark").unwrap_or(egui::Color32::from_gray(170));
+        let text_light = Self::meta_color(&store, "text_light").unwrap_or(egui::Color32::from_gray(20));
+        let weak_light = Self::meta_color(&store, "weak_light").unwrap_or(egui::Color32::from_gray(120));
         // Read-only probe of the actual registry state (the app never writes it).
         let ctx_menu = crate::shell::is_installed();
 
@@ -310,12 +395,16 @@ impl Explorer {
             rec_rx,
             pending_rec: HashSet::new(),
             system_qa: vec![],
-            user_pins: store.qa_pins(),
+            favorites: store.qa_pins(),
             qa_rx: None,
+            qa_cache: vec![],
+            qa_dirty: true,
             store,
             size_tx,
             size_rx,
             pending_sizes: HashSet::new(),
+            last_size_poll: Instant::now(),
+            bg_signal: None,
             list_tx: list_req_tx,
             list_rx,
             job: None,
@@ -347,6 +436,15 @@ impl Explorer {
             dark,
             lang,
             font_scale,
+            text_dark,
+            weak_dark,
+            text_light,
+            weak_light,
+            applied_dark: None,
+            applied_font_scale: -1.0,
+            icon_mode,
+            small_font,
+            reload_font: false,
             ctx_menu,
             last_flush: Instant::now(),
             text_focus: false,
@@ -362,6 +460,8 @@ impl Explorer {
             addr_fresh: false,
             enter_consumed: false,
         };
+        me.icons
+            .set_mode(crate::shellicon::IconMode::from_id(icon_mode));
         me.restore_layout();
         me.restore_columns();
         // From here on every navigation reads its listing on the worker
@@ -715,6 +815,65 @@ impl Explorer {
 
     // ---------- appearance / i18n ----------
 
+    /// Parse a "r,g,b,a" meta string into a colour. `a` defaults to 255.
+    fn meta_color(store: &crate::cache::Store, key: &str) -> Option<egui::Color32> {
+        let s = store.meta(key)?;
+        let mut it = s.split(',').map(|p| p.trim().parse::<u8>().ok());
+        let r = it.next()??;
+        let g = it.next()??;
+        let b = it.next()??;
+        let a = it.next().unwrap_or(Some(255))?;
+        Some(egui::Color32::from_rgba_unmultiplied(r, g, b, a))
+    }
+
+    /// Format a colour as the "r,g,b,a" string stored in meta.
+    fn color_meta(c: egui::Color32) -> String {
+        let [r, g, b, a] = c.to_srgba_unmultiplied();
+        format!("{},{},{},{}", r, g, b, a)
+    }
+
+    /// Main body / label text colour for the active theme.
+    pub fn text_color(&self) -> egui::Color32 {
+        if self.dark {
+            self.text_dark
+        } else {
+            self.text_light
+        }
+    }
+
+    /// Secondary (dimmer) text colour for the active theme.
+    pub fn weak_color(&self) -> egui::Color32 {
+        if self.dark {
+            self.weak_dark
+        } else {
+            self.weak_light
+        }
+    }
+
+    /// Persist one of the four custom text colours and re-apply the theme.
+    pub fn set_text_color(&mut self, which: TextColor, c: egui::Color32) {
+        match which {
+            TextColor::TextDark => {
+                self.text_dark = c;
+                self.store.set_meta("text_dark", &Self::color_meta(c));
+            }
+            TextColor::WeakDark => {
+                self.weak_dark = c;
+                self.store.set_meta("weak_dark", &Self::color_meta(c));
+            }
+            TextColor::TextLight => {
+                self.text_light = c;
+                self.store.set_meta("text_light", &Self::color_meta(c));
+            }
+            TextColor::WeakLight => {
+                self.weak_light = c;
+                self.store.set_meta("weak_light", &Self::color_meta(c));
+            }
+        }
+        // Force `update()` to re-push the visuals next frame.
+        self.applied_dark = None;
+    }
+
     /// Translate a UI string for the current language. Note: call sites use
     /// `crate::lang::tr(key, self.lang)` directly, because `tr` only reads the
     /// `self.lang` field and so can appear in the same expression as
@@ -748,6 +907,26 @@ impl Explorer {
     pub fn set_font_scale(&mut self, scale: f32) {
         self.font_scale = scale.clamp(0.8, 1.6);
         self.store.set_meta("font_scale", &format!("{:.2}", self.font_scale));
+    }
+
+    /// Switch icon source (0 shell / 1 vector / 2 emoji) and persist it.
+    ///
+    /// Leaving shell mode drops the whole texture cache, so that memory goes
+    /// back immediately instead of waiting for the process to exit.
+    pub fn set_icon_mode(&mut self, mode: u8) {
+        self.icon_mode = mode;
+        self.store.set_meta("icon_mode", &mode.to_string());
+        self.icons.set_mode(crate::shellicon::IconMode::from_id(mode));
+        self.status = crate::lang::tr("图标模式已切换", self.lang).into();
+    }
+
+    /// Use the smallest CJK font instead of the nicest one. The swap is done
+    /// on the next frame (`reload_font`), because rebuilding the font
+    /// definitions needs the egui context.
+    pub fn set_small_font(&mut self, on: bool) {
+        self.small_font = on;
+        self.store.set_meta("small_font", if on { "1" } else { "0" });
+        self.reload_font = true;
     }
 
     /// Turn the "通过 MarinExplorer 打开" context menu on or off.
@@ -986,7 +1165,10 @@ impl Explorer {
         let (tx, rx) = channel();
         self.qa_rx = Some(rx);
         thread::spawn(move || {
-            let list = crate::quickaccess::load_windows_quick_access();
+            let list: Vec<(PathBuf, bool)> = crate::quickaccess::load_windows_quick_access()
+                .into_iter()
+                .map(|e| (e.path, e.pinned))
+                .collect();
             tx.send(list).ok();
         });
     }
@@ -998,6 +1180,7 @@ impl Explorer {
             if let Ok(list) = rx.try_recv() {
                 let n = list.len();
                 self.system_qa = list;
+                self.qa_dirty = true;
                 if n > 0 {
                     self.status = format!("{} {n} {}", crate::lang::tr("已加载", self.lang), crate::lang::tr("个系统快速访问文件夹", self.lang));
                 }
@@ -1005,91 +1188,316 @@ impl Explorer {
         }
     }
 
-    /// Combined Quick-Access list: the user's own pins first, then the
-    /// system pins (skipping any path the user already pinned).
-    pub fn quick_access_list(&self) -> Vec<(PathBuf, bool)> {
-        let mut out: Vec<(PathBuf, bool)> = Vec::new();
-        for p in &self.user_pins {
-            if !out.iter().any(|(q, _)| q == p) {
-                out.push((p.clone(), true));
+    /// Combined Quick-Access list as `(path, origin)`, in display order: the
+    /// user's own favourites first, then Windows' pinned folders, then its
+    /// recent ones.
+    ///
+    /// Windows' pin flags are what populate the "已固定" heading — without
+    /// them that group only ever held Marin's own entries and looked empty
+    /// even though Explorer showed a dozen.
+    pub fn quick_access_list(&mut self) -> Vec<(PathBuf, QaKind)> {
+        if self.qa_dirty {
+            let mut out: Vec<(PathBuf, QaKind)> = Vec::new();
+            for p in &self.favorites {
+                if !out.iter().any(|(q, _)| q == p) {
+                    out.push((p.clone(), QaKind::Favorite));
+                }
             }
-        }
-        for p in &self.system_qa {
-            if !out.iter().any(|(q, _)| q == p) {
-                out.push((p.clone(), false));
+            for (p, pinned) in &self.system_qa {
+                if *pinned {
+                    // Always show Windows' own pins under "已固定", even when the
+                    // same folder is also one of our 收藏 — the two groups mean
+                    // different things (Explorer owns the pin; we own the bookmark).
+                    out.push((p.clone(), QaKind::WinPin));
+                } else if !out.iter().any(|(q, _)| q == p) {
+                    out.push((p.clone(), QaKind::Recent));
+                }
             }
+            self.qa_cache = out;
+            self.qa_dirty = false;
         }
-        out
+        self.qa_cache.clone()
     }
 
-    /// Pin the active panel's current directory to the user Quick-Access list.
-    pub fn pin_current(&mut self) {
+    /// Upper bound on Marin's own favourites.
+    ///
+    /// Windows' own pinned group has no fixed limit (the jump list just grows),
+    /// but ours lives in `store.txt` and is shown in a rail of fixed height, so
+    /// an unbounded list would only push everything else out of reach.
+    pub const MAX_FAVORITES: usize = 30;
+
+    /// Add the active panel's current directory to the favourites.
+    pub fn favorite_current(&mut self) {
         let cwd = self.active_panel().cwd.clone();
-        if cwd.is_dir() && !self.user_pins.iter().any(|p| *p == cwd) {
-            self.user_pins.push(cwd.clone());
-            self.store.set_qa_pins(&self.user_pins);
-            self.status = format!("{}: {}", crate::lang::tr("已固定到快速访问", self.lang), cwd.display());
-        } else if self.user_pins.iter().any(|p| *p == cwd) {
-            self.status = crate::lang::tr("该目录已在快速访问中", self.lang).into();
+        self.favorite_path(cwd);
+    }
+
+    /// Add an arbitrary folder or file (toolbar, folder menu, tab menu, rail
+    /// menu, file menu) to the favourites.
+    ///
+    /// Refuses two cases with a status line instead of failing silently: the
+    /// path is already a favourite, or the cap is reached. Windows-pinned
+    /// folders are *allowed* — a folder can sit in both "已固定" (read-only,
+    /// from Explorer) and "收藏" (ours, removable), and the × only ever
+    /// touches the latter.
+    pub fn favorite_path(&mut self, path: PathBuf) {
+        // Folders and files both go into 收藏: a folder is a jump target, a
+        // file is a one-click launcher. Reject anything that isn't on disk so a
+        // stale or phantom path can't squat in the rail.
+        if !(path.is_dir() || path.is_file()) {
+            return;
+        }
+        if self.favorites.iter().any(|p| *p == path) {
+            self.status = crate::lang::tr("该目录已收藏", self.lang).into();
+            return;
+        }
+        if self.favorites.len() >= Self::MAX_FAVORITES {
+            self.status = format!(
+                "{}（{} {}）",
+                crate::lang::tr("收藏数量已达上限", self.lang),
+                Self::MAX_FAVORITES,
+                crate::lang::tr("个", self.lang),
+            );
+            return;
+        }
+        self.favorites.push(path.clone());
+        self.store.set_qa_pins(&self.favorites);
+        self.qa_dirty = true;
+        self.status = format!("{} {}", crate::lang::tr("已收藏:", self.lang), path.display());
+    }
+
+    /// "加入收藏" / "取消收藏" menu item for `path` — one entry that flips
+    /// with the current state, shared by the folder menu, the pane background
+    /// menu, the tab menu and the Quick-Access rail menu.
+    pub fn favorite_menu_item(&mut self, ui: &mut egui::Ui, path: &std::path::Path) {
+        if self.favorites.iter().any(|p| p.as_path() == path) {
+            if ui.button(crate::lang::tr("取消收藏", self.lang)).clicked() {
+                self.unfavorite(path);
+                ui.close_menu();
+            }
+        } else if ui
+            .button(crate::lang::tr("加入收藏", self.lang))
+            .on_hover_text(path.to_string_lossy().to_string())
+            .clicked()
+        {
+            self.favorite_path(path.to_path_buf());
+            ui.close_menu();
         }
     }
 
-    /// Pin an arbitrary folder (used by the folder right-click menu) to the
-    /// user Quick-Access list.
-    pub fn pin_path(&mut self, path: PathBuf) {
-        if path.is_dir() && !self.user_pins.iter().any(|p| *p == path) {
-            self.user_pins.push(path.clone());
-            self.store.set_qa_pins(&self.user_pins);
-            self.status = format!("{}: {}", crate::lang::tr("已固定到快速访问", self.lang), path.display());
-        } else if self.user_pins.iter().any(|p| *p == path) {
-            self.status = crate::lang::tr("该目录已在快速访问中", self.lang).into();
+    /// Remove a path from the favourites (Windows' pins stay).
+    pub fn unfavorite(&mut self, path: &std::path::Path) {
+        let before = self.favorites.len();
+        self.favorites.retain(|p| p.as_path() != path);
+        if self.favorites.len() != before {
+            self.store.set_qa_pins(&self.favorites);
+            self.qa_dirty = true;
+            self.status = crate::lang::tr("已取消收藏", self.lang).into();
         }
     }
 
-    /// Remove a path from the user Quick-Access list (system pins stay).
-    pub fn unpin(&mut self, path: &std::path::Path) {
-        let before = self.user_pins.len();
-        self.user_pins.retain(|p| p.as_path() != path);
-        if self.user_pins.len() != before {
-            self.store.set_qa_pins(&self.user_pins);
-            self.status = crate::lang::tr("已取消固定", self.lang).into();
+    /// Right-click menu for a Quick-Access rail row.
+    ///
+    /// A rail entry is a folder, so it gets the folder actions the listing
+    /// offers — open, new tab, VS Code, terminal, reveal, copy path,
+    /// properties — plus the favourite toggle. Editing actions (rename,
+    /// delete) are left out on purpose: those belong to the listing, where
+    /// the row is the real directory entry.
+    pub fn qa_context_menu(&mut self, ui: &mut egui::Ui, path: &std::path::Path) {
+        let path = path.to_path_buf();
+        let is_dir = path.is_dir();
+        let hint = path.to_string_lossy().to_string();
+        if ui
+            .button(crate::lang::tr("打开", self.lang))
+            .on_hover_text(&hint)
+            .clicked()
+        {
+            if is_dir {
+                self.active_panel().navigate(path.clone());
+                self.apply_cached_sizes();
+            } else {
+                crate::fs_util::open_default_file(&path);
+            }
+            ui.close_menu();
         }
+        // Folder-only affordances: a file has no "open in pane" target.
+        if is_dir {
+            if ui
+                .button(crate::lang::tr("在新标签页打开", self.lang))
+                .on_hover_text(&hint)
+                .clicked()
+            {
+                self.open_path_in_new_tab(path.clone());
+                ui.close_menu();
+            }
+            if ui
+                .button(crate::lang::tr("在右栏打开", self.lang))
+                .on_hover_text(&hint)
+                .clicked()
+            {
+                self.open_path_in_right_pane(path.clone());
+                ui.close_menu();
+            }
+        }
+        ui.separator();
+        // Only offered when the program is installed, so a menu item never
+        // dead-ends.
+        if crate::fs_util::vscode_exe().is_some()
+            && ui
+                .button(crate::lang::tr("通过 VS Code 打开", self.lang))
+                .clicked()
+        {
+            crate::fs_util::open_with_vscode(&path);
+            ui.close_menu();
+        }
+        if ui
+            .button(crate::lang::tr("在此打开终端", self.lang))
+            .clicked()
+        {
+            let dir = if is_dir {
+                path.clone()
+            } else {
+                path.parent()
+                    .map(|p| p.to_path_buf())
+                    .unwrap_or_else(|| path.clone())
+            };
+            crate::fs_util::open_terminal(&dir);
+            ui.close_menu();
+        }
+        if ui
+            .button(crate::lang::tr("在资源管理器中显示", self.lang))
+            .clicked()
+        {
+            crate::fs_util::reveal_in_explorer(&path);
+            ui.close_menu();
+        }
+        ui.separator();
+        if ui.button(crate::lang::tr("复制路径", self.lang)).clicked() {
+            ui.ctx().copy_text(hint.clone());
+            ui.close_menu();
+        }
+        if ui.button(crate::lang::tr("属性", self.lang)).clicked() {
+            self.show_props(path.clone());
+            ui.close_menu();
+        }
+        ui.separator();
+        self.favorite_menu_item(ui, &path);
     }
 
     // ---------- size worker ----------
 
-    /// Ask the background worker to (re)compute sizes for unknown folders.
-    pub fn request_folder_sizes(&mut self) {
-        if self.pending_sizes.len() >= 64 {
+    /// Re-apply cached sizes and queue the missing ones, at most once a second.
+    ///
+    /// This used to run on every frame: two full walks over both panels' rows,
+    /// sixty times a second, for a result that only changes when the worker
+    /// delivers something or the user navigates. It is now called from
+    /// navigation as well, so the periodic call is only a top-up.
+    pub fn refresh_folder_sizes_throttled(&mut self) {
+        const INTERVAL: std::time::Duration = std::time::Duration::from_millis(1000);
+        if self.last_size_poll.elapsed() < INTERVAL {
             return;
         }
+        self.last_size_poll = std::time::Instant::now();
+        self.apply_cached_sizes();
+        self.request_folder_sizes();
+    }
+
+    /// Ask the background worker to (re)compute sizes for unknown folders.
+    ///
+    /// Two brakes on the cost: only the first `FOLDERS_PER_PANEL` folders of a
+    /// listing are queued (roughly what fits on screen — nobody looks at
+    /// folder 300's size), and a value that is still inside its TTL is reused
+    /// instead of rescanned.
+    pub fn request_folder_sizes(&mut self) {
+        self.request_sizes_limited(FOLDERS_PER_PANEL, MAX_PENDING_SIZES);
+    }
+
+    /// Same, with caller-chosen ceilings. The manual "重新计算大小" action uses
+    /// this: there the "only what fits on screen" limit does not apply, the
+    /// user explicitly asked for everything to be recomputed.
+    fn request_sizes_limited(&mut self, per_panel: usize, max_pending: usize) {
+        if self.pending_sizes.len() >= max_pending {
+            return;
+        }
+        let now = crate::cache::now_secs();
         // Index-based loop: borrowing `self.tabs` directly (not through a
         // method) lets the other fields be touched inside the loop.
         for i in 0..2 {
             let panel = &mut self.tabs[self.active_tab].panes[i];
+            let mut queued = 0usize;
             for e in panel.entries.iter().filter(|e| e.is_dir && !e.size_known) {
+                if queued >= per_panel {
+                    break;
+                }
                 let p = panel.cwd.join(&e.name);
                 let mtime = e.mtime;
-                if self.store.size_for(&p, mtime).is_some() {
-                    continue; // cache hit, no request needed
+                // Fresh enough, or unchanged: keep the cached value.
+                if self.store.size_for_lenient(&p, mtime, now).is_some() {
+                    continue;
                 }
                 if self.pending_sizes.insert(p.clone()) {
                     self.size_tx.send(p).ok();
+                    queued += 1;
                 }
             }
         }
     }
 
-    /// Apply a size result coming back from the worker.
-    pub fn apply_size_result(&mut self, path: PathBuf, mtime: u64, size: u64) {
-        self.pending_sizes.remove(&path);
-        self.store.record_size(path.clone(), mtime, size);
+    /// Forget every cached folder size in view and queue a fresh scan.
+    ///
+    /// The TTL in `Store` keeps a stale — or budget-stopped — number on screen
+    /// for hours. This is the manual override behind the 重新计算大小 button.
+    /// Both panes are recomputed: the sibling pane is the one being compared
+    /// against, and it is usually the pane holding the stale parent.
+    pub fn recompute_sizes(&mut self) {
+        let mut paths: Vec<PathBuf> = Vec::new();
         for i in 0..2 {
             let panel = &mut self.tabs[self.active_tab].panes[i];
-            for e in panel.entries.iter_mut() {
-                if e.is_dir && e.mtime == mtime && panel.cwd.join(&e.name) == path {
-                    e.size = size;
-                    e.size_known = true;
+            for e in panel.entries.iter_mut().filter(|e| e.is_dir) {
+                e.size_known = false;
+                e.size = 0;
+                e.size_est = false;
+                paths.push(panel.cwd.join(&e.name));
+            }
+            panel.resort_sizes();
+        }
+        // Drop the cached values as well: `size_for_lenient` would otherwise
+        // hand the very same number straight back and nothing would rescan.
+        for p in &paths {
+            self.store.size_map.remove(p);
+        }
+        self.store.dirty = true;
+        // An explicit request, so the "roughly what fits on screen" ceiling is
+        // raised. Still bounded: a folder with thousands of sub-directories
+        // must not wedge the single worker thread.
+        self.request_sizes_limited(256, 1024);
+    }
+
+    /// Apply a size result coming back from the worker.
+    ///
+    /// `complete == false` marks a budget-stopped scan: the number is a lower
+    /// bound, so it is flagged and rendered with `~`.
+    pub fn apply_size_result(&mut self, path: PathBuf, mtime: u64, size: u64, complete: bool) {
+        self.pending_sizes.remove(&path);
+        self.store.record_size(path.clone(), mtime, size, complete);
+        // Match each entry by the result's parent dir + file name instead of
+        // `cwd.join(name)` per entry: a 5k-entry folder × many size results
+        // used to allocate 5k PathBufs on every result. `parent()` /
+        // `file_name()` are borrow-only and free.
+        let parent = path.parent().map(|p| p.to_path_buf());
+        let fname = path.file_name().map(|n| n.to_string_lossy().into_owned());
+        if let (Some(parent), Some(fname)) = (parent, fname) {
+            for i in 0..2 {
+                let panel = &mut self.tabs[self.active_tab].panes[i];
+                if panel.cwd != parent {
+                    continue;
+                }
+                for e in panel.entries.iter_mut() {
+                    if e.is_dir && e.mtime == mtime && e.name == fname {
+                        e.size = size;
+                        e.size_known = true;
+                        e.size_est = !complete;
+                    }
                 }
             }
         }
@@ -1119,21 +1527,44 @@ impl Explorer {
             // the rest get requested from the size worker.
             self.apply_cached_sizes();
             self.request_folder_sizes();
+            self.bg_signal = Some(Instant::now());
         }
     }
 
     /// Fill in cached sizes for the current listings (called after loads).
-    pub fn apply_cached_sizes(&mut self) {        for i in 0..2 {
+    pub fn apply_cached_sizes(&mut self) {
+        let now = crate::cache::now_secs();
+        for i in 0..2 {
             let panel = &mut self.tabs[self.active_tab].panes[i];
+            let mut filled = false;
             for e in panel.entries.iter_mut() {
                 if e.is_dir && !e.size_known {
                     let p = panel.cwd.join(&e.name);
-                    if let Some(sz) = self.store.size_for(&p, e.mtime) {
+                    if let Some((sz, est)) = self.store.size_for_lenient(&p, e.mtime, now) {
                         e.size = sz;
                         e.size_known = true;
+                        // Persisted since the estimate flag is stored on disk:
+                        // a `~` value must not lose its tilde on the next visit.
+                        e.size_est = est;
+                        filled = true;
                     }
                 }
             }
+            // The rows now carry real sizes: a size-sorted panel has to be
+            // re-sorted or it would keep the order they had when every folder
+            // still looked like 0 bytes.
+            if filled {
+                panel.resort_sizes();
+            }
+        }
+    }
+
+    /// Re-sort any size-sorted pane, after a batch of sizes came back from
+    /// the worker. Batched here (not per result) so a burst of results costs
+    /// one sort per pane instead of one per folder.
+    pub fn resort_size_sorted_panels(&mut self) {
+        for i in 0..2 {
+            self.tabs[self.active_tab].panes[i].resort_sizes();
         }
     }
 
@@ -1189,7 +1620,7 @@ impl Explorer {
         fs_util::set_clipboard_files(&paths);
         self.status = format!(
             "{} {} {}",
-            crate::lang::tr(if cut { "已准备移动" } else { "已复制" }, self.lang),
+            crate::lang::tr(if cut { "已准备剪贴" } else { "已复制" }, self.lang),
             n,
             crate::lang::tr("项", self.lang)
         );
@@ -1440,6 +1871,7 @@ impl Explorer {
         self.job = Some(Job {
             label,
             progress: 0.0,
+            indeterminate: false,
             note: None,
             err: None,
             rx,
@@ -1504,6 +1936,7 @@ impl Explorer {
         self.job = Some(Job {
             label,
             progress: 0.0,
+            indeterminate: false,
             note: None,
             err: None,
             rx,
@@ -1625,11 +2058,96 @@ impl Explorer {
         self.delete_open = false;
     }
 
-    /// Empty the active recycle-bin view in the background (no UI stall).
+    /// Delete one recycle-bin item, working around the two reasons a plain
+/// `remove_file` refuses: the `\\?\` prefix lifts the 260-character path
+/// limit, and read-only entries have to be un-read-only'd first.
+fn force_remove(p: &std::path::Path) -> std::io::Result<()> {
+    let verbatim = std::path::PathBuf::from(format!(r"\\?\{}", p.display()));
+    // `$R` payloads of deleted *folders* are directories: a plain remove_file
+    // fails on them (which is how "empty" silently left every deleted folder
+    // behind).
+    if verbatim.is_dir() {
+        Self::remove_tree(&verbatim)
+    } else {
+        Self::remove_one(&verbatim)
+    }
+}
+
+/// Delete one file, clearing the read-only attribute first (Windows refuses
+/// to delete a read-only file outright).
+fn remove_one(p: &std::path::Path) -> std::io::Result<()> {
+    if let Ok(m) = fs::metadata(p) {
+        let mut perms = m.permissions();
+        if perms.readonly() {
+            perms.set_readonly(false);
+            let _ = fs::set_permissions(p, perms);
+        }
+    }
+    fs::remove_file(p)
+}
+
+/// Delete a whole tree, files first and directories deepest-first.
+///
+/// `remove_dir_all` stops at the first read-only child, and a recycled folder
+/// is full of them — anything deleted from read-only media, or carrying its
+/// original attributes, came back as a failure. So attributes are cleared on
+/// the way down and every child is removed explicitly.
+fn remove_tree(p: &std::path::Path) -> std::io::Result<()> {
+    let mut dirs: Vec<std::path::PathBuf> = vec![p.to_path_buf()];
+    let mut i = 0;
+    while i < dirs.len() {
+        if let Ok(rd) = fs::read_dir(&dirs[i]) {
+            for e in rd.flatten() {
+                let c = e.path();
+                if c.is_dir() {
+                    dirs.push(c);
+                } else {
+                    let _ = Self::remove_one(&c);
+                }
+            }
+        }
+        i += 1;
+    }
+    // Reverse = deepest first, so a parent is only removed once it is empty.
+    for d in dirs.iter().rev() {
+        let _ = fs::remove_dir(d);
+    }
+    if p.exists() {
+        Err(std::io::Error::new(std::io::ErrorKind::Other, "not removed"))
+    } else {
+        Ok(())
+    }
+}
+
+/// `C:\$Recycle.Bin\S-1-…` -> `Some("C:\")`, used to scope the shell call.
+fn drive_root(dir: &std::path::Path) -> Option<String> {
+    let s = dir.to_string_lossy();
+    let mut chars = s.chars();
+    let letter = chars.next()?;
+    if chars.next() == Some(':') {
+        Some(format!("{letter}:\\"))
+    } else {
+        None
+    }
+}
+
+/// Empty the active recycle-bin view in the background (no UI stall).
     pub fn spawn_empty_recycle(&mut self) {
         let dir = self.active_panel().cwd.clone();
         let (tx, rx) = channel();
         thread::spawn(move || {
+            // Preferred: hand it to the shell. It is the only thing that
+            // reliably removes read-only entries, names past MAX_PATH and
+            // items from another account — exactly the cases where "empty"
+            // used to look like it did nothing.
+            // Scope the shell call to this drive: NULL means "every drive",
+            // and one unreachable volume then fails the whole call.
+            let root = Self::drive_root(&dir);
+            if crate::shell::empty_recycle_bin(root.as_deref()) {
+                tx.send(JobMsg::Done("已清空回收站", String::new())).ok();
+                return;
+            }
+            // Fallback: delete the $I / $R pairs ourselves.
             let mut files: Vec<PathBuf> = vec![];
             if let Ok(rd) = fs::read_dir(&dir) {
                 for e in rd.flatten() {
@@ -1641,25 +2159,70 @@ impl Explorer {
             }
             let total = files.len().max(1) as f32;
             let mut n = 0f32;
+            let mut failed = 0usize;
             for p in &files {
-                // `$R` payloads of deleted *folders* are directories: a plain
-                // remove_file fails on them, so fall back to remove_dir_all
-                // (otherwise "empty" silently leaves every deleted folder).
-                let _ = fs::remove_file(p).or_else(|_| fs::remove_dir_all(p));
+                if Self::force_remove(p).is_err() {
+                    failed += 1;
+                }
                 n += 1.0;
                 tx.send(JobMsg::Progress(n / total)).ok();
             }
-            tx.send(JobMsg::Done("已清空回收站（删除 %s 个文件）", files.len().to_string())).ok();
+            if failed > 0 {
+                // Say so instead of claiming success: a silent partial empty
+                // is what made this look broken.
+                tx.send(JobMsg::Done(
+                    "回收站已清空，但 %s 项无法删除（可尝试以管理员身份运行后重试）",
+                    failed.to_string(),
+                ))
+                .ok();
+            } else {
+                tx.send(JobMsg::Done("已清空回收站（删除 %s 个文件）", files.len().to_string())).ok();
+            }
         });
         self.job = Some(Job {
             label: crate::lang::tr("清空回收站…", self.lang).into(),
             progress: 0.0,
+            // The shell owns the real work and only signals at the end, so we
+            // cannot show a percentage. Draw an indeterminate (animated) bar
+            // instead of the shell's own stall-prone modal dialog.
+            indeterminate: true,
             note: None,
             err: None,
             rx,
         });
         self.empty_open = false;
         self.status = crate::lang::tr("正在清空回收站…", self.lang).into();
+    }
+
+    /// True while something on screen is still changing.
+    ///
+    /// Calling `request_repaint()` unconditionally pins egui in continuous
+    /// mode — a full redraw every frame, which costs an entire core while the
+    /// window just sits there. Repaint only while there is a reason to.
+    pub fn needs_repaint(&self) -> bool {
+        // A status band highlighted for a few seconds, or a running job.
+        if self.status_fresh || self.job.is_some() {
+            return true;
+        }
+        // Sizes still being computed, or listings still being read.
+        if !self.pending_sizes.is_empty() {
+            return true;
+        }
+        // The frame right after the last background result landed: the queue
+        // is empty by then, but the value has not been drawn yet.
+        if let Some(at) = self.bg_signal {
+            if at.elapsed() < std::time::Duration::from_millis(600) {
+                return true;
+            }
+        }
+        self.tabs
+            .iter()
+            .any(|t| t.panes.iter().any(|p| p.loading || p.rec_loading))
+    }
+
+    /// Record that a background result just arrived (see `needs_repaint`).
+    pub fn mark_bg_activity(&mut self) {
+        self.bg_signal = Some(Instant::now());
     }
 
     // ---------- misc ops ----------
@@ -2209,14 +2772,13 @@ impl Explorer {
                 self.persist_layout();
                 ui.close_menu();
             }
-            if ui.button(crate::lang::tr("固定到快速访问", self.lang)).clicked() {
-                self.pin_path(path.clone());
-                ui.close_menu();
-            }
         } else if ui.button(crate::lang::tr("打开", self.lang)).clicked() {
             fs_util::open_default_file(&path);
             ui.close_menu();
         }
+        // Both folders and files can be dropped into 收藏 (the rail holds
+        // either a jump target or a one-click launcher).
+        self.favorite_menu_item(ui, &path);
         // "Open with" entries — only shown when the program is actually
         // installed, so a menu item never dead-ends.
         if crate::fs_util::vscode_exe().is_some()
@@ -2408,11 +2970,8 @@ impl Explorer {
             fs_util::open_terminal(&cwd);
             ui.close_menu();
         }
-        if ui.button(crate::lang::tr("固定到快速访问", self.lang)).clicked() {
-            self.set_active_pane(is_left);
-            self.pin_current();
-            ui.close_menu();
-        }
+        let cwd_fav = self.pane_of(is_left).cwd.clone();
+        self.favorite_menu_item(ui, &cwd_fav);
         if ui.button(crate::lang::tr("复制当前目录路径", self.lang)).clicked() {
             let cwd = self.pane_of(is_left).cwd.clone();
             let t = cwd.to_string_lossy().into_owned();
@@ -2628,14 +3187,208 @@ fn unique_dest_path(orig: &std::path::Path) -> std::path::PathBuf {
     orig.to_path_buf() // 999 clashes: give up, the rename reports the error
 }
 
-/// Recursively sum file sizes under `src`.
-pub fn total_size(src: &std::path::Path) -> u64 {
-    if src.is_dir() {
-        fs::read_dir(src)
-            .map(|rd| rd.flatten().map(|e| total_size(&e.path())).sum::<u64>())
-            .unwrap_or(0)
-    } else {
-        fs::metadata(src).map(|m| m.len()).unwrap_or(0)
+/// Recursive folder size, scanned with one bulk Win32 enumeration per
+/// directory and a hard budget.
+///
+/// Plain `read_dir` + `metadata` costs one system call *per file*, so a folder
+/// with 200k files means 200k round trips into the kernel. `FileIdBothDirectoryInfo`
+/// instead returns a whole page of entries — name, attributes and size — in a
+/// single call, which is an order of magnitude cheaper.
+///
+/// Returns `(bytes, complete)`. `complete == false` means the budget ran out
+/// mid-scan: the value is a lower bound and is shown with a `~` prefix. It is
+/// cached all the same, so a folder that blew the budget once is not rescanned
+/// on every visit.
+pub fn scan_dir_size(src: &std::path::Path) -> (u64, bool) {
+    // A file: one metadata read, no scanning involved.
+    if !src.is_dir() {
+        return (fs::metadata(src).map(|m| m.len()).unwrap_or(0), true);
+    }
+    let mut budget = ScanBudget::new();
+    let mut total: u64 = 0;
+    // Breadth-first with an explicit queue: deep trees must not blow the
+    // thread's stack, and — more importantly — a budget stop must not leave a
+    // whole top-level branch unvisited. A stack is depth-first, so the *last*
+    // sub-directory is scanned first and the *first* sibling is the one dropped
+    // when the 400 ms run out: the parent then reports a number far below its
+    // real size, and a 400 MB child can vanish from the total entirely.
+    // Level order visits every directory at depth N before any at depth N+1,
+    // so a stopped scan is only short in the deep tail, never by a branch.
+    let mut queue: std::collections::VecDeque<std::path::PathBuf> =
+        std::collections::VecDeque::new();
+    queue.push_back(src.to_path_buf());
+    while let Some(dir) = queue.pop_front() {
+        scan_one_dir(&dir, &mut budget, &mut queue, &mut total);
+        if budget.exhausted {
+            return (total, false);
+        }
+    }
+    (total, true)
+}
+
+/// Cost ceiling for a single folder scan.
+///
+/// Without this, opening a folder that contains `node_modules` or a game
+/// library keeps the worker (and the disk) busy for minutes. Stopping early
+/// and showing `~` keeps the UI responsive; the number is still useful.
+const SCAN_MAX_ENTRIES: u32 = 150_000;
+const SCAN_MAX_MS: u64 = 400;
+/// How often the clock is consulted (checking on every entry is its own cost).
+const SCAN_CHECK_EVERY: u32 = 512;
+
+struct ScanBudget {
+    entries: u32,
+    deadline: std::time::Instant,
+    exhausted: bool,
+}
+
+impl ScanBudget {
+    fn new() -> Self {
+        Self {
+            entries: 0,
+            deadline: std::time::Instant::now() + std::time::Duration::from_millis(SCAN_MAX_MS),
+            exhausted: false,
+        }
+    }
+
+    /// Charge one directory entry; false once the budget is gone.
+    fn spend(&mut self) -> bool {
+        if self.exhausted {
+            return false;
+        }
+        self.entries += 1;
+        if self.entries >= SCAN_MAX_ENTRIES {
+            self.exhausted = true;
+            return false;
+        }
+        if self.entries % SCAN_CHECK_EVERY == 0 && std::time::Instant::now() >= self.deadline {
+            self.exhausted = true;
+            return false;
+        }
+        true
+    }
+}
+
+// --- Win32 bulk directory enumeration (hand-rolled FFI, no new dependency) ---
+
+const GENERIC_READ: u32 = 0x8000_0000;
+const FILE_SHARE_ALL: u32 = 0x0000_0007; // read | write | delete
+const OPEN_EXISTING: u32 = 3;
+const FILE_FLAG_BACKUP_SEMANTICS: u32 = 0x0200_0000;
+const FILE_ATTRIBUTE_DIRECTORY: u32 = 0x10;
+/// Junctions / symlinks: never followed, or a cycle would spin forever and
+/// the same files would be counted twice.
+const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x400;
+/// `FILE_INFO_BY_HANDLE_CLASS`: FileIdBothDirectoryInfo.
+const FILE_ID_BOTH_DIR_INFO: i32 = 10;
+
+extern "system" {
+    fn CreateFileW(
+        name: *const u16,
+        access: u32,
+        share: u32,
+        sec: *const (),
+        disp: u32,
+        flags: u32,
+        tmpl: *mut (),
+    ) -> isize;
+    fn GetFileInformationByHandleEx(file: isize, class: i32, buf: *mut u8, len: u32) -> i32;
+    fn CloseHandle(file: isize) -> i32;
+}
+
+/// `FILE_ID_BOTH_DIR_INFO` up to (not including) its final `FileName[1]`.
+/// `#[repr(C)]` reproduces the C layout, padding included.
+#[repr(C)]
+struct DirInfoHeader {
+    next_entry_offset: u32,
+    _file_index: u32,
+    _creation_time: i64,
+    _last_access_time: i64,
+    _last_write_time: i64,
+    _change_time: i64,
+    end_of_file: i64,
+    _allocation_size: i64,
+    file_attributes: u32,
+    file_name_length: u32,
+    _ea_size: u32,
+    _short_name_length: i8,
+    _short_name: [u16; 12],
+    _file_id: i64,
+}
+/// `FileName` starts right after the header, which is what
+/// `offsetof(FILE_ID_BOTH_DIR_INFO, FileName)` is on Windows.
+const NAME_OFFSET: usize = std::mem::size_of::<DirInfoHeader>();
+const _: () = assert!(std::mem::size_of::<DirInfoHeader>() == 104);
+
+/// Sum one directory's files and queue its sub-directories.
+///
+/// Unreadable directories (access denied, gone mid-scan) are skipped, not
+/// fatal: the caller gets a partial total like any other budget stop.
+fn scan_one_dir(
+    dir: &std::path::Path,
+    budget: &mut ScanBudget,
+    pending: &mut std::collections::VecDeque<std::path::PathBuf>,
+    total: &mut u64,
+) {
+    use std::os::windows::ffi::OsStrExt;
+    let wide: Vec<u16> = dir.as_os_str().encode_wide().chain(std::iter::once(0)).collect();
+    let handle = unsafe {
+        CreateFileW(
+            wide.as_ptr(),
+            GENERIC_READ,
+            FILE_SHARE_ALL,
+            std::ptr::null(),
+            OPEN_EXISTING,
+            FILE_FLAG_BACKUP_SEMANTICS,
+            std::ptr::null_mut(),
+        )
+    };
+    if handle <= 0 {
+        return;
+    }
+    let mut buf = vec![0u8; 64 * 1024];
+    'pages: loop {
+        let ok = unsafe {
+            GetFileInformationByHandleEx(handle, FILE_ID_BOTH_DIR_INFO, buf.as_mut_ptr(), buf.len() as u32)
+        };
+        if ok == 0 {
+            // No more entries, or an error we cannot do anything about:
+            // either way this directory is done.
+            break;
+        }
+        let mut offset = 0usize;
+        loop {
+            let base = unsafe { buf.as_ptr().add(offset) };
+            let info = unsafe { &*(base as *const DirInfoHeader) };
+            let chars = info.file_name_length as usize / 2;
+            if chars > 0 && offset + NAME_OFFSET + chars * 2 <= buf.len() {
+                let name = unsafe {
+                    std::slice::from_raw_parts(base.add(NAME_OFFSET) as *const u16, chars)
+                };
+                let name = String::from_utf16_lossy(name);
+                if name != "." && name != ".." {
+                    let is_dir = info.file_attributes & FILE_ATTRIBUTE_DIRECTORY != 0;
+                    let is_link = info.file_attributes & FILE_ATTRIBUTE_REPARSE_POINT != 0;
+                    if is_dir {
+                        if !is_link {
+                            pending.push_back(dir.join(&name));
+                        }
+                    } else {
+                        *total += info.end_of_file.max(0) as u64;
+                    }
+                }
+            }
+            if !budget.spend() {
+                break 'pages;
+            }
+            if info.next_entry_offset == 0 {
+                break;
+            }
+            offset += info.next_entry_offset as usize;
+        }
+    }
+    unsafe {
+        CloseHandle(handle);
     }
 }
 

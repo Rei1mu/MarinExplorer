@@ -17,6 +17,42 @@ use crate::fs_util::{percent_decode, percent_encode};
 pub const CACHE_SUBDIR: &str = "MarinExplorer";
 pub const STORE_FILE: &str = "store.txt";
 
+/// How long a computed size is good enough to keep showing without rescanning.
+///
+/// Scanning is the expensive part (every file has to be visited), while the
+/// *purpose* is only "roughly how big is this folder". So a value stays valid
+/// for a while even after the folder changed — a few MB of drift in a 40 GB
+/// folder is invisible, and rescanning it constantly is not. Bigger folders
+/// get a longer grace period: they cost more to scan and any absolute change
+/// is relatively smaller.
+pub fn size_ttl_secs(size: u64) -> u64 {
+    const MB: u64 = 1024 * 1024;
+    const GB: u64 = 1024 * MB;
+    const DAY: u64 = 24 * 3600;
+    match size {
+        s if s >= 4 * GB => 14 * DAY,
+        s if s >= GB => 7 * DAY,
+        s if s >= 128 * MB => 3 * DAY,
+        _ => DAY,
+    }
+}
+
+/// How long a *budget-stopped* size stays on screen.
+///
+/// Such a value is a lower bound that can miss entire sub-trees, so it is not
+/// in the same class as an exact number: it is re-checked after an hour
+/// instead of after days. Without this the "~" number survives its own
+/// staleness — the parent shows 200 MB while a child inside it is 400 MB.
+const EST_TTL_SECS: u64 = 3600;
+
+/// Wall-clock seconds, 0 if the clock is somehow before the epoch.
+pub fn now_secs() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
+
 /// Where the store lives.
 ///
 /// Preferred location is **next to the running executable** (`<exe dir>/
@@ -54,8 +90,13 @@ fn is_writable(dir: &Path) -> bool {
 }
 
 pub struct Store {
-    /// folder path -> (folder mtime, recursive size)
-    pub size_map: HashMap<PathBuf, (u64, u64)>,
+    /// folder path -> (folder mtime, recursive size, computed_at, complete)
+    /// `computed_at` is unix seconds and drives the TTL below: a value that is
+    /// still fresh is reused even when the folder changed, which is what keeps
+    /// a busy folder (Downloads, caches, AppData) off the scanner.
+    /// `complete` is false for a budget-stopped scan: the size is a lower
+    /// bound and must keep its `~` even after a round-trip through disk.
+    pub size_map: HashMap<PathBuf, (u64, u64, u64, bool)>,
     /// arbitrary app metadata: sid, cwd_left, cwd_right, ...
     pub meta: HashMap<String, String>,
     pub file: PathBuf,
@@ -76,16 +117,26 @@ impl Store {
             for line in text.lines() {
                 let mut f = line.split('\t');
                 match f.next() {
-                    Some("S") => {
+                    // `S` = exact scan, `E` = budget-stopped estimate. Same
+                    // field layout; the tag carries the `~` across restarts.
+                    // Older stores only ever wrote `S`.
+                    Some(tag) if tag == "S" || tag == "E" => {
+                        let complete = tag == "S";
                         let size = f.next().and_then(|x| x.parse().ok()).unwrap_or(0);
                         let mtime = f.next().and_then(|x| x.parse().ok()).unwrap_or(0);
-                        let path = f
-                            .next()
-                            .map(percent_decode)
-                            .map(PathBuf::from)
-                            .unwrap_or_default();
+                        // New layout carries a fourth numeric column
+                        // (`computed_at`). Older stores only have the path
+                        // here, so a field that does not parse as a number has
+                        // to be the path — and the value counts as expired.
+                        let next = f.next().unwrap_or_default();
+                        let (computed_at, path_str) = match next.parse::<u64>() {
+                            Ok(at) => (at, f.next().unwrap_or_default()),
+                            Err(_) => (0, next),
+                        };
+                        let path = PathBuf::from(percent_decode(path_str));
                         if !path.as_os_str().is_empty() {
-                            s.size_map.insert(path, (mtime, size));
+                            s.size_map
+                                .insert(path, (mtime, size, computed_at, complete));
                         }
                     }
                     Some("M") => {
@@ -105,16 +156,35 @@ impl Store {
         s
     }
 
-    /// A cached size for `path`, valid only if the folder's mtime still matches.
-    pub fn size_for(&self, path: &Path, dir_mtime: u64) -> Option<u64> {
-        self.size_map
-            .get(path)
-            .filter(|&&(m, _)| m == dir_mtime)
-            .map(|&(_, sz)| sz)
+    /// A size that is good enough to show right now without rescanning.
+    ///
+    /// Reused when either the folder is unchanged (mtime match — the value is
+    /// exact) or the value is still inside its TTL (the folder changed, but a
+    /// few hours of drift is within the point of "how big is this folder").
+    ///
+    /// Returns `(size, complete)`: `complete == false` marks a budget-stopped
+    /// lower bound, which the UI renders with a `~`. Estimates expire much
+    /// sooner than exact values (see `EST_TTL_SECS`).
+    pub fn size_for_lenient(&self, path: &Path, dir_mtime: u64, now: u64) -> Option<(u64, bool)> {
+        let (m, sz, at, complete) = self.size_map.get(path)?;
+        if *m == dir_mtime {
+            return Some((*sz, *complete));
+        }
+        let ttl = if *complete {
+            size_ttl_secs(*sz)
+        } else {
+            EST_TTL_SECS
+        };
+        if now.saturating_sub(*at) < ttl {
+            Some((*sz, *complete))
+        } else {
+            None
+        }
     }
 
-    pub fn record_size(&mut self, path: PathBuf, dir_mtime: u64, size: u64) {
-        self.size_map.insert(path, (dir_mtime, size));
+    pub fn record_size(&mut self, path: PathBuf, dir_mtime: u64, size: u64, complete: bool) {
+        self.size_map
+            .insert(path, (dir_mtime, size, now_secs(), complete));
         self.dirty = true;
     }
 
@@ -172,12 +242,14 @@ impl Store {
             fs::create_dir_all(parent)?;
         }
         let mut buf = String::with_capacity(64 * 1024);
-        for (path, (mtime, size)) in &self.size_map {
-            buf.push('S');
+        for (path, (mtime, size, computed_at, complete)) in &self.size_map {
+            buf.push(if *complete { 'S' } else { 'E' });
             buf.push('\t');
             buf.push_str(&size.to_string());
             buf.push('\t');
             buf.push_str(&mtime.to_string());
+            buf.push('\t');
+            buf.push_str(&computed_at.to_string());
             buf.push('\t');
             buf.push_str(&percent_encode(&path.to_string_lossy()));
             buf.push('\n');

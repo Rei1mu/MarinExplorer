@@ -10,7 +10,6 @@
 #[cfg(target_os = "windows")]
 mod imp {
     use std::ffi::OsStr;
-    use std::os::windows::ffi::OsStrExt;
     use std::ptr;
     use std::sync::atomic::{AtomicI32, Ordering};
 
@@ -451,10 +450,17 @@ mod imp {
     }
 }
 
+// Drag-out is not wired into the UI yet, so nothing calls this. The Windows
+// implementation lives in `imp`; keep it reachable without a `pub use`
+// re-export, which rustc flags as an unused import while no caller exists.
 #[cfg(target_os = "windows")]
-pub use imp::begin_file_drag;
+#[allow(dead_code)]
+pub fn begin_file_drag(paths: &[std::path::PathBuf]) -> bool {
+    imp::begin_file_drag(paths)
+}
 
 #[cfg(not(target_os = "windows"))]
+#[allow(dead_code)]
 pub fn begin_file_drag(_paths: &[std::path::PathBuf]) -> bool {
     false
 }

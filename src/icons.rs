@@ -52,10 +52,20 @@ pub const UP: Icon = Icon("M12 19V5M5 12l7-7 7 7");
 pub const REFRESH: Icon = Icon(
     "M21 12a9 9 0 1 1-9-9c2.52 0 4.93 1 6.74 2.74L21 8M21 3v5h-5",
 );
+/// 重新计算大小: a storage cylinder, deliberately unlike REFRESH's circular
+/// arrow so the two toolbar buttons next to each other stay tellable apart.
+pub const SIZE: Icon = Icon(
+    "M12 8c4.97 0 9-1.34 9-3s-4.03-3-9-3-9 1.34-9 3 4.03 3 9 3zM21 5v6c0 1.66-4.03 3-9 3s-9-1.34-9-3V5M21 11v6c0 1.66-4.03 3-9 3s-9-1.34-9-3v-6",
+);
 pub const COPY: Icon = Icon(
     "M20 9h-9a2 2 0 0 0-2 2v9a2 2 0 0 0 2 2h9a2 2 0 0 0 2-2v-9a2 2 0 0 0-2-2zM5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1",
 );
-pub const MOVE: Icon = Icon("m16 3 4 4-4 4M20 7H4m8 21-4-4 4-4M4 17h16");
+/// 剪贴 (cut): a pair of scissors — the dedicated glyph for the cut-to-clipboard
+/// action, kept visually apart from 复制/粘贴 so the three toolbar buttons read
+/// at a glance.
+pub const CUT: Icon = Icon(
+    "M6 4a2 2 0 1 0 0 4 2 2 0 1 0 0-4M6 16a2 2 0 1 0 0 4 2 2 0 1 0 0-4M6 6l12 12M6 18l12-12",
+);
 pub const PASTE: Icon = Icon(
     "M15 2H9a1 1 0 0 0-1 1v2a1 1 0 0 0 1 1h6a1 1 0 0 0 1-1V3a1 1 0 0 0-1-1zM8 4H6a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2M16 4h2a2 2 0 0 1 2 2v2M9 14h10",
 );
@@ -68,17 +78,20 @@ pub const FOLDER_PLUS: Icon = Icon(
 pub const FOLDER: Icon = Icon(
     "M20 20a2 2 0 0 0 2-2V8a2 2 0 0 0-2-2h-7.9a2 2 0 0 1-1.69-.9L9.6 3.9A2 2 0 0 0 7.93 3H4a2 2 0 0 0-2 2v13a2 2 0 0 0 2 2z",
 );
+pub const FILE: Icon = Icon("M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8zM14 2v6h6");
 pub const PLUS: Icon = Icon("M5 12h14M12 5v14");
 pub const PIN: Icon = Icon(
     "M12 17v5M9 10.76a2 2 0 0 1-1.11 1.79l-1.78.9A2 2 0 0 0 5 15.24V16a1 1 0 0 0 1 1h12a1 1 0 0 0 1-1v-.76a2 2 0 0 0-1.11-1.79l-1.78-.9A2 2 0 0 1 15 10.76V7a1 1 0 0 1 1-1 2 2 0 0 0 0-4H8a2 2 0 0 0 0 4 1 1 0 0 1 1 1z",
 );
 pub const NAV: Icon = Icon("M3 11l19-9-9 19-2-8-8-2z");
 pub const TERMINAL: Icon = Icon("m4 17 6-6-6-6M12 19h8");
-pub const MAP_PIN: Icon = Icon(
-    "M20 10c0 4.993-5.539 10.193-7.399 11.799a1 1 0 0 1-1.202 0C9.539 20.193 4 14.993 4 10a8 8 0 0 1 16 0zM15 10a3 3 0 1 1-6 0 3 3 0 0 1 6 0z",
-);
+pub const CLOCK: Icon = Icon("M12 22a10 10 0 1 0 0-20 10 10 0 0 0 0 20zM12 6v6l4 2");
 pub const STAR: Icon = Icon(
     "M11.525 2.295a.53.53 0 0 1 .95 0l2.31 4.679a2.123 2.123 0 0 0 1.595 1.16l5.166.756a.53.53 0 0 1 .294.904l-3.736 3.638a2.123 2.123 0 0 0-.611 1.878l.882 5.14a.53.53 0 0 1-.771.56l-4.618-2.428a2.122 2.122 0 0 0-1.973 0L6.396 21.16a.53.53 0 0 1-.77-.56l.881-5.139a2.122 2.122 0 0 0-.611-1.879L2.16 12.944a.53.53 0 0 1 .294-.904l5.165-.755a2.122 2.122 0 0 0 1.597-1.16z",
+);
+/// 收藏: a heart — the user's own list, kept apart from Windows' pins.
+pub const HEART: Icon = Icon(
+    "M19 14c1.49-1.46 3-3.21 3-5.5A5.5 5.5 0 0 0 16.5 3c-1.76 0-3 .5-4.5 2-1.5-1.5-2.74-2-4.5-2A5.5 5.5 0 0 0 2 8.5c0 2.3 1.5 4.05 3 5.5l7 7z",
 );
 pub const X: Icon = Icon("M18 6 6 18M6 6l12 12");
 pub const SLIDERS: Icon = Icon("M21 4h-7M10 4H3M21 12h-9M8 12H3M21 20h-5M12 20H3M14 2v4M8 10v4M16 18v4");
@@ -300,6 +313,36 @@ pub fn entry(
     }
 }
 
+/// A group heading *inside* a rail section — smaller and weaker than [`label`],
+/// and nudged right, so it reads as nested under its parent section. Windows
+/// Explorer splits Quick Access into "已固定" and "最近使用"; this draws those.
+pub fn sub_label(ui: &mut egui::Ui, ic: &Icon, text: &str, weak: egui::Color32) {
+    let font_id = egui::TextStyle::Body.resolve(ui.style());
+    let color = weak;
+    let galley = ui
+        .painter()
+        .layout_no_wrap(text.to_string(), font_id, color);
+    let ic_w = 12.0;
+    let indent = 6.0;
+    let h = galley.size().y.max(16.0);
+    let (rect, _) = ui.allocate_exact_size(
+        egui::vec2(indent + ic_w + 5.0 + galley.size().x, h),
+        egui::Sense::hover(),
+    );
+    let ic_rect = Rect::from_min_size(
+        egui::pos2(rect.min.x + indent, rect.center().y - ic_w * 0.5),
+        egui::vec2(ic_w, ic_w),
+    );
+    paint(ui.painter(), ic.0, ic_rect, color, WEIGHT);
+    let pos = egui::pos2(
+        rect.min.x + indent + ic_w + 5.0,
+        rect.center().y - galley.size().y * 0.5,
+    );
+    ui.painter()
+        .with_clip_rect(rect)
+        .galley(pos, galley, color);
+}
+
 /// A section heading: stroked glyph + emphasised text (no widget, so it can't
 /// swallow clicks).
 pub fn label(ui: &mut egui::Ui, ic: &Icon, text: &str) {
@@ -332,28 +375,30 @@ struct Sub {
 
 /// Flattened geometries are parsed once per distinct path string and then
 /// reused — parsing 30 short paths every frame would be wasteful.
-fn cache() -> &'static std::sync::Mutex<HashMap<&'static str, Vec<Sub>>> {
-    static C: OnceLock<std::sync::Mutex<HashMap<&'static str, Vec<Sub>>>> = OnceLock::new();
+///
+/// NOTE: `Arc`, not `Rc`. The cache lives in a `static`, so its contents must
+/// be `Send`; `Rc` is not, and the borrow checker rejects the whole static
+/// (`shared static variables must have a type that implements Sync`).
+fn cache() -> &'static std::sync::Mutex<HashMap<&'static str, std::sync::Arc<Vec<Sub>>>> {
+    static C: OnceLock<std::sync::Mutex<HashMap<&'static str, std::sync::Arc<Vec<Sub>>>>> = OnceLock::new();
     C.get_or_init(|| std::sync::Mutex::new(HashMap::new()))
 }
 
-fn geometry(d: &'static str) -> Vec<Sub> {
+/// Returns a shared, ref-counted copy of the parsed geometry. Painting a glyph
+/// used to deep-copy the whole `Vec<Sub>` (with its `Vec<(f32, f32)>`) on
+/// every call; now only the `Arc` is cloned (a refcount bump). The per-glyph
+/// point transform inside `paint` still allocates its own `Vec<Pos2>`.
+fn geometry(d: &'static str) -> std::sync::Arc<Vec<Sub>> {
     if let Ok(guard) = cache().lock() {
         if let Some(v) = guard.get(d) {
-            return clone_subs(v);
+            return v.clone();
         }
     }
-    let subs = parse(d);
+    let subs = std::sync::Arc::new(parse(d));
     if let Ok(mut guard) = cache().lock() {
-        guard.insert(d, clone_subs(&subs));
+        guard.insert(d, subs.clone());
     }
     subs
-}
-
-fn clone_subs(v: &[Sub]) -> Vec<Sub> {
-    v.iter()
-        .map(|s| Sub { pts: s.pts.clone(), closed: s.closed })
-        .collect()
 }
 
 /// Stroke `d` (24×24 grid) into `rect`, centred, with `w` the stroke weight in
@@ -367,7 +412,7 @@ pub fn paint(painter: &Painter, d: &'static str, rect: Rect, color: Color32, w: 
     let s = size / VIEW;
     let c = rect.center();
     let stroke_w = (w * s).max(0.75);
-    for sub in &subs {
+    for sub in subs.iter() {
         let pts: Vec<Pos2> = sub
             .pts
             .iter()

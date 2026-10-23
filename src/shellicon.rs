@@ -51,14 +51,42 @@ struct Bmp {
     rgba: Vec<u8>,
 }
 
+/// Where the row / rail icons come from.
+///
+/// `System` asks the Windows shell for each icon (full colour, but it pulls in
+/// the shell namespace + COM stack and keeps one texture per file type). The
+/// other two never touch the shell at all: they draw the built-in vector
+/// shapes or a font emoji glyph. Use them to keep the process small.
+#[derive(Clone, Copy, PartialEq, Eq, Default)]
+pub enum IconMode {
+    /// Ask the shell (default; costs the most memory).
+    #[default]
+    System,
+    /// Built-in vector shapes — no shell call, no texture.
+    Vector,
+    /// Emoji glyphs from egui's bundled Noto Emoji font — no shell call.
+    Emoji,
+}
+
+impl IconMode {
+    pub fn from_id(v: u8) -> Self {
+        match v {
+            1 => Self::Vector,
+            2 => Self::Emoji,
+            _ => Self::System,
+        }
+    }
+}
+
 /// A cache of shell icons as egui textures.
 pub struct Icons {
     map: HashMap<Kind, Option<egui::TextureHandle>>,
+    mode: IconMode,
 }
 
 impl Default for Icons {
     fn default() -> Self {
-        Self { map: HashMap::new() }
+        Self { map: HashMap::new(), mode: IconMode::System }
     }
 }
 
@@ -67,10 +95,30 @@ impl Icons {
         Self::default()
     }
 
+    pub fn mode(&self) -> IconMode {
+        self.mode
+    }
+
+    /// Switch icon source. Leaving `System` drops every cached texture, so the
+    /// GPU and the heap give that memory back straight away.
+    pub fn set_mode(&mut self, mode: IconMode) {
+        if self.mode != mode {
+            self.mode = mode;
+            self.map.clear();
+        }
+    }
+
     /// Texture for `kind`, uploaded on first use. `None` when the shell has no
     /// icon for it (or when the platform has no shell to ask) — callers fall
     /// back to a vector glyph then.
+    ///
+    /// Always `None` outside [`IconMode::System`]: that is the whole point of
+    /// the lighter modes — the shell is never queried, so nothing of the shell
+    /// namespace (COM, icon handlers, textures) is loaded or kept.
     pub fn get(&mut self, ctx: &egui::Context, kind: Kind) -> Option<egui::TextureId> {
+        if self.mode != IconMode::System {
+            return None;
+        }
         if let Some(slot) = self.map.get(&kind) {
             return slot.as_ref().map(|t| t.id());
         }

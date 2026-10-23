@@ -61,12 +61,19 @@ pub struct Previews {
     order: Vec<Key>,
     failed: HashSet<Key>,
     pending: HashSet<Key>,
+    /// RGBA bytes currently held in `map` (dropped entries give theirs back).
+    bytes: usize,
     req_tx: Sender<(PathBuf, u16)>,
     res_rx: Receiver<Reply>,
 }
 
 /// Upper bound on cached textures; oldest entries are dropped beyond this.
 const MAX_CACHE: usize = 96;
+/// …plus a byte budget on top of the count: one full-window viewer texture
+/// (1600 px long edge) is ~10 MB of RGBA, so a count-only cap could still
+/// hold ~1 GB once a folder of photos is browsed. Grid thumbnails (128 px)
+/// are ~65 KB each, so for them the count cap stays the binding one.
+const MAX_CACHE_BYTES: usize = 192 * 1024 * 1024;
 /// Files bigger than this are not decoded (protects against 500 MB TIFFs).
 const MAX_FILE_BYTES: u64 = 96 * 1024 * 1024;
 
@@ -85,6 +92,7 @@ impl Previews {
             order: Vec::new(),
             failed: HashSet::new(),
             pending: HashSet::new(),
+            bytes: 0,
             req_tx,
             res_rx,
         }
@@ -117,13 +125,28 @@ impl Previews {
     }
 
     fn insert(&mut self, key: Key, tex: Tex) {
-        if !self.map.contains_key(&key) {
-            self.order.push(key.clone());
+        // A re-decode of a cached key replaces its texture; drop the old one
+        // from the bookkeeping first so `bytes` stays truthful.
+        if let Some(old) = self.map.remove(&key) {
+            self.bytes = self.bytes.saturating_sub(tex_bytes(&old));
+            if let Some(pos) = self.order.iter().position(|k| *k == key) {
+                self.order.remove(pos);
+            }
         }
-        self.map.insert(key, tex);
-        while self.order.len() > MAX_CACHE {
+        self.bytes += tex_bytes(&tex);
+        self.map.insert(key.clone(), tex);
+        self.order.push(key);
+        // Evict oldest-first until both the count and the byte budget fit.
+        // `> 1` keeps one texture even if it alone busts the budget (a single
+        // 1600 px texture is ~10 MB, far below the cap, so this is just a
+        // guard against an eviction loop).
+        while self.order.len() > MAX_CACHE
+            || (self.bytes > MAX_CACHE_BYTES && self.order.len() > 1)
+        {
             let old = self.order.remove(0);
-            self.map.remove(&old);
+            if let Some(tex) = self.map.remove(&old) {
+                self.bytes = self.bytes.saturating_sub(tex_bytes(&tex));
+            }
         }
     }
 
@@ -152,6 +175,11 @@ impl Previews {
     pub fn failed(&self, path: &Path, max: u16) -> bool {
         self.failed.contains(&(path.to_path_buf(), max))
     }
+}
+
+/// RGBA bytes a cached texture occupies.
+fn tex_bytes(tex: &Tex) -> usize {
+    tex.w as usize * tex.h as usize * 4
 }
 
 /// Decode `path` down to `max` px on the long edge; returns `(w, h, rgba)`.
