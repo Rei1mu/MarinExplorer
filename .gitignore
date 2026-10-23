@@ -18,6 +18,12 @@ __pycache__/
 .workbuddy-ai/
 _keep.pid
 
+# ---- Runtime data written next to the deployed exe (store cache, inbox) ----
+/MarinExplorer/
+
+# ---- Dev scratch (build/diagnostic logs) ----
+/_t/
+
 # ---- Dev helper scripts (personal tooling, may contain local paths) ----
 _*.py
 _*.ps1

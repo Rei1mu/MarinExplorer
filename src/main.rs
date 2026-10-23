@@ -29,6 +29,7 @@ mod preview;
 mod quickaccess;
 mod shell;
 mod shellicon;
+mod single;
 mod tray;
 mod dragout;
 
@@ -83,6 +84,57 @@ const CELL_W: f32 = 108.0;
 const CELL_H: f32 = 134.0;
 
 fn main() -> eframe::Result {
+    // ---- single instance -------------------------------------------------
+    // A second launch must not open a second window: it activates the one the
+    // first instance owns and hands over any path it carried. Decided here,
+    // *before* the elevation relaunch below, so the common case costs no UAC
+    // prompt — and it can be decided here: UIPI blocks messages, not
+    // `EnumWindows` / `ShowWindow` / `SetForegroundWindow`, so an unelevated
+    // launcher can still find and foreground the elevated instance's window.
+    let take_over = std::env::args().any(|a| a == "--take-over");
+    let path_arg = std::env::args()
+        .skip(1)
+        .find(|a| a != "--elevated" && a != "--take-over");
+    // True once this process has already been through a UAC prompt: never
+    // ask twice (a declined prompt must not loop).
+    let mut elevation_attempted = false;
+    if let Some(found) = crate::single::find_existing() {
+        if take_over {
+            // Spawned to replace a running instance (tray 重启, or our own
+            // elevated relaunch after finding an older build). Closing an
+            // elevated window needs elevation, so hop through UAC first.
+            if !crate::shell::is_elevated() {
+                elevation_attempted = true;
+                if crate::shell::relaunch_elevated() {
+                    return Ok(());
+                }
+            }
+            crate::single::take_over(&found);
+        } else if crate::single::same_build(&found) {
+            // Same binary: hand the path over (if any) and bring the window
+            // forward. No UAC, no second process.
+            if let Some(p) = &path_arg {
+                crate::single::write_inbox(p);
+            }
+            crate::single::activate(found.hwnd);
+            return Ok(());
+        } else if crate::shell::is_elevated() {
+            // An older build owns the window — a reload whose taskkill could
+            // not reach the elevated instance. We may close it ourselves.
+            crate::single::take_over(&found);
+        } else {
+            // Older build, no rights yet: relaunch elevated carrying the
+            // replace flag, so the elevated copy does the closing.
+            elevation_attempted = true;
+            if crate::shell::relaunch_elevated_with(&["--take-over"]) {
+                return Ok(());
+            }
+            // UAC declined: best effort (the close will fail — the window
+            // belongs to a higher integrity process), then start anyway.
+            crate::single::take_over(&found);
+        }
+    }
+
     // Run elevated. Emptying the Recycle Bin has to delete entries that belong
     // to other accounts or sit in protected folders — an unelevated process
     // cannot remove those no matter how the delete is attempted, which is why
@@ -91,7 +143,7 @@ fn main() -> eframe::Result {
     // The relaunch is a soft failure on purpose: if the UAC prompt is declined
     // the app still starts, just without those rights.
     let elevation_tried = std::env::args().any(|a| a == "--elevated");
-    if !elevation_tried && !crate::shell::is_elevated() {
+    if !elevation_attempted && !elevation_tried && !crate::shell::is_elevated() {
         if crate::shell::relaunch_elevated() {
             // The elevated copy owns the window from here on.
             return Ok(());
@@ -101,12 +153,20 @@ fn main() -> eframe::Result {
     let store = Store::load();
 
     // Folder-size worker: one persistent thread, unbounded queue.
-    let (size_tx, size_rx) = channel::<PathBuf>();
-    let (back_tx, back_rx) = channel::<(PathBuf, u64, u64, bool)>();
+    let (size_tx, size_rx) = channel::<(PathBuf, bool)>(); // (path, full_scan)
+    let (prog_tx, prog_rx) = channel::<(PathBuf, u64)>(); // full-scan progress
+    let (back_tx, back_rx) = channel::<(PathBuf, u64, u64, bool, bool)>(); // …, was_full
     std::thread::spawn(move || {
-        while let Ok(path) = size_rx.recv() {
-            // Bulk enumeration with a budget: `(bytes, complete)`.
-            let (size, complete) = explorer::scan_dir_size(&path);
+        while let Ok((path, full)) = size_rx.recv() {
+            // Passive scans are budgeted: `complete == false` means the number
+            // is a lower bound (`~`). The manual recompute asks for `full`:
+            // no budget — an exact number is the whole point of the button —
+            // with progress streamed back while it runs.
+            let (size, complete) = if full {
+                (explorer::scan_dir_size_full(&path, &prog_tx), true)
+            } else {
+                explorer::scan_dir_size(&path)
+            };
             let mtime = match std::fs::metadata(&path) {
                 Ok(m) => m
                     .modified()
@@ -116,7 +176,7 @@ fn main() -> eframe::Result {
                     .unwrap_or(0),
                 Err(_) => 0,
             };
-            back_tx.send((path, mtime, size, complete)).ok();
+            back_tx.send((path, mtime, size, complete, full)).ok();
         }
     });
 
@@ -154,12 +214,15 @@ fn main() -> eframe::Result {
                 }
             }
             cc.egui_ctx.set_fonts(fonts);
-            let mut ex = Explorer::new(store, size_tx, back_rx);
+            let mut ex = Explorer::new(store, size_tx, prog_rx, back_rx);
             // A path handed over on the command line (context menu, drag onto
             // the exe, `MarinExplorer.exe D:\foo`) opens that folder — or, for
             // a file, its parent with the file selected.
-            // Skip the elevation marker: it is a flag, not a path to open.
-            if let Some(arg) = std::env::args().skip(1).find(|a| a != "--elevated") {
+            // Skip the internal markers: they are flags, not paths to open.
+            if let Some(arg) = std::env::args()
+                .skip(1)
+                .find(|a| a != "--elevated" && a != "--take-over")
+            {
                 ex.open_arg(&arg);
             }
             ex.hwnd = hwnd;
@@ -419,12 +482,53 @@ impl eframe::App for Explorer {
         self.enter_consumed = false;
         // ----- drain background channels -----
         let mut sizes_arrived = false;
-        while let Ok((p, m, s, complete)) = self.size_rx.try_recv() {
+        // Full-scan progress first: draining it before the results means the
+        // last progress message (the final byte count) is still on screen when
+        // the result that ends the scan lands in the same frame.
+        while let Ok((root, total)) = self.size_prog_rx.try_recv() {
+            // Progress only belongs to a live batch. A straggler message can
+            // land a frame *after* the batch's last result — the two travel on
+            // separate channels — and would otherwise resurrect the finished
+            // "正在重新计算大小" line and leave it there forever.
+            if self.size_scan_started.is_none() {
+                continue;
+            }
+            let label = root
+                .file_name()
+                .map(|n| n.to_string_lossy().into_owned())
+                .unwrap_or_else(|| root.to_string_lossy().into_owned());
+            self.size_scan = Some(explorer::SizeScanUi::Running(label, total));
+        }
+        while let Ok((p, m, s, complete, was_full)) = self.size_rx.try_recv() {
+            if was_full {
+                self.size_full_left = self.size_full_left.saturating_sub(1);
+                // Volume covered by the manual batch, for the finish line.
+                self.size_full_bytes = self.size_full_bytes.saturating_add(s);
+            }
             self.apply_size_result(p, m, s, complete);
             sizes_arrived = true;
         }
         if sizes_arrived {
             self.resort_size_sorted_panels();
+        }
+        // The manual recompute batch just finished: the box keeps its place
+        // and switches to the finish line ("计算完成 · 耗时 X"). The status
+        // line is deliberately NOT written — it is the operation log, and a
+        // minutes-long size scan must not overwrite it. `pending_sizes` must
+        // be empty too: the last full result and the last passive straggler
+        // can land in either order, and the finish line waits for both.
+        if self.size_full_left == 0 && self.pending_sizes.is_empty() {
+            if let Some(t0) = self.size_scan_started.take() {
+                let took = crate::app::human_duration(t0.elapsed(), self.lang);
+                let line = format!(
+                    "{} · {} · {}",
+                    crate::lang::tr("大小计算完成", self.lang),
+                    crate::lang::tr("耗时 %s", self.lang).replace("%s", &took),
+                    crate::lang::tr("已扫 %s", self.lang)
+                        .replace("%s", &crate::app::human_size(self.size_full_bytes))
+                );
+                self.size_scan = Some(explorer::SizeScanUi::Done(line));
+            }
         }
         // One flag for "a background result landed this frame": it has to be
         // raised outside the borrows above, which hold `&self.drives_rx` etc.
@@ -467,6 +571,9 @@ impl eframe::App for Explorer {
         }
         // Throttled (once a second), not per frame: see the comment there.
         self.refresh_folder_sizes_throttled();
+        // Paths a second launch handed over (single instance): throttled to
+        // 400ms, each opens its own tab.
+        self.poll_inbox_throttled();
         self.maybe_flush();
         self.previews.poll(ctx);
 
@@ -699,6 +806,44 @@ impl eframe::App for Explorer {
         egui::TopBottomPanel::bottom("statusbar").show(ctx, |ui| {
             ui.horizontal(|ui| {
                 ui.strong(&self.status);
+                // The folder-size box. It owns its own slot so that neither
+                // the running line nor the finish line ever lands in the
+                // operation log on the far left. The finish line stays until
+                // the next manual recompute — "计算完成 · 耗时 X" is the only
+                // warning the user gets that the exact numbers cost real time.
+                match &self.size_scan {
+                    Some(explorer::SizeScanUi::Running(label, bytes)) => {
+                        ui.separator();
+                        // Animated bar: no total is known up front, so this is
+                        // bytes-counted, never a percentage.
+                        ui.add(egui::ProgressBar::new(f32::NAN).desired_width(48.0));
+                        ui.label(format!(
+                            "{}：{}… 已扫 {}",
+                            crate::lang::tr("正在重新计算大小", self.lang),
+                            label,
+                            crate::app::human_size(*bytes)
+                        ));
+                    }
+                    Some(explorer::SizeScanUi::Done(line)) => {
+                        ui.separator();
+                        // No bar: a static full bar reads as "still working"
+                        // (and a moving one lies). The line itself is the
+                        // result — time taken plus the volume scanned.
+                        ui.label(line);
+                    }
+                    None => {}
+                }
+                // Every other CPU-heavy background task, bottom-left: a
+                // copy/delete or a big directory read is just as invisible
+                // without this line.
+                let tasks = self.running_tasks();
+                if !tasks.is_empty() {
+                    ui.separator();
+                    // Small indeterminate bar: motion for the tasks that have
+                    // no numbers of their own (directory reads).
+                    ui.add(egui::ProgressBar::new(f32::NAN).desired_width(48.0));
+                    ui.label(tasks.join(" · "));
+                }
                 ui.separator();
                 let cwd = self.active_panel().cwd.clone();
                 let count = {

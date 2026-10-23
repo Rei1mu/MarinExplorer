@@ -155,6 +155,18 @@ mod win {
     /// instance that it is the result of an elevation attempt, so it must not
     /// ask again (otherwise a declined prompt would loop forever).
     pub fn relaunch_elevated() -> bool {
+        relaunch_elevated_with(&[])
+    }
+
+    /// Relaunch with the `runas` verb plus `extra` flags. The flags travel
+    /// with the command line (only the `--elevated` marker itself is
+    /// filtered out), so the elevated copy knows what it was spawned for —
+    /// `--take-over`, meaning "replace a running instance".
+    ///
+    /// The `--elevated` marker tells the new instance that it is the result
+    /// of an elevation attempt, so it must not ask again (otherwise a
+    /// declined prompt would loop forever).
+    pub fn relaunch_elevated_with(extra: &[&str]) -> bool {
         let Ok(exe) = std::env::current_exe() else {
             return false;
         };
@@ -163,6 +175,10 @@ mod win {
         // Keep whatever the shell passed (e.g. the folder behind a right-click
         // "open here"), so the elevated copy opens the same place.
         let mut line = String::from("--elevated");
+        for f in extra {
+            line.push(' ');
+            line.push_str(f);
+        }
         for a in std::env::args().skip(1).filter(|a| a != "--elevated") {
             line.push(' ');
             if a.contains(' ') {
@@ -352,6 +368,19 @@ pub fn relaunch_elevated() -> bool {
 
 #[cfg(not(target_os = "windows"))]
 pub fn relaunch_elevated() -> bool {
+    false
+}
+
+/// Like `relaunch_elevated`, but the elevated copy also carries `extra`
+/// flags — `--take-over` makes it replace a running instance instead of
+/// activating it.
+#[cfg(target_os = "windows")]
+pub fn relaunch_elevated_with(extra: &[&str]) -> bool {
+    win::relaunch_elevated_with(extra)
+}
+
+#[cfg(not(target_os = "windows"))]
+pub fn relaunch_elevated_with(_extra: &[&str]) -> bool {
     false
 }
 

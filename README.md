@@ -11,6 +11,18 @@
 
 ## 更新日志 / Changelog
 
+### v0.1.7 — 2026-10-23
+- **单实例守卫**：重复启动不再打开第二个窗口——新进程把路径交给已运行的实例并激活它的窗口（用文件投递代替 `WM_COPYDATA`，绕过 UIPI 对提权窗口的拦截）。托盘「重启」改为接管模式（`--take-over`）：重启后直接替换旧窗口，不再留下一个空窗口。
+- **大小计算框常驻**：手动点「重新计算大小」后，左下角的框不再中途消失——完成后固定显示「大小计算完成 · 耗时 X · 已扫 Y」，直到下一次计算；也不再覆盖最左侧的操作日志。
+- **启动更安静**：不再显示「已加载 N 个系统快速访问文件夹」这类一次性启动信息，底栏保留默认的快捷键提示。
+- 文档补充「建议固定到任务栏」。
+
+**English**
+- **Single-instance guard**: launching again no longer opens a second window — the new process hands its path to the running instance and activates its window (via a file drop instead of `WM_COPYDATA`, so UIPI cannot block messages to the elevated window). The tray "restart" now takes over (`--take-over`): it replaces the old window instead of leaving an empty one behind.
+- **Persistent size box**: after a manual "recompute sizes" the bottom-left box no longer vanishes mid-scan — it finishes with "sizes recomputed · took X · scanned Y" and stays until the next run, without overwriting the operation log.
+- **Quieter startup**: the one-shot "loaded N system Quick Access folders" message is gone; the status bar keeps its default shortcut hints.
+- Docs now suggest pinning the app to the taskbar.
+
 ### v0.1.6 — 2026-10-23
 - **清空回收站重构**：不再调用 `SHEmptyRecycleBin`（系统会在删除前枚举并重新计算总大小，数万乃至数十万文件时正是资源管理器卡死/无法删除的根因）。改为直接遍历自己 SID 下的 `$Recycle.Bin\{SID}`，边删 `$I`/`$R` 边计数，底部进度条显示真实百分比 + 「已删除 N」，不再卡顿，也不会因系统枚举失败而删不掉。
 - **下载指引**：普通 Windows x64 用户请下载 `MarinExplorer-Setup-Windows-x64-msvc-0.1.6.exe`；ARM 架构的 Windows（如 Surface、骁龙平板/笔记本）请下载 `MarinExplorer-Setup-Windows-arm64-0.1.6.exe`。两者不可混用，安装包已按架构限制。
@@ -52,6 +64,8 @@
 首次打开会读取并缓存磁盘信息，之后都很快。
 
 💡 **建议以管理员身份运行**：访问受保护的系统目录、写入系统路径时，管理员权限能避免因权限不足导致的功能受限。
+
+📌 **建议固定到任务栏**：安装后右键开始菜单（或桌面）里的 MarinExplorer 图标 →「固定到任务栏」，之后随点随用，不必每次翻开始菜单。
 
 🔒 **安全提醒**：请只从本仓库的 **Releases** 或官方构建渠道获取 `MarinExplorer.exe`。不要从不明来源下载，以免被植入木马或后门。
 
@@ -167,6 +181,8 @@ You may change the install directory; the default is `%LOCALAPPDATA%\Programs\Ma
 The first open reads and caches disk info; afterwards it's fast.
 
 💡 **Run as Administrator** is recommended: it avoids permission errors when reaching protected system folders or writing to system paths.
+
+📌 **Pin it to the taskbar**: after install, right-click the MarinExplorer icon in the Start menu (or on the desktop) → "Pin to taskbar", so it's one click away every time.
 
 🔒 **Security**: only download `MarinExplorer.exe` from this repo's **Releases** or official build artifacts. Do not fetch it from unknown sources — that's how trojans and backdoors get in.
 

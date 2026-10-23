@@ -161,6 +161,13 @@ pub struct Panel {
     pub multi: std::collections::HashSet<String>,
     /// Shift+click anchor: extending a range starts from here.
     pub anchor: Option<String>,
+    /// Entry name to select as soon as the listing is in. Set when a path
+    /// was handed over (command line, or a second launch through the inbox)
+    /// while the folder was still loading; applied by `adopt_listing` and
+    /// cleared. Checking `entries` right after `navigate` never matched —
+    /// the listing arrives a frame later — so the selection used to be
+    /// silently dropped.
+    pub pending_select: Option<String>,
     pub filter: String,
     pub sort_key: SortKey,
     pub sort_dir: SortDir,
@@ -203,6 +210,7 @@ impl Panel {
             selected: None,
             multi: std::collections::HashSet::new(),
             anchor: None,
+            pending_select: None,
             filter: String::new(),
             // Newest first: a freshly opened folder shows what changed last
             // at the top, which is what people usually look for.
@@ -277,6 +285,14 @@ impl Panel {
         self.entries = entries;
         self.loading = false;
         self.resort();
+        // A path handed over while this folder was still loading: select
+        // the file now that we can actually see it.
+        if let Some(name) = self.pending_select.take() {
+            if self.entries.iter().any(|e| e.name == name) {
+                self.selected = Some(name.clone());
+                self.multi = std::iter::once(name).collect();
+            }
+        }
     }
 
     /// Change directory, recording it in the history.
@@ -672,6 +688,29 @@ pub fn human_size_est(n: u64, est: bool) -> String {
         format!("~{}", human_size(n))
     } else {
         human_size(n)
+    }
+}
+
+/// Elapsed time as "1 分 23 秒" — the finish line of a long scan or copy.
+/// Templates are translated (`%s` placeholders), the numbers are not.
+pub fn human_duration(d: std::time::Duration, lang: crate::lang::Lang) -> String {
+    let s = d.as_secs();
+    let sub = |t: &'static str, a: u64, b: u64| {
+        crate::lang::tr(t, lang)
+            .replacen("%s", &a.to_string(), 1)
+            .replace("%s", &b.to_string())
+    };
+    // Sub-second work used to print "耗时 0 秒", which reads like the timer is
+    // broken. Say so plainly instead.
+    if d.as_millis() < 1000 {
+        return crate::lang::tr("不到 1 秒", lang).to_string();
+    }
+    if s < 60 {
+        crate::lang::tr("%s 秒", lang).replace("%s", &s.to_string())
+    } else if s < 3600 {
+        sub("%s 分 %s 秒", s / 60, s % 60)
+    } else {
+        sub("%s 小时 %s 分", s / 3600, (s % 3600) / 60)
     }
 }
 

@@ -251,7 +251,13 @@ mod imp {
     fn restart_main(tray_hwnd: isize) {
         unsafe {
             if let Some(exe) = current_exe() {
-                let _ = create_process(&exe);
+                // --take-over: the new process must *replace* this instance,
+                // not activate it — it would activate the window we are
+                // about to close and then exit, leaving nothing running.
+                // Quoted because the path contains spaces and CreateProcess
+                // parses the command line.
+                let cmd = format!("\"{}\" --take-over", exe);
+                let _ = create_process(&cmd);
             }
             delete_icon(tray_hwnd);
             destroy_window(tray_hwnd);

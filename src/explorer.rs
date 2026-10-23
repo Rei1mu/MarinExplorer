@@ -48,6 +48,9 @@ pub struct Job {
     pub note: Option<(&'static str, String)>,
     pub err: Option<String>,
     pub rx: Receiver<JobMsg>,
+    /// When the job started: the finish line reports the elapsed time, so a
+    /// 10-minute copy says so instead of just "done".
+    pub started: Instant,
 }
 
 impl Job {
@@ -74,6 +77,19 @@ impl Tab {
     }
 }
 
+/// Select `name` in `panel` once its listing is in: right away when the
+/// entries are already there (the inline first load), otherwise when the
+/// worker delivers them. Only selects when the name really got listed — a
+/// filter could hide it, or the folder may have failed to read.
+fn select_when_listed(panel: &mut Panel, name: String) {
+    if panel.loading {
+        panel.pending_select = Some(name);
+    } else if panel.entries.iter().any(|e| e.name == name) {
+        panel.selected = Some(name.clone());
+        panel.multi = std::iter::once(name).collect();
+    }
+}
+
 /// Where a Quick-Access row came from — which group it is listed under and
 /// whether Marin is allowed to remove it.
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -84,6 +100,16 @@ pub enum QaKind {
     WinPin,
     /// Windows' jump-list MRU entry — neither pinned nor ours.
     Recent,
+}
+
+/// State of the bottom-left folder-size box (see `Explorer::size_scan`).
+pub enum SizeScanUi {
+    /// Scanning: the folder being walked right now, plus the bytes counted so
+    /// far. A full scan never pre-counts, so this is bytes — not a percentage.
+    Running(String, u64),
+    /// Finished: the ready-made line, elapsed time included. Stays on screen
+    /// until the next manual recompute replaces it.
+    Done(String),
 }
 
 pub struct Explorer {
@@ -138,12 +164,33 @@ pub struct Explorer {
     pub qa_dirty: bool,
     // folder sizes
     pub store: Store,
-    pub size_tx: Sender<PathBuf>,
-    pub size_rx: Receiver<(PathBuf, u64, u64, bool)>, // (path, dir_mtime, size, complete)
+    pub size_tx: Sender<(PathBuf, bool)>, // (path, full_scan)
+    pub size_rx: Receiver<(PathBuf, u64, u64, bool, bool)>, // (path, mtime, size, complete, was_full)
+    /// Live progress of a full (manual recompute) scan: (folder, bytes so far).
+    /// A full scan never pre-counts, so the total is unknown — this is bytes,
+    /// not a percentage.
+    pub size_prog_rx: Receiver<(PathBuf, u64)>,
+    /// The bottom-left size box. It deliberately **survives completion**: the
+    /// finish line ("计算完成 · 耗时 X") stays on screen until the next manual
+    /// recompute, instead of vanishing or overwriting the operation log at the
+    /// far left of the status bar.
+    pub size_scan: Option<SizeScanUi>,
+    /// When the current manual recompute batch started; the finish line
+    /// reports how long the whole batch took.
+    pub size_scan_started: Option<Instant>,
+    /// Outstanding full scans from the manual batch; zero means done.
+    pub size_full_left: usize,
+    /// Bytes counted by the current manual batch's full-scan results. Summed
+    /// as results land; the finish line reports it ("已扫 X GiB") so the user
+    /// sees the volume the exact numbers cost. Reset when a batch starts.
+    pub size_full_bytes: u64,
     pub pending_sizes: HashSet<PathBuf>,
     /// Wall clock of the last periodic folder-size top-up (see
     /// `refresh_folder_sizes_throttled`).
     pub last_size_poll: Instant,
+    /// Wall clock of the last inbox check (see `poll_inbox_throttled`):
+    /// paths a second launch handed over while this instance was running.
+    pub last_inbox_poll: Instant,
     /// Set whenever a background result lands. The UI needs one more repaint
     /// *after* a queue drains (the last size, the last listing), and egui is
     /// otherwise idle by then.
@@ -295,8 +342,9 @@ pub enum TextColor {
 impl Explorer {
     pub fn new(
         store: Store,
-        size_tx: Sender<PathBuf>,
-        size_rx: Receiver<(PathBuf, u64, u64, bool)>,
+        size_tx: Sender<(PathBuf, bool)>,
+        size_prog_rx: Receiver<(PathBuf, u64)>,
+        size_rx: Receiver<(PathBuf, u64, u64, bool, bool)>,
     ) -> Self {
         let (rec_tx, rec_rx) = channel::<(PathBuf, Vec<fs_util::RecItem>)>();
         // Directory-listing worker: one persistent thread. A folder with tens
@@ -411,8 +459,17 @@ impl Explorer {
             store,
             size_tx,
             size_rx,
+            size_prog_rx,
+            size_scan: None,
+            size_scan_started: None,
+            size_full_left: 0,
+            size_full_bytes: 0,
             pending_sizes: HashSet::new(),
             last_size_poll: Instant::now(),
+            // Back-dated so the first frame already drains the inbox: a
+            // path handed over by the launch that is replacing us must not
+            // wait a full interval to open.
+            last_inbox_poll: Instant::now() - std::time::Duration::from_millis(500),
             bg_signal: None,
             list_tx: list_req_tx,
             list_rx,
@@ -972,30 +1029,108 @@ impl Explorer {
     /// drag-and-drop onto the exe, `start MarinExplorer D:\`). Directories are
     /// opened directly; for a file we open its parent and select the file,
     /// which is what users expect from "open this file's folder".
+    ///
+    /// This is the **first launch** behaviour: the path lands in the left
+    /// pane of the initial tab. When an instance is already running the path
+    /// is handed over instead and opens a new tab (`open_arg_in_tab`).
     pub fn open_arg(&mut self, arg: &str) {
+        let Some((dir, select)) = Self::resolve_arg(arg) else {
+            return;
+        };
+        self.pane_of(true).navigate(dir);
+        if let Some(name) = select {
+            select_when_listed(self.pane_of(true), name);
+        }
+        self.apply_cached_sizes();
+    }
+
+    /// Split a command-line argument into the directory to open and the file
+    /// to select inside it. `None` when the path exists as neither a folder
+    /// nor a file (a stale favourite, a typo) — nothing to open.
+    fn resolve_arg(arg: &str) -> Option<(std::path::PathBuf, Option<String>)> {
         let raw = arg.trim_matches('"');
         let p = std::path::PathBuf::from(raw);
         if p.is_dir() {
-            self.pane_of(true).navigate(p);
+            Some((p, None))
         } else if p.is_file() {
-            match p.parent() {
-                Some(parent) => {
-                    let parent = parent.to_path_buf();
-                    self.pane_of(true).navigate(parent);
-                }
-                None => return,
-            }
-            if let Some(name) = p.file_name().map(|n| n.to_string_lossy().to_string()) {
-                let panel = self.pane_of(true);
-                // Only select it if it really got listed (a filter could hide
-                // it, or the folder may have failed to read).
-                if panel.entries.iter().any(|e| e.name == name) {
-                    panel.selected = Some(name.clone());
-                    panel.multi = std::iter::once(name).collect();
-                }
-            }
+            let parent = p.parent()?.to_path_buf();
+            let name = p.file_name().map(|n| n.to_string_lossy().to_string())?;
+            Some((parent, Some(name)))
+        } else {
+            None
         }
-        self.apply_cached_sizes();
+    }
+
+    /// Open a path in a **new tab** — the tab starts life on that path
+    /// (title included), it is not a clone of the current one that then
+    /// navigates. Used when a second launch hands a path over (see
+    /// `crate::single`).
+    ///
+    /// If some tab already shows that directory (either pane, compared
+    /// case-insensitively — Windows paths are), that tab is brought forward
+    /// instead: right-clicking the same folder twice must not fill the tab
+    /// strip with duplicates.
+    pub fn open_arg_in_tab(&mut self, arg: &str) {
+        let Some((dir, select)) = Self::resolve_arg(arg) else {
+            return;
+        };
+        let key = dir.to_string_lossy().to_lowercase();
+        if let Some(idx) = self.tabs.iter().position(|t| {
+            t.panes
+                .iter()
+                .any(|p| p.cwd.to_string_lossy().to_lowercase() == key)
+        }) {
+            self.active_tab = idx;
+            self.active_pane = 0;
+            self.persist_layout();
+            return;
+        }
+        self.new_tab_at(dir, select);
+    }
+
+    /// Open a new tab that starts on `dir`: the right pane keeps the active
+    /// tab's right pane, so the two-pane context survives, and `select` (a
+    /// file inside `dir`) is selected once the listing is in.
+    pub fn new_tab_at(&mut self, dir: std::path::PathBuf, select: Option<String>) {
+        let id = self.next_tab_id;
+        self.next_tab_id += 1;
+        let right = self.p1().cwd.clone();
+        // Built with the target cwd from the start: `Tab::new` reads the
+        // listing inline (no worker wired yet), so the first frame already
+        // shows the folder and the tab title is right from birth — no
+        // clone-then-navigate flash of the old location.
+        self.tabs
+            .insert(self.active_tab + 1, Tab::new(id, dir, right));
+        self.active_tab += 1;
+        self.active_pane = 0;
+        self.sync_new_tab_prefs(self.active_tab);
+        // The new panels were built with `list_tx: None` (inline load); wire
+        // them to the worker like every other panel.
+        let tx = self.list_tx.clone();
+        for p in &mut self.tabs[self.active_tab].panes {
+            p.list_tx = Some(tx.clone());
+        }
+        if let Some(name) = select {
+            select_when_listed(&mut self.tabs[self.active_tab].panes[0], name);
+        }
+        self.status = format!("{} {id}", crate::lang::tr("新标签页", self.lang));
+        self.persist_layout();
+    }
+
+    /// Paths a second launch handed over through the inbox, at most every
+    /// 400ms: a `read_dir` over a near-empty box is free, but there is no
+    /// reason to do it per frame either. Each path opens its own tab
+    /// (`open_arg_in_tab`), so a burst of right-clicks lands as a burst of
+    /// tabs, in launch order.
+    pub fn poll_inbox_throttled(&mut self) {
+        const INTERVAL: std::time::Duration = std::time::Duration::from_millis(400);
+        if self.last_inbox_poll.elapsed() < INTERVAL {
+            return;
+        }
+        self.last_inbox_poll = std::time::Instant::now();
+        for p in crate::single::take_inbox() {
+            self.open_arg_in_tab(&p.to_string_lossy());
+        }
     }
 
     /// Repaint the OS window frame (title bar + border) to match the theme.
@@ -1184,15 +1319,16 @@ impl Explorer {
 
     /// Drain the Quick-Access loader channel once its background read finishes.
     /// The (empty) receiver is kept as a "loaded" sentinel so we never re-spawn.
+    ///
+    /// The loaded count is deliberately **not** written to the status log: it is
+    /// a one-shot startup message that would clobber the "就绪 + shortcut hints"
+    /// line, and the folders are already visible in the sidebar — the number
+    /// tells the user nothing.
     pub fn poll_quick_access(&mut self) {
         if let Some(rx) = &self.qa_rx {
             if let Ok(list) = rx.try_recv() {
-                let n = list.len();
                 self.system_qa = list;
                 self.qa_dirty = true;
-                if n > 0 {
-                    self.status = format!("{} {n} {}", crate::lang::tr("已加载", self.lang), crate::lang::tr("个系统快速访问文件夹", self.lang));
-                }
             }
         }
     }
@@ -1418,24 +1554,31 @@ impl Explorer {
     /// folder 300's size), and a value that is still inside its TTL is reused
     /// instead of rescanned.
     pub fn request_folder_sizes(&mut self) {
-        self.request_sizes_limited(FOLDERS_PER_PANEL, MAX_PENDING_SIZES);
+        self.request_sizes_limited(FOLDERS_PER_PANEL, MAX_PENDING_SIZES, false);
     }
 
-    /// Same, with caller-chosen ceilings. The manual "重新计算大小" action uses
-    /// this: there the "only what fits on screen" limit does not apply, the
-    /// user explicitly asked for everything to be recomputed.
-    fn request_sizes_limited(&mut self, per_panel: usize, max_pending: usize) {
+    /// Same, with caller-chosen ceilings and scan mode. The manual
+    /// "重新计算大小" action uses this: there the "only what fits on screen"
+    /// limit does not apply, the user explicitly asked for everything to be
+    /// recomputed — and with `full = true` the scan runs *without* the
+    /// 400 ms / 150k-entry budget, so the number is exact instead of a lower
+    /// bound. A 700 GB folder needs tens of seconds for that; the budgeted
+    /// mode stays for passive browsing, where a fast `~` beats a slow exact.
+    /// Returns how many folders were queued (the manual action uses this to
+    /// know whether anything was left to do at all).
+    fn request_sizes_limited(&mut self, per_panel: usize, max_pending: usize, full: bool) -> usize {
         if self.pending_sizes.len() >= max_pending {
-            return;
+            return 0;
         }
         let now = crate::cache::now_secs();
+        let mut queued = 0usize;
         // Index-based loop: borrowing `self.tabs` directly (not through a
         // method) lets the other fields be touched inside the loop.
         for i in 0..2 {
             let panel = &mut self.tabs[self.active_tab].panes[i];
-            let mut queued = 0usize;
+            let mut per = 0usize;
             for e in panel.entries.iter().filter(|e| e.is_dir && !e.size_known) {
-                if queued >= per_panel {
+                if per >= per_panel {
                     break;
                 }
                 let p = panel.cwd.join(&e.name);
@@ -1444,12 +1587,22 @@ impl Explorer {
                 if self.store.size_for_lenient(&p, mtime, now).is_some() {
                     continue;
                 }
-                if self.pending_sizes.insert(p.clone()) {
-                    self.size_tx.send(p).ok();
+                let already = !self.pending_sizes.insert(p.clone());
+                // `full` re-sends even when a passive scan for the same folder
+                // is already in flight: the manual action must not come back
+                // with a budgeted `~` just because browsing queued it a moment
+                // earlier. FIFO order keeps the exact result last, so it wins.
+                if full || !already {
+                    self.size_tx.send((p, full)).ok();
+                    if full {
+                        self.size_full_left += 1;
+                    }
                     queued += 1;
+                    per += 1;
                 }
             }
         }
+        queued
     }
 
     /// Forget every cached folder size in view and queue a fresh scan.
@@ -1477,9 +1630,66 @@ impl Explorer {
         }
         self.store.dirty = true;
         // An explicit request, so the "roughly what fits on screen" ceiling is
-        // raised. Still bounded: a folder with thousands of sub-directories
-        // must not wedge the single worker thread.
-        self.request_sizes_limited(256, 1024);
+        // raised to everything in view: the user asked for *all* of it. `full
+        // = true`: no scan budget, so every folder gets an exact number
+        // instead of a `~` lower bound (that is what made a 700 GB folder
+        // report ~140 GB before).
+        self.request_sizes_limited(usize::MAX, usize::MAX, true);
+        // Fresh volume counter for the new batch: the finish line reports how
+        // much data the exact walk covered ("已扫 X GiB").
+        self.size_full_bytes = 0;
+        // Time the whole batch: the finish line says how long it took, which
+        // is the only warning the user gets that a 700 GB folder costs real
+        // minutes (and that the exact number was worth the wait).
+        //
+        // `size_scan_started` is set even when nothing was queued: an instant
+        // batch still deserves its finish line ("耗时 不到 1 秒"), delivered
+        // through the same path on the next frame. The status line is never
+        // touched — the size box is the whole feedback surface, so the
+        // operation log at the far left keeps whatever it was showing. The
+        // outstanding-scan counter lives in `size_full_left` and is only ever
+        // decremented as results land, so the frame loop's "batch finished?"
+        // check cannot fire early.
+        self.size_scan_started = Some(Instant::now());
+        // A new run replaces the previous run's finish line.
+        self.size_scan = None;
+    }
+
+    /// One short line per CPU-heavy background task currently running.
+    ///
+    /// The bottom status bar draws these on the left: a copy / delete or a big
+    /// directory read is invisible without them. The manual full size scan is
+    /// **not** here — it has its own box (`size_scan`), which also carries the
+    /// finish line and stays on screen. Passive (budgeted) size scans share
+    /// one line — each of them is over in well under a second — and are
+    /// suppressed while a manual batch owns the box.
+    pub fn running_tasks(&self) -> Vec<String> {
+        let mut v: Vec<String> = Vec::new();
+        if let Some(job) = &self.job {
+            let mut line = job.label.clone();
+            if job.deleted > 0 {
+                line = format!("{line} 已删除 {}", job.deleted);
+            } else if !job.indeterminate {
+                line = format!("{line} {:.0}%", job.progress * 100.0);
+            }
+            v.push(line);
+        }
+        if self.size_scan_started.is_none() && !self.pending_sizes.is_empty() {
+            v.push(crate::lang::tr("正在计算文件夹大小…", self.lang).into());
+        }
+        // One line per kind, not per pane: both panes loading at once is the
+        // common case and would otherwise read twice.
+        if self.tabs.iter().any(|t| t.panes.iter().any(|p| p.loading)) {
+            v.push(crate::lang::tr("正在读取目录…", self.lang).into());
+        }
+        if self
+            .tabs
+            .iter()
+            .any(|t| t.panes.iter().any(|p| p.rec_loading))
+        {
+            v.push(crate::lang::tr("正在读取回收站…", self.lang).into());
+        }
+        v
     }
 
     /// Apply a size result coming back from the worker.
@@ -1885,6 +2095,7 @@ impl Explorer {
             note: None,
             err: None,
             rx,
+            started: Instant::now(),
         });
     }
 
@@ -1951,6 +2162,7 @@ impl Explorer {
             note: None,
             err: None,
             rx,
+            started: Instant::now(),
         });
     }
 
@@ -1958,6 +2170,7 @@ impl Explorer {
     pub fn poll_job(&mut self) -> Option<String> {
         let Some(job) = self.job.as_mut() else { return None };
         let mut finished: Option<String> = None;
+        let mut took = std::time::Duration::ZERO;
         while let Ok(m) = job.rx.try_recv() {
             if job.note.is_none() && job.err.is_none() {
                 job.finish(m);
@@ -1977,9 +2190,11 @@ impl Explorer {
                     }
                 };
                 finished = Some(s);
+                took = job.started.elapsed();
             }
             if let Some(err) = &job.err {
                 finished = Some(format!("{}: {err}", crate::lang::tr("失败", self.lang)));
+                took = job.started.elapsed();
             }
         }
         if let Some(line) = finished {
@@ -1989,7 +2204,13 @@ impl Explorer {
             // cached full/empty glyph is dropped for all of them.
             self.icons.invalidate(&crate::shellicon::Kind::Recycle);
             self.refresh_both();
-            Some(line)
+            // Say how long it ran: a 10-minute copy must not look like an
+            // instant one in the log of what just happened.
+            let took_s = crate::app::human_duration(took, self.lang);
+            Some(format!(
+                "{line} · {}",
+                crate::lang::tr("耗时 %s", self.lang).replace("%s", &took_s)
+            ))
         } else {
             None
         }
@@ -2198,6 +2419,7 @@ fn remove_tree(p: &std::path::Path) -> std::io::Result<()> {
             note: None,
             err: None,
             rx,
+            started: Instant::now(),
         });
         self.empty_open = false;
         self.status = crate::lang::tr("正在清空回收站…", self.lang).into();
@@ -3208,8 +3430,11 @@ fn unique_dest_path(orig: &std::path::Path) -> std::path::PathBuf {
 /// mid-scan: the value is a lower bound and is shown with a `~` prefix. It is
 /// cached all the same, so a folder that blew the budget once is not rescanned
 /// on every visit.
+///
+/// Use this for *passive* scans (browsing). The manual 重新计算大小 action
+/// wants an exact number and uses `scan_dir_size_full` instead — the budget
+/// is exactly what turned a 700 GB folder into `~140 GB` there.
 pub fn scan_dir_size(src: &std::path::Path) -> (u64, bool) {
-    // A file: one metadata read, no scanning involved.
     if !src.is_dir() {
         return (fs::metadata(src).map(|m| m.len()).unwrap_or(0), true);
     }
@@ -3235,6 +3460,31 @@ pub fn scan_dir_size(src: &std::path::Path) -> (u64, bool) {
     (total, true)
 }
 
+/// Full scan: same breadth-first walk, **no** entry-count or time budget.
+///
+/// Only for the explicit 重新计算大小 action, where the user asked for the
+/// real number. A 700 GB folder takes tens of seconds here (I/O bound — there
+/// is no faster way to touch every file), so progress is streamed back over
+/// `prog` as `(root, bytes so far)` after every directory. The total is never
+/// pre-counted: the bytes grow as the walk advances, which is what keeps this
+/// from doing an expensive "count everything first" pass.
+pub fn scan_dir_size_full(src: &std::path::Path, prog: &Sender<(std::path::PathBuf, u64)>) -> u64 {
+    if !src.is_dir() {
+        return fs::metadata(src).map(|m| m.len()).unwrap_or(0);
+    }
+    let mut budget = ScanBudget::unlimited();
+    let mut total: u64 = 0;
+    let mut queue: std::collections::VecDeque<std::path::PathBuf> =
+        std::collections::VecDeque::new();
+    queue.push_back(src.to_path_buf());
+    while let Some(dir) = queue.pop_front() {
+        scan_one_dir(&dir, &mut budget, &mut queue, &mut total);
+        // One clone per directory is noise next to the I/O of reading it.
+        prog.send((src.to_path_buf(), total)).ok();
+    }
+    total
+}
+
 /// Cost ceiling for a single folder scan.
 ///
 /// Without this, opening a folder that contains `node_modules` or a game
@@ -3249,6 +3499,7 @@ struct ScanBudget {
     entries: u32,
     deadline: std::time::Instant,
     exhausted: bool,
+    limited: bool,
 }
 
 impl ScanBudget {
@@ -3257,6 +3508,17 @@ impl ScanBudget {
             entries: 0,
             deadline: std::time::Instant::now() + std::time::Duration::from_millis(SCAN_MAX_MS),
             exhausted: false,
+            limited: true,
+        }
+    }
+
+    /// No ceiling at all — only the manual 重新计算大小 action scans this way.
+    fn unlimited() -> Self {
+        Self {
+            entries: 0,
+            deadline: std::time::Instant::now(),
+            exhausted: false,
+            limited: false,
         }
     }
 
@@ -3264,6 +3526,9 @@ impl ScanBudget {
     fn spend(&mut self) -> bool {
         if self.exhausted {
             return false;
+        }
+        if !self.limited {
+            return true;
         }
         self.entries += 1;
         if self.entries >= SCAN_MAX_ENTRIES {
