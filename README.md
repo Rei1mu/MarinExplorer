@@ -11,6 +11,16 @@
 
 ## 更新日志 / Changelog
 
+### v0.1.11 — 2026-10-25
+- **字体下拉读系统全部字体**：原本只列 8 个写死的字体，现在展开下拉时扫描 `%WINDIR%\Fonts` 下所有 `.ttf/.ttc/.otf/.otc`，用字体名表的真实家族名（按界面语言优先、回退英文）列出本机安装的全部字体，按名称排序。旧版本保存的字体偏好（短键名）会自动迁移成文件名。
+- **默认字号调大**：未手动调过字号时，默认从 `1.0×` 提到 `1.12×`（约 +12%）；字号滑块上限从 `1.6×` 放宽到 `2.0×`，方便继续放大。
+- **驱动器容量文案压缩**：左栏进度条与右侧磁盘详情里的「共 … · 剩 …」改为紧凑的「共…/剩…」（去空格、去中间点），避免文字过长超出范围；`human_size` 不再在数字与单位之间留空格。
+
+**English**
+- **Font picker now lists every system font**: previously it only offered 8 hard-coded faces. Opening the dropdown now scans `%WINDIR%\Fonts` for every `.ttf/.ttc/.otf/.otc`, reads each file's real family name (UI language first, English fallback) and lists all installed fonts sorted by name. Legacy font preferences (short keys) are migrated to file names automatically.
+- **Larger default font size**: when the size has never been changed by hand, the default rises from `1.0×` to `1.12×` (~+12%); the size slider's upper bound is widened from `1.6×` to `2.0×` for even larger text.
+- **Compact drive-capacity text**: the "共 … · 剩 …" labels in the left sidebar bar and the right-side disk panel are now "共…/剩…" (no spaces, no middle dot) so the text no longer overflows; `human_size` no longer puts a space between the number and the unit.
+
 ### v0.1.10 — 2026-10-24
 - **预览 / 查看器不再卡死**：千张图片的文件夹里，网格缩略图不再一次性塞满解码队列。解码改为优先级队列——预览窗格里选中的图、查看器里正在看的大图为 `Urgent` 立即解码，胶片条 ±5 为 `Film`，网格缩略图最低优先且只解码视口内可见的。点图 / 双击立即出图，不再被整文件夹缩略图堵死。
 - **查看器胶片条移到窗口底部**：小预览条之前画在顶部压住大图，现在落到大图下方预留的区域。

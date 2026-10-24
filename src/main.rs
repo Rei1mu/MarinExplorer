@@ -188,13 +188,11 @@ fn main() -> eframe::Result {
         ..Default::default()
     };
 
-    // 中文字体：运行时从 Windows 字体目录加载系统自带字体（微软雅黑优先）。
-    // 不把字体文件打包进 exe（省掉 ~8MB），中文观感也与 Windows 原生 UI 一致。
-    // Honour the persisted "省内存字体" setting on the very first frame: the
-    // font file is the single biggest allocation the app keeps (see
-    // `font_definitions`), so it is worth not loading the large one at all.
-    let small_font = store.meta("small_font").map_or(false, |v| v == "1");
-    let fonts = font_definitions(small_font);
+    // UI 字体：运行时从 Windows 字体目录加载系统自带字体（默认黑体，最小）。
+    // 不把字体文件打包进 exe，中文观感也与 Windows 原生 UI 一致。
+    let boot_lang = crate::lang::Lang::from_id(&store.meta("lang").unwrap_or_default());
+    let ui_font = store.meta("ui_font").unwrap_or(crate::DEFAULT_FONT);
+    let fonts = font_definitions(ui_font, boot_lang);
 
     // The native window handle, grabbed once here: it is what lets us repaint
     // the OS title bar to match the in-app dark theme.
@@ -238,15 +236,47 @@ fn main() -> eframe::Result {
     )
 }
 
-/// egui's own font set plus the CJK face.
+/// Default UI font: the smallest system CJK face. We persist the font **file
+/// name** (e.g. "simhei.ttf") as the stable key so the picker can list every
+/// font Windows ships, not just a hand-picked pool. [`normalize_font_key`]
+/// maps the old short keys (pre-v0.1.11) onto these file names on load.
+pub const DEFAULT_FONT: &str = "simhei.ttf";
+
+/// `%WINDIR%\Fonts` (falls back to `%SystemRoot%\Fonts` then `C:\Windows`).
+fn fonts_dir() -> std::path::PathBuf {
+    let windir = std::env::var("WINDIR")
+        .or_else(|_| std::env::var("SystemRoot"))
+        .unwrap_or_else(|_| "C:\\Windows".to_owned());
+    std::path::PathBuf::from(windir).join("Fonts")
+}
+
+/// Map a (possibly legacy) font key to a concrete file name in `%WINDIR%\Fonts`.
+/// Pre-v0.1.11 the settings stored short keys like "simhei"/"msyh"; those are
+/// migrated here so existing users keep their chosen font.
+pub fn normalize_font_key(key: &str) -> String {
+    match key {
+        "simhei" => "simhei.ttf".to_owned(),
+        "deng" => "Deng.ttf".to_owned(),
+        "kaiti" => "simkai.ttf".to_owned(),
+        "simsun" => "simsun.ttc".to_owned(),
+        "msyh" => "msyh.ttc".to_owned(),
+        "msyhui" => "msyhui.ttc".to_owned(),
+        "yugothic" => "YuGothR.ttc".to_owned(),
+        "msgothic" => "msgothic.ttc".to_owned(),
+        other => other.to_owned(),
+    }
+}
+
+/// Build egui font definitions. The chosen font is placed **first** in each
+/// family so Latin, digits and CJK all share one face — one baseline, so mixed
+/// strings (e.g. "steam分销协议", "共 1.9TB") line up. egui's own Ubuntu
+/// (Latin) and NotoEmoji (emoji) stay in the family as final fallbacks.
 ///
-/// `small` picks the smallest system CJK font instead of the nicest one. The
-/// font file is the single biggest allocation the app keeps: it stays in the
-/// heap for the whole session (see [`font_bytes`] for why it is exactly one
-/// copy — a 19 MB `msyh.ttc` would cost ~38 MB if it were cloned).
-pub fn font_definitions(small: bool) -> egui::FontDefinitions {
+/// When the UI language is Japanese we also append a Japanese-capable system
+/// font so kana never render as boxes.
+pub fn font_definitions(key: &str, lang: crate::lang::Lang) -> egui::FontDefinitions {
     let mut fonts = egui::FontDefinitions::default();
-    if let Some((_name, data)) = load_windows_cjk_font(small) {
+    if let Some(data) = load_cjk_by_key(key) {
         fonts
             .font_data
             .insert("cjk".to_owned(), std::sync::Arc::new(data));
@@ -254,12 +284,29 @@ pub fn font_definitions(small: bool) -> egui::FontDefinitions {
             .families
             .get_mut(&egui::FontFamily::Proportional)
             .unwrap()
-            .push("cjk".to_owned());
+            .insert(0, "cjk".to_owned());
         fonts
             .families
             .get_mut(&egui::FontFamily::Monospace)
             .unwrap()
-            .push("cjk".to_owned());
+            .insert(0, "cjk".to_owned());
+    }
+    if lang == crate::lang::Lang::Ja {
+        if let Some(data) = load_cjk_by_key("YuGothR.ttc").or_else(|| load_cjk_by_key("msgothic.ttc")) {
+            fonts
+                .font_data
+                .insert("jp".to_owned(), std::sync::Arc::new(data));
+            fonts
+                .families
+                .get_mut(&egui::FontFamily::Proportional)
+                .unwrap()
+                .push("jp".to_owned());
+            fonts
+                .families
+                .get_mut(&egui::FontFamily::Monospace)
+                .unwrap()
+                .push("jp".to_owned());
+        }
     }
     fonts
 }
@@ -293,61 +340,109 @@ fn font_bytes(path: &std::path::Path) -> Option<&'static [u8]> {
     Some(bytes)
 }
 
-/// CJK font, loaded at runtime from the Windows font directory — Microsoft YaHei
-/// first (SimHei first when `small`). We deliberately do *not* bundle a font
-/// file: that costs ~8MB of exe size, and the system font also matches the
-/// native Windows look.
-///
-/// egui ships no CJK glyphs at all (only Ubuntu-Light / Hack / NotoEmoji), so
-/// without this every Chinese character renders as an empty box.
-///
-/// epaint *panics* when handed a font file it cannot parse, so every candidate
-/// is validated with `ttf-parser` before it reaches egui; a missing or broken
-/// file simply moves us on to the next candidate. The bytes go through
-/// [`font_bytes`], which keeps the font to a single heap copy.
-fn load_windows_cjk_font(small: bool) -> Option<(&'static str, egui::FontData)> {
-    // (display name, file name inside %WINDIR%\Fonts, face index within a .ttc)
-    // Ordered by looks; the `small` list is ordered by size instead, because a
-    // full CJK face stays in the heap for the whole session.
-    const NICE: &[(&str, &str, u32)] = &[
-        ("Microsoft YaHei", "msyh.ttc", 0),
-        ("Microsoft YaHei UI", "msyhui.ttc", 0),
-        ("DengXian", "Deng.ttf", 0),
-        ("SimHei", "simhei.ttf", 0),
-        ("SimSun", "simsun.ttc", 0),
-    ];
-    const SMALL: &[(&str, &str, u32)] = &[
-        ("SimHei", "simhei.ttf", 0),        // 9.3 MB
-        ("KaiTi", "simkai.ttf", 0),         // 11.2 MB
-        ("Microsoft YaHei Light", "msyhl.ttc", 0), // 11.6 MB
-        ("DengXian", "Deng.ttf", 0),        // 15.6 MB
-        ("Microsoft YaHei", "msyh.ttc", 0), // 18.8 MB — last resort
-    ];
-    let candidates = if small { SMALL } else { NICE };
-
-    let windir = std::env::var("WINDIR")
-        .or_else(|_| std::env::var("SystemRoot"))
-        .unwrap_or_else(|_| "C:\\Windows".to_owned());
-    let dir = std::path::PathBuf::from(windir).join("Fonts");
-
-    for &(name, file, index) in candidates {
-        let path = dir.join(file);
-        let Some(bytes) = font_bytes(&path) else {
-            continue;
-        };
-        if ttf_parser::Face::parse(bytes, index).is_err() {
-            continue;
+/// Every usable font file in `%WINDIR%\Fonts`, for the settings picker.
+/// Enumerates `.ttf/.ttc/.otf/.otc`, reads each file's name table for the real
+/// family name (preferring the UI language, then English), and sorts by that
+/// name. Called lazily — only the first time the font dropdown is opened.
+pub fn available_fonts(lang: crate::lang::Lang) -> Vec<(String, String)> {
+    let dir = fonts_dir();
+    let mut out: Vec<(String, String)> = Vec::new();
+    if let Ok(entries) = std::fs::read_dir(&dir) {
+        for entry in entries.flatten() {
+            let path = entry.path();
+            let is_font = path
+                .extension()
+                .and_then(|e| e.to_str())
+                .map(|e| {
+                    let e = e.to_ascii_lowercase();
+                    e == "ttf" || e == "ttc" || e == "otf" || e == "otc"
+                })
+                .unwrap_or(false);
+            if !is_font {
+                continue;
+            }
+            let filename = match path.file_name().and_then(|f| f.to_str()) {
+                Some(f) => f.to_owned(),
+                None => continue,
+            };
+            let display = font_family_name(&path, lang).unwrap_or_else(|| filename.clone());
+            out.push((filename, display));
         }
-        // `from_static` (not `from_owned`) — see `font_bytes`: this is what
-        // keeps the font at one copy instead of two.
-        let mut data = egui::FontData::from_static(bytes);
-        data.index = index;
-        eprintln!("[font] CJK: {name} ({file})");
-        return Some((name, data));
     }
+    out.sort_by(|a, b| a.1.cmp(&b.1));
+    out
+}
 
-    eprintln!("[font] warning: no Windows CJK font found; Chinese may render as boxes");
-    None
+/// Family name from a font file's name table. Prefers the requested language,
+/// then English, then any available name. Returns `None` if the file can't be
+/// parsed or has no name.
+///
+/// Name IDs: 1 = family, 16 = typographic family. Windows language IDs:
+/// 2052 = Chinese (PRC), 1041 = Japanese, 1033 = English.
+fn font_family_name(path: &std::path::Path, lang: crate::lang::Lang) -> Option<String> {
+    let bytes = std::fs::read(path).ok()?;
+    let want = match lang {
+        crate::lang::Lang::Zh | crate::lang::Lang::ZhTw => 2052u16,
+        crate::lang::Lang::Ja => 1041u16,
+        _ => 1033u16,
+    };
+    let count = ttf_parser::fonts_in_collection(&bytes).unwrap_or(1);
+    let mut fallback: Option<String> = None;
+    for idx in 0..count {
+        let face = match ttf_parser::Face::parse(&bytes, idx) {
+            Ok(f) => f,
+            Err(_) => continue,
+        };
+        for name in face.names() {
+            let is_family = name.name_id == 1 || name.name_id == 16;
+            if !is_family {
+                continue;
+            }
+            if let Some(s) = name.to_string() {
+                if name.language_id == want {
+                    return Some(s);
+                }
+                if name.language_id == 1033 && fallback.is_none() {
+                    fallback = Some(s);
+                }
+            }
+        }
+    }
+    fallback
+}
+
+/// Display name for a font key (the file name). Parsed from the font file so it
+/// matches what the picker shows; falls back to the file name itself.
+pub fn font_display_name(key: &str, lang: crate::lang::Lang) -> String {
+    let fname = normalize_font_key(key);
+    let path = fonts_dir().join(&fname);
+    if let Some(name) = font_family_name(&path, lang) {
+        return name;
+    }
+    fname
+}
+
+/// Load a system font by file name (e.g. "simhei.ttf"). Validates with
+/// `ttf-parser` first (epaint panics on an unparseable file) and keeps the
+/// bytes to a single heap copy via [`font_bytes`]. Face index 0 (the regular
+/// face) is used. Returns `None` if the file is missing or broken.
+///
+/// We deliberately do *not* bundle a font file — that would cost ~8 MB of exe
+/// size, and the system font also matches the native Windows look. egui ships
+/// no CJK glyphs (only Ubuntu-Light / Hack / NotoEmoji), so without this every
+/// Chinese character renders as an empty box.
+fn load_cjk_by_key(key: &str) -> Option<egui::FontData> {
+    let fname = normalize_font_key(key);
+    let path = fonts_dir().join(&fname);
+    let bytes = font_bytes(&path)?;
+    if ttf_parser::Face::parse(bytes, 0).is_err() {
+        return None;
+    }
+    // `from_static` (not `from_owned`) — see `font_bytes`: one heap copy.
+    let mut data = egui::FontData::from_static(bytes);
+    data.index = 0;
+    eprintln!("[font] CJK: {fname}");
+    Some(data)
 }
 
 /// Window / taskbar icon, decoded straight from the multi-size `logo.ico`
@@ -470,12 +565,12 @@ impl eframe::App for Explorer {
         // 次要文字（面板信息栏的"N 项"计数、网格缩略图下方的大小、左栏分组
         // 小标题）一律走 `TextStyle::Body`，与左栏条目主文字同字号，不再用
         // 极小的 `Small`，保证清晰、全界面一致。
-        // "省内存字体" was just toggled: rebuild the font definitions here,
-        // where the egui context exists. Dropping the old set frees the big
-        // font file (both copies of it).
+        // The UI font (or language) changed: rebuild the font definitions here,
+        // where the egui context exists. Dropping the old set frees the font
+        // file (both copies of it).
         if self.reload_font {
             self.reload_font = false;
-            ctx.set_fonts(crate::font_definitions(self.small_font));
+            ctx.set_fonts(crate::font_definitions(&self.ui_font, self.lang));
         }
         self.text_focus = false;
         // Each frame starts fresh: set when the address editor consumes Enter.
@@ -606,7 +701,7 @@ impl eframe::App for Explorer {
                         let fs_label = format!("{:.2}×", self.font_scale);
                         if ui
                             .add(
-                                egui::Slider::new(&mut self.font_scale, 0.8..=1.6)
+                                egui::Slider::new(&mut self.font_scale, 0.8..=2.0)
                                     .step_by(0.05)
                                     .text(fs_label),
                             )
@@ -674,13 +769,49 @@ impl eframe::App for Explorer {
                             }
                         }
                     });
+                    ui.label(t("字体"));
+                    // Custom dropdown: the candidate list is only scanned the
+                    // first time it is opened (`avail_fonts` starts as `None`),
+                    // then cached, so we never touch %WINDIR%\Fonts at startup
+                    // or on every settings frame.
+                    let cur = crate::font_display_name(&self.ui_font, self.lang);
                     if ui
-                        .checkbox(&mut self.small_font, t("省内存字体"))
-                        .on_hover_text(t("改用体积最小的中文字体；完整字体文件会常驻内存两份，换小字体可省约 19MB"))
+                        .selectable_label(self.font_picker_open, format!("▾ {cur}"))
                         .clicked()
                     {
-                        self.set_small_font(self.small_font);
+                        self.font_picker_open = !self.font_picker_open;
                     }
+                    if self.font_picker_open {
+                        // Populate the lazy cache up front, then drop the
+                        // mutable borrow so `set_ui_font` below can run.
+                        if self.avail_fonts.is_none() {
+                            self.avail_fonts = Some(
+                                crate::available_fonts(self.lang)
+                                    .into_iter()
+                                    .map(|(k, d)| (k.to_owned(), d.to_owned()))
+                                    .collect(),
+                            );
+                        }
+                        // Clone the small list into a local so no borrow of
+                        // `self` is held while the loop calls `set_ui_font`.
+                        let items = self.avail_fonts.clone().unwrap_or_default();
+                        ui.indent("font_list", |ui| {
+                            for (k, d) in items.iter() {
+                                if ui
+                                    .selectable_label(
+                                        self.ui_font.as_str() == k.as_str(),
+                                        d,
+                                    )
+                                    .clicked()
+                                    && self.ui_font.as_str() != k.as_str()
+                                {
+                                    self.set_ui_font(k.to_owned());
+                                    self.font_picker_open = false;
+                                }
+                            }
+                        });
+                    }
+                    ui.label(t("选择界面字体；默认黑体体积最小，中英文混排已对齐"));
                     ui.separator();
                     ui.label(t("语言"));
                     // Plain buttons, one per language — a ComboBox nested
@@ -937,7 +1068,7 @@ impl eframe::App for Explorer {
                             .desired_height(24.0)
                             .corner_radius(egui::CornerRadius::same(8))
                             .text(format!(
-                                "{} {} · {} {}",
+                                "{}{}/{}{}",
                                 t("共"),
                                 human_size(d.total),
                                 t("剩"),
@@ -2280,7 +2411,7 @@ impl Explorer {
                                 .text(format!("{} {}%", crate::lang::tr("已用", self.lang), pct)),
                         );
                         ui.label(format!(
-                            "{} {} · {} {} · {} {}",
+                            "{}{}/{}{}/{}{}",
                             crate::lang::tr("共", self.lang),
                             human_size(d.total),
                             crate::lang::tr("已用", self.lang),

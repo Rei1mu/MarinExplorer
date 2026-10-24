@@ -346,16 +346,16 @@ fn lookup(key: &str) -> Option<(&'static str, &'static str, &'static str)> {
         ("设置", "Settings", "設定", "設定"),
         ("深色模式", "Dark mode", "ダークモード", "深色模式"),
         ("语言", "Language", "言語", "語言"),
+        ("字体", "Font", "フォント", "字型"),
+        (
+            "选择界面字体；默认黑体体积最小，中英文混排已对齐",
+            "Choose the UI font; the default SimHei is smallest and keeps mixed CJK/Latin aligned",
+            "UIフォントを選択。既定のSimHeiが最小で、日中混在も揃います",
+            "選擇介面字型；預設黑體體積最小，中英混排已對齊",
+        ),
         ("图标", "Icons", "アイコン", "圖示"),
         ("系统图标", "System icons", "システムアイコン", "系統圖示"),
         ("矢量图标", "Vector icons", "ベクターアイコン", "向量圖示"),
-        ("省内存字体", "Low-memory font", "省メモリフォント", "省記憶體字型"),
-        (
-            "改用体积最小的中文字体；完整字体文件会常驻内存两份，换小字体可省约 19MB",
-            "Use the smallest Chinese font instead: a full font file is kept twice in memory, so the smaller face saves about 19 MB",
-            "最も小さい中国語フォントを使います。フォントファイルはメモリに2つ保持されるため、小さいものに替えると約19MB節約できます",
-            "改用體積最小的中文字型；完整字型檔會常駐記憶體兩份，換小字型可省約 19MB",
-        ),
         ("图标模式已切换", "Icon mode changed", "アイコンモードを変更しました", "圖示模式已切換"),
         ("关闭标签页", "Close tab", "タブを閉じる", "關閉標籤頁"),
         // --- shell integration ---

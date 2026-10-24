@@ -261,13 +261,19 @@ pub struct Explorer {
     /// Icon source: 0 = shell, 1 = built-in vector, 2 = font emoji.
     /// Persisted as `icon_mode`; the two light modes never touch the shell.
     pub icon_mode: u8,
-    /// Use the smallest CJK font available (a full font file stays in the heap
-    /// *twice* — once in the definitions, once inside ab_glyph — so picking a
-    /// 9 MB face instead of a 19 MB one frees ~19 MB). Persisted `small_font`;
-    /// `reload_font` applies the change on the next frame.
-    pub small_font: bool,
-    /// Set when `small_font` changed: `update()` rebuilds the font definitions.
+    /// Selected UI font key — a font file name in `%WINDIR%\Fonts`
+    /// (e.g. "simhei.ttf"). Default `DEFAULT_FONT`.
+    /// `reload_font` applies a change on the next frame, because rebuilding the
+    /// font definitions needs the egui context.
+    pub ui_font: String,
+    /// Set when the UI font (or language) changed: `update()` rebuilds the font definitions.
     pub reload_font: bool,
+    /// Lazy cache of installable system fonts (key, display name). `None` until
+    /// the font dropdown is first opened, so we never scan `%WINDIR%\Fonts`
+    /// unless the user actually reaches for the picker.
+    pub avail_fonts: Option<Vec<(String, String)>>,
+    /// Font dropdown expand state (persists across frames inside the settings popup).
+    pub font_picker_open: bool,
     /// Whether the Explorer context-menu entry ("通过 MarinExplorer 打开")
     /// is registered under `HKCU\Software\Classes`. The value is re-read from
     /// the registry whenever the toggle is used, so it reflects reality even
@@ -416,13 +422,14 @@ impl Explorer {
         let font_scale = store
             .meta("font_scale")
             .and_then(|v| v.parse::<f32>().ok())
-            .unwrap_or(1.0)
-            .clamp(0.8, 1.6);
+            .unwrap_or(1.12)
+            .clamp(0.8, 2.0);
         let icon_mode = store
             .meta("icon_mode")
             .and_then(|v| v.parse::<u8>().ok())
             .unwrap_or(0);
-        let small_font = store.meta("small_font").map_or(false, |v| v == "1");
+        let ui_font =
+            crate::normalize_font_key(store.meta("ui_font").unwrap_or(crate::DEFAULT_FONT));
         let text_dark = Self::meta_color(&store, "text_dark").unwrap_or(egui::Color32::from_gray(240));
         let weak_dark = Self::meta_color(&store, "weak_dark").unwrap_or(egui::Color32::from_gray(170));
         let text_light = Self::meta_color(&store, "text_light").unwrap_or(egui::Color32::from_gray(20));
@@ -509,8 +516,10 @@ impl Explorer {
             applied_dark: None,
             applied_font_scale: -1.0,
             icon_mode,
-            small_font,
+            ui_font,
             reload_font: false,
+            avail_fonts: None,
+            font_picker_open: false,
             ctx_menu,
             last_flush: Instant::now(),
             text_focus: false,
@@ -955,6 +964,12 @@ impl Explorer {
     pub fn set_lang(&mut self, lang: crate::lang::Lang) {
         self.lang = lang;
         self.store.set_meta("lang", lang.id());
+        // The Japanese fallback font depends on the language, so rebuild the
+        // font definitions on the next frame.
+        self.reload_font = true;
+        // The lazy font-list cache was built with the old language's display
+        // names; drop it so the picker re-scans in the new language.
+        self.avail_fonts = None;
         // The context-menu text lives in the registry, written once at install
         // time. Rewrite it so the menu follows the UI language.
         if self.ctx_menu {
@@ -971,7 +986,7 @@ impl Explorer {
 
     /// Set the UI font scale and persist it.
     pub fn set_font_scale(&mut self, scale: f32) {
-        self.font_scale = scale.clamp(0.8, 1.6);
+        self.font_scale = scale.clamp(0.8, 2.0);
         self.store.set_meta("font_scale", &format!("{:.2}", self.font_scale));
     }
 
@@ -986,12 +1001,12 @@ impl Explorer {
         self.status = crate::lang::tr("图标模式已切换", self.lang).into();
     }
 
-    /// Use the smallest CJK font instead of the nicest one. The swap is done
-    /// on the next frame (`reload_font`), because rebuilding the font
-    /// definitions needs the egui context.
-    pub fn set_small_font(&mut self, on: bool) {
-        self.small_font = on;
-        self.store.set_meta("small_font", if on { "1" } else { "0" });
+    /// Switch the UI font and persist it. The swap is done on the next frame
+    /// (`reload_font`), because rebuilding the font definitions needs the egui
+    /// context.
+    pub fn set_ui_font(&mut self, key: String) {
+        self.ui_font = key.clone();
+        self.store.set_meta("ui_font", &key);
         self.reload_font = true;
     }
 

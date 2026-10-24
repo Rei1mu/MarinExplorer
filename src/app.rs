@@ -676,9 +676,9 @@ pub fn human_size(n: u64) -> String {    const UNITS: [&str; 5] = ["B", "KiB", "
         u += 1;
     }
     if u == 0 {
-        format!("{} {}", n, UNITS[0])
+        format!("{}{}", n, UNITS[0])
     } else {
-        format!("{:.1} {}", v, UNITS[u])
+        format!("{:.1}{}", v, UNITS[u])
     }
 }
 
