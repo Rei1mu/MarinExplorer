@@ -1748,7 +1748,7 @@ impl Explorer {
         self.viewer_pan += area_resp.drag_delta();
         }
         // Main image.
-        if let Some(t) = self.previews.get(&vpath, preview::FULL) {
+        if let Some(t) = self.previews.get(&vpath, preview::FULL, preview::Priority::Urgent) {
         let (mut w, mut h) = (t.w as f32, t.h as f32);
         if self.viewer_zoom <= 0.0 {
         let s = (area_w / w).min(area_h / h).min(1.0);
@@ -1813,14 +1813,20 @@ impl Explorer {
         self.weak_color(),
         );
         }
+        // The main image + its interaction area are painted directly onto the
+        // painter (they don't consume layout space), so the cursor is still at
+        // the top. Advance it past the image region now so the filmstrip below
+        // actually lands at the bottom instead of overlapping the top of the
+        // image. The reserved `film_h` slice is exactly what's left.
+        ui.advance_cursor_after_rect(area);
         // Filmstrip: pinned to the very bottom by the vertical flow above.
         // When every thumbnail fits we centre the row; when they would
         // overflow we fall back to a sideways scroll.
         if n_imgs > 1 {
         ui.separator();
         let avail_w = ui.available_width();
-        let start = self.viewer_index.saturating_sub(4);
-        let end = (self.viewer_index + 4).min(n_imgs - 1);
+        let start = self.viewer_index.saturating_sub(5);
+        let end = (self.viewer_index + 5).min(n_imgs - 1);
         let cnt = end.saturating_sub(start) + 1;
         let total = cnt as f32 * 64.0 + (cnt.saturating_sub(1) as f32) * 6.0;
         if total <= avail_w {
@@ -1838,14 +1844,14 @@ impl Explorer {
     }
 
 
-    /// Draw the +/-4 thumbnails of the folder around the current image, in a
+    /// Draw the +/-5 thumbnails of the folder around the current image, in a
     /// single horizontal row. Called inside either a centred `ui.horizontal`
     /// or a sideways `ScrollArea`, so it just lays out 64x64 cells left to
     /// right and does not manage its own scroll.
     fn draw_film_thumbs(&mut self, ui: &mut egui::Ui, n_imgs: usize) {
         ui.spacing_mut().item_spacing.x = 6.0;
         let accent = ui.visuals().selection.bg_fill;
-        for o in -4..=4i32 {
+        for o in -5..=5i32 {
         let i = self.viewer_index as i32 + o;
         if i < 0 || i as usize >= n_imgs {
         continue;
@@ -1857,7 +1863,7 @@ impl Explorer {
         egui::Rect::from_min_size(ui.cursor().min, egui::vec2(64.0, 64.0));
         let resp = ui.allocate_rect(thumb_rect, egui::Sense::click());
         let inner = resp.rect.shrink(4.0);
-        if let Some(t) = self.previews.get(p, preview::THUMB) {
+        if let Some(t) = self.previews.get(p, preview::THUMB, preview::Priority::Film) {
         let ar = t.aspect().max(0.01);
         let mut w = inner.width();
         let mut h = w / ar;
@@ -3168,28 +3174,33 @@ impl Explorer {
                             );
                         } else if crate::preview::is_image(&name) {
                             let mut painted = false;
-                            if let Some(t) = self.previews.get(&path, preview::THUMB) {
-                                let ar = t.aspect().max(0.01);
-                                let mut w = rect.width();
-                                let mut h = w / ar;
-                                if h > rect.height() {
-                                    h = rect.height();
-                                    w = h * ar;
+                            // Only request a thumbnail for on-screen cells; off-
+                            // screen cells in a huge folder must not flood the
+                            // decode queue (they are lowest priority anyway).
+                            if ui.is_rect_visible(rect) {
+                                if let Some(t) = self.previews.get(&path, preview::THUMB, preview::Priority::Grid) {
+                                    let ar = t.aspect().max(0.01);
+                                    let mut w = rect.width();
+                                    let mut h = w / ar;
+                                    if h > rect.height() {
+                                        h = rect.height();
+                                        w = h * ar;
+                                    }
+                                    let dest = egui::Rect::from_center_size(
+                                        rect.center(),
+                                        egui::vec2(w, h),
+                                    );
+                                    ui.painter().image(
+                                        t.tex.id(),
+                                        dest,
+                                        egui::Rect::from_min_max(
+                                            egui::pos2(0.0, 0.0),
+                                            egui::pos2(1.0, 1.0),
+                                        ),
+                                        egui::Color32::WHITE,
+                                    );
+                                    painted = true;
                                 }
-                                let dest = egui::Rect::from_center_size(
-                                    rect.center(),
-                                    egui::vec2(w, h),
-                                );
-                                ui.painter().image(
-                                    t.tex.id(),
-                                    dest,
-                                    egui::Rect::from_min_max(
-                                        egui::pos2(0.0, 0.0),
-                                        egui::pos2(1.0, 1.0),
-                                    ),
-                                    egui::Color32::WHITE,
-                                );
-                                painted = true;
                             }
                             if !painted {
                                 // Thumbnail still decoding: show the shell's own
@@ -3479,7 +3490,7 @@ impl Explorer {
         ui.separator();
 
         if !is_dir && crate::preview::is_image(&name) {
-            if let Some(t) = self.previews.get(&path, preview::PREVIEW) {
+            if let Some(t) = self.previews.get(&path, preview::PREVIEW, preview::Priority::Urgent) {
                 let ar = t.aspect().max(0.01);
                 let mut w = ui.available_width().max(40.0);
                 let mut h = w / ar;

@@ -11,6 +11,14 @@
 
 ## 更新日志 / Changelog
 
+### v0.1.10 — 2026-10-24
+- **预览 / 查看器不再卡死**：千张图片的文件夹里，网格缩略图不再一次性塞满解码队列。解码改为优先级队列——预览窗格里选中的图、查看器里正在看的大图为 `Urgent` 立即解码，胶片条 ±5 为 `Film`，网格缩略图最低优先且只解码视口内可见的。点图 / 双击立即出图，不再被整文件夹缩略图堵死。
+- **查看器胶片条移到窗口底部**：小预览条之前画在顶部压住大图，现在落到大图下方预留的区域。
+
+**English**
+- **Previews / viewer no longer hang**: in a folder with thousands of images the grid no longer floods the decode queue. The decoder is now a priority queue — the image selected in the preview pane and the one shown large in the viewer decode as `Urgent` immediately, the filmstrip ±5 as `Film`, and grid thumbnails are lowest priority and only decode what is visible in the viewport. Clicking or double-clicking shows the image at once instead of being blocked behind the whole folder.
+- **Viewer filmstrip moved to the bottom**: the small-preview strip used to paint on top of the large image; it now sits in the reserved area below it.
+
 ### v0.1.9 — 2026-10-23
 - **修复 v0.1.8 安装失败**：v0.1.8 把 `DefaultGroupName` 误写成路径（`{userprograms}\MarinExplorer`）。管理安装模式下 Inno 会把它拼到 `{commonprograms}` 后面，展开的绝对路径里带冒号，`CreateDirectory` 直接报「文件名称不能包含下列任何字符」导致安装中断。现改为：`DefaultGroupName` 只用纯名称；开始菜单快捷方式在 `[Icons]` 里直写 `{userprograms}`，保证条目留在当前用户的开始菜单（与每用户安装位置一致），不再依赖 `{group}`。
 

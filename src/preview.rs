@@ -10,9 +10,10 @@
 //!   * a side "预览" pane for the selected file,
 //!   * a full-window viewer with fit / 1:1 zoom.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BinaryHeap, HashMap, HashSet};
 use std::path::{Path, PathBuf};
-use std::sync::mpsc::{Receiver, Sender, channel};
+use std::sync::mpsc::{channel, Receiver};
+use std::sync::{Arc, Condvar, Mutex};
 
 /// Extensions we attempt to decode.
 pub const IMAGE_EXTS: &[&str] = &[
@@ -25,6 +26,19 @@ pub const THUMB: u16 = 128;
 pub const PREVIEW: u16 = 720;
 /// Long-edge size for the full-window viewer.
 pub const FULL: u16 = 1600;
+
+/// Decode request priority. Higher sorts first in the worker heap, so the
+/// image the user is actually looking at never waits behind a backlog of
+/// grid thumbnails.
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum Priority {
+    /// Grid thumbnails: a background backlog, lowest priority.
+    Grid,
+    /// Viewer filmstrip (±5 around the current image).
+    Film,
+    /// The image being viewed / the selected file's preview pane: decode now.
+    Urgent,
+}
 
 /// `true` when `name` looks like an image we can preview.
 pub fn is_image(name: &str) -> bool {
@@ -55,6 +69,13 @@ impl Tex {
 type Key = (PathBuf, u16);
 type Reply = (PathBuf, u16, Option<(u32, u32, Vec<u8>)>);
 
+/// Shared decode queue: a max-heap of pending requests, drained by the worker
+/// thread in priority order. `Mutex` + `Condvar` let the worker sleep when
+/// idle and wake on each new request.
+struct DecodeQueue {
+    heap: BinaryHeap<(Priority, std::cmp::Reverse<u64>, PathBuf, u16)>,
+}
+
 /// LRU-ish cache of decoded images, plus the decode worker.
 pub struct Previews {
     map: HashMap<Key, Tex>,
@@ -63,12 +84,19 @@ pub struct Previews {
     pending: HashSet<Key>,
     /// RGBA bytes currently held in `map` (dropped entries give theirs back).
     bytes: usize,
-    req_tx: Sender<(PathBuf, u16)>,
+    /// Monotonic sequence for same-priority FIFO ordering.
+    seq: u64,
+    /// Priority-sorted decode queue shared with the worker thread.
+    queue: Arc<(Mutex<DecodeQueue>, Condvar)>,
     res_rx: Receiver<Reply>,
 }
 
 /// Upper bound on cached textures; oldest entries are dropped beyond this.
 const MAX_CACHE: usize = 96;
+/// Upper bound on in-flight decode requests. Once the queue is this deep we
+/// stop enqueuing new low-priority (grid) thumbnails — a fast scroll can
+/// otherwise pile up thousands. Urgent / Film requests always enqueue.
+const MAX_PENDING: usize = 256;
 /// …plus a byte budget on top of the count: one full-window viewer texture
 /// (1600 px long edge) is ~10 MB of RGBA, so a count-only cap could still
 /// hold ~1 GB once a folder of photos is browsed. Grid thumbnails (128 px)
@@ -79,12 +107,24 @@ const MAX_FILE_BYTES: u64 = 96 * 1024 * 1024;
 
 impl Previews {
     pub fn new() -> Self {
-        let (req_tx, req_rx) = channel::<(PathBuf, u16)>();
         let (res_tx, res_rx) = channel::<Reply>();
+        let queue = Arc::new((Mutex::new(DecodeQueue { heap: BinaryHeap::new() }), Condvar::new()));
+        let qw = queue.clone();
         std::thread::spawn(move || {
-            while let Ok((path, max)) = req_rx.recv() {
+            let (lock, cvar) = &*qw;
+            loop {
+                let (path, max) = {
+                    let mut g = lock.lock().unwrap();
+                    while g.heap.is_empty() {
+                        g = cvar.wait(g).unwrap();
+                    }
+                    let (_p, _s, p, m) = g.heap.pop().unwrap();
+                    (p, m)
+                };
                 let out = decode(&path, max);
-                res_tx.send((path, max, out)).ok();
+                if res_tx.send((path, max, out)).is_err() {
+                    break;
+                }
             }
         });
         Self {
@@ -93,7 +133,8 @@ impl Previews {
             failed: HashSet::new(),
             pending: HashSet::new(),
             bytes: 0,
-            req_tx,
+            seq: 0,
+            queue,
             res_rx,
         }
     }
@@ -151,8 +192,10 @@ impl Previews {
     }
 
     /// Texture for `path` at (at most) `max` pixels on the long edge.
-    /// Returns `None` on the first call (decode is queued) — call again next frame.
-    pub fn get(&mut self, path: &Path, max: u16) -> Option<&Tex> {
+    /// Returns `None` on the first call (decode is queued at `prio`) — call
+    /// again next frame. `Urgent` requests jump ahead of any grid-thumbnail
+    /// backlog, so clicking / double-clicking an image always decodes first.
+    pub fn get(&mut self, path: &Path, max: u16, prio: Priority) -> Option<&Tex> {
         let key = (path.to_path_buf(), max);
         if self.map.contains_key(&key) {
             // touch: move to the back of the eviction order
@@ -165,8 +208,20 @@ impl Previews {
         if self.failed.contains(&key) {
             return None;
         }
-        if self.pending.insert(key) {
-            self.req_tx.send((path.to_path_buf(), max)).ok();
+        if self.pending.insert(key.clone()) {
+            // Bound the background grid backlog: if the queue is already deep,
+            // drop new low-priority grid requests rather than letting a fast
+            // scroll pile up thousands. They simply re-show the shell icon
+            // until the backlog drains. Urgent / Film always enqueue.
+            if prio == Priority::Grid && self.pending.len() > MAX_PENDING {
+                self.pending.remove(&key);
+                return None;
+            }
+            let seq = self.seq;
+            self.seq += 1;
+            let mut g = self.queue.0.lock().unwrap();
+            g.heap.push((prio, std::cmp::Reverse(seq), path.to_path_buf(), max));
+            self.queue.1.notify_one();
         }
         None
     }
