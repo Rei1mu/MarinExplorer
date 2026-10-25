@@ -11,6 +11,14 @@
 
 ## 更新日志 / Changelog
 
+### v0.1.12 — 2026-10-25
+- **列表 / 网格视图虚拟化**：超大文件夹（如 5 万条图片+视频）不再逐帧重排全部条目。每帧只布局视口内可见行（屏外行只占位、不建单元格、不解析图标），每帧工作量从 O(5万) 降到 O(约 50 行)。拖动窗口、整体响应、以及打开查看器后的所有操作都恢复流畅。
+- **双击打开不再整目录重读**：查看器的图片列表直接复用面板已加载的 `entries`，不再每次 `read_dir` 重新扫整目录。双击打开从几百 ms 降到近乎即时。
+
+**English**
+- **Virtualized list / grid views**: very large folders (e.g. 50k images + videos) no longer re-layout every entry each frame. Each frame now lays out only the rows visible in the viewport (off-screen rows are placeholders — no cells, no icon resolution), dropping per-frame work from O(50k) to O(~50 rows). Dragging the window, general responsiveness, and every action inside the opened viewer are smooth again.
+- **Double-click no longer re-reads the whole directory**: the viewer's image list reuses the panel's already-loaded `entries` instead of `read_dir`'ing the folder on every open. Double-click open goes from hundreds of ms to near-instant.
+
 ### v0.1.11 — 2026-10-25
 - **字体下拉读系统全部字体**：原本只列 8 个写死的字体，现在展开下拉时扫描 `%WINDIR%\Fonts` 下所有 `.ttf/.ttc/.otf/.otc`，用字体名表的真实家族名（按界面语言优先、回退英文）列出本机安装的全部字体，按名称排序。旧版本保存的字体偏好（短键名）会自动迁移成文件名。
 - **默认字号调大**：未手动调过字号时，默认从 `1.0×` 提到 `1.12×`（约 +12%）；字号滑块上限从 `1.6×` 放宽到 `2.0×`，方便继续放大。

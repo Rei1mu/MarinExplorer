@@ -2932,18 +2932,10 @@ impl Explorer {
         }
         let entries = std::mem::take(&mut get_panel(self, is_left).entries);
 
-        // Native (full-colour) icons, resolved before the loop: the borrow of
-        // `self.icons` must not overlap the `&mut self` work done per row.
+        // Icons are resolved per visible row inside the loop (below), not for
+        // all `vis.len()` rows up front — a 50k-entry folder must not pay 50k
+        // shell/COM lookups every single frame.
         let emoji_mode = self.icons.mode() == shellicon::IconMode::Emoji;
-        let ctx = ui.ctx().clone();
-        let texs: Vec<Option<egui::TextureId>> = vis
-            .iter()
-            .map(|&i| {
-                let e = &entries[i];
-                self.icons
-                    .get(&ctx, shellicon::Kind::for_entry(e.is_dir, &e.ext))
-            })
-            .collect();
 
         egui::ScrollArea::vertical()
             .id_salt(if is_left { "filelist_left" } else { "filelist_right" })
@@ -2960,105 +2952,123 @@ impl Explorer {
                         weak(ui, crate::lang::tr("空目录", self.lang));
                     }
                 }
-                for (k, &i) in vis.iter().enumerate() {
-                    let e = &entries[i];
-                    let name = e.name.clone();
-                    let is_dir = e.is_dir;
-                    // Highlight comes from `multi` alone: a Ctrl+clicked-off
-                    // focus row keeps `selected` (preview, Enter) but shows no
-                    // highlight, exactly like Explorer.
-                    let is_sel = get_panel(self, is_left).multi.contains(&name);
-                    let tex = texs[k];
-                    // "" unless the emoji mode is on: then every row wears a
-                    // font glyph instead of a shell texture.
-                    let emoji = if emoji_mode {
-                        emoji_for(is_dir, &e.ext)
-                    } else {
-                        ""
-                    };
-                    // Per-row text is cached by `(index, size, est)`: re-reading
-                    // `entries` on the worker replaces them, and a size result
-                    // mid-scan bumps `e.size` so the row refreshes. The cache is
-                    // cleared wholesale on nav / language / width change above.
-                    let (size_txt, type_txt, mtime_txt, ctime_txt): (&str, &str, &str, &str) = {
-                        let key = (i, e.size, e.size_est as u8);
-                        let lang = self.lang;
-                        let mtime_w = cols.time;
-                        let ctime_w = cols.date;
-                        let fmt = get_panel(self, is_left)
-                            .fmt_cache
-                            .entry(key)
-                            .or_insert_with(|| {
-                                let size_txt = if is_dir {
-                                    if e.size_known {
-                                        human_size_est(e.size, e.size_est)
-                                    } else {
-                                        "…".to_string()
-                                    }
-                                } else {
-                                    human_size(e.size)
-                                };
-                                let type_txt = e.type_label(lang);
-                                let mtime_txt = col_datetime(e.mtime, mtime_w);
-                                let ctime_txt = col_datetime(e.ctime, ctime_w);
-                                (size_txt, type_txt, mtime_txt, ctime_txt)
-                            });
-                        (fmt.0.as_str(), fmt.1.as_str(), fmt.2.as_str(), fmt.3.as_str())
-                    };
-                    let fill = if is_sel {
-                        ui.visuals().selection.bg_fill
-                    } else {
-                        egui::Color32::TRANSPARENT
-                    };
-
-                    let row = egui::Frame::NONE.fill(fill).show(ui, |ui| {
-                        ui.horizontal(|ui| {
-                            name_cell(
-                                ui,
-                                cols.name,
-                                name.clone(),
-                                if is_dir { IconKind::Folder } else { IconKind::File },
-                                tex,
-                                emoji,
-                            );
-                            table_cell(ui, cols.ty, true, type_txt);
-                            table_cell(ui, cols.size, true, size_txt);
-                            table_cell(ui, cols.time, true, mtime_txt);
-                            table_cell(ui, cols.date, false, ctime_txt);
-                        });
-                    });
-                    let resp = row.response.interact(egui::Sense::click());
-                    let resp = resp.on_hover_cursor(egui::CursorIcon::PointingHand);
-
-                    // Double-click must win over single-click: test it first,
-                    // otherwise every double-click also fires `clicked()` and
-                    // only ever selects (the old bug — folders never opened).
-                    if resp.double_clicked() {
-                        self.open_row(is_left, &name, is_dir);
-                        ui.ctx().request_repaint();
-                    } else if resp.clicked() {
-                        // Explorer-style modifier clicks: Ctrl toggles one row,
-                        // Shift extends from the anchor, a plain click starts
-                        // a fresh single selection.
-                        let (ctrl, shift) = ui.input(|i| (i.modifiers.ctrl, i.modifiers.shift));
-                        let vis_names: Vec<String> =
-                            vis.iter().map(|&j| entries[j].name.clone()).collect();
-                        self.set_active_pane(is_left);
-                        get_panel(self, is_left).click_select(&name, ctrl, shift, &vis_names);
-                        // Clicking a file row must hand the keyboard back to
-                        // the pane too (same fix as the background click above):
-                        // otherwise the always-present filter box keeps egui
-                        // focus and Ctrl+C / Ctrl+V / Delete stay suppressed.
-                        if let Some(id) = ui.memory(|m| m.focused()) {
-                            ui.memory_mut(|m| m.surrender_focus(id));
-                        }
+                for &i in vis.iter() {
+                    // Reserve exactly one row of space for every entry so the
+                    // scrollbar length stays correct, but only actually build
+                    // the (expensive) Frame + cells + shell icon when the row
+                    // is on screen. This is what keeps a 50k-file folder from
+                    // freezing the whole window every frame.
+                    let (row_rect, _) =
+                        ui.allocate_exact_size(egui::vec2(ui.available_width(), ROW_H), egui::Sense::hover());
+                    if !ui.is_rect_visible(row_rect) {
+                        continue;
                     }
+                    let mut row_ui = ui.new_child(
+                        egui::UiBuilder::new()
+                            .max_rect(row_rect)
+                            .layout(egui::Layout::top_down(egui::Align::LEFT)),
+                    );
+                    let ui = &mut row_ui;
+                        let e = &entries[i];
+                        let name = e.name.clone();
+                        let is_dir = e.is_dir;
+                        let is_sel = get_panel(self, is_left).multi.contains(&name);
+                        // Icon resolved lazily, only for this visible row.
+                        let tex = self
+                            .icons
+                            .get(&ui.ctx().clone(), shellicon::Kind::for_entry(e.is_dir, &e.ext));
+                        // "" unless the emoji mode is on: then every row wears a
+                        // font glyph instead of a shell texture.
+                        let emoji = if emoji_mode {
+                            emoji_for(is_dir, &e.ext)
+                        } else {
+                            ""
+                        };
+                        // Per-row text is cached by `(index, size, est)`: re-reading
+                        // `entries` on the worker replaces them, and a size result
+                        // mid-scan bumps `e.size` so the row refreshes. The cache is
+                        // cleared wholesale on nav / language / width change above.
+                        let (size_txt, type_txt, mtime_txt, ctime_txt): (&str, &str, &str, &str) = {
+                            let key = (i, e.size, e.size_est as u8);
+                            let lang = self.lang;
+                            let mtime_w = cols.time;
+                            let ctime_w = cols.date;
+                            let fmt = get_panel(self, is_left)
+                                .fmt_cache
+                                .entry(key)
+                                .or_insert_with(|| {
+                                    let size_txt = if is_dir {
+                                        if e.size_known {
+                                            human_size_est(e.size, e.size_est)
+                                        } else {
+                                            "…".to_string()
+                                        }
+                                    } else {
+                                        human_size(e.size)
+                                    };
+                                    let type_txt = e.type_label(lang);
+                                    let mtime_txt = col_datetime(e.mtime, mtime_w);
+                                    let ctime_txt = col_datetime(e.ctime, ctime_w);
+                                    (size_txt, type_txt, mtime_txt, ctime_txt)
+                                });
+                            (fmt.0.as_str(), fmt.1.as_str(), fmt.2.as_str(), fmt.3.as_str())
+                        };
+                        let fill = if is_sel {
+                            ui.visuals().selection.bg_fill
+                        } else {
+                            egui::Color32::TRANSPARENT
+                        };
 
-                    let path = get_panel(self, is_left).cwd.join(&name);
-                    let _ = resp.context_menu(|ui| {
-                        self.set_selection(is_left, &name);
-                        self.file_context_menu(ui, &name, is_dir, &path);
-                    });
+                        let row = egui::Frame::NONE.fill(fill).show(ui, |ui| {
+                            ui.horizontal(|ui| {
+                                name_cell(
+                                    ui,
+                                    cols.name,
+                                    name.clone(),
+                                    if is_dir { IconKind::Folder } else { IconKind::File },
+                                    tex,
+                                    emoji,
+                                );
+                                table_cell(ui, cols.ty, true, type_txt);
+                                table_cell(ui, cols.size, true, size_txt);
+                                table_cell(ui, cols.time, true, mtime_txt);
+                                table_cell(ui, cols.date, false, ctime_txt);
+                            });
+                        });
+                        let resp = row.response.interact(egui::Sense::click());
+                        let resp = resp.on_hover_cursor(egui::CursorIcon::PointingHand);
+
+                        // Double-click must win over single-click: test it first,
+                        // otherwise every double-click also fires `clicked()` and
+                        // only ever selects (the old bug — folders never opened).
+                        if resp.double_clicked() {
+                            self.open_row(is_left, &name, is_dir, &entries);
+                            ui.ctx().request_repaint();
+                        } else if resp.clicked() {
+                            // Explorer-style modifier clicks: Ctrl toggles one row,
+                            // Shift extends from the anchor, a plain click starts
+                            // a fresh single selection.
+                            let (ctrl, shift) =
+                                ui.input(|i| (i.modifiers.ctrl, i.modifiers.shift));
+                            let vis_names: Vec<String> =
+                                vis.iter().map(|&j| entries[j].name.clone()).collect();
+                            self.set_active_pane(is_left);
+                            get_panel(self, is_left)
+                                .click_select(&name, ctrl, shift, &vis_names);
+                            // Clicking a file row must hand the keyboard back to
+                            // the pane too (same fix as the background click above):
+                            // otherwise the always-present filter box keeps egui
+                            // focus and Ctrl+C / Ctrl+V / Delete stay suppressed.
+                            if let Some(id) = ui.memory(|m| m.focused()) {
+                                ui.memory_mut(|m| m.surrender_focus(id));
+                            }
+                        }
+
+                        let path = get_panel(self, is_left).cwd.join(&name);
+                        let _ = resp.context_menu(|ui| {
+                            self.set_selection(is_left, &name);
+                            self.file_context_menu(ui, &name, is_dir, &path);
+                        });
                 }
                 self.pane_bg_menu(ui, is_left, None);
             });
@@ -3220,14 +3230,17 @@ impl Explorer {
         let entries = std::mem::take(&mut get_panel(self, is_left).entries);
         let sp = ui.spacing().item_spacing.x;
         let cols = (((ui.available_width() + sp) / (CELL_W + sp)).floor() as usize).max(1);
-        // Visible names in display order — Shift+click ranges follow what the
-        // user sees, not the raw listing.
-        let vis_names: Vec<String> = vis.iter().map(|&j| entries[j].name.clone()).collect();
+        // Row height is fixed (`CELL_H`), so off-screen rows are skipped
+        // entirely: a huge folder no longer builds 50k cells (and pays 50k
+        // shell icon lookups) every frame. `vis_names` is no longer built up
+        // front — `grid_cell` assembles it only when a row is actually clicked.
+        let row_w = (cols as f32) * (CELL_W + sp) - sp;
 
         egui::ScrollArea::vertical()
             .id_salt(if is_left { "grid_left" } else { "grid_right" })
             .auto_shrink([false, false])
             .show(ui, |ui| {
+                ui.spacing_mut().item_spacing.x = sp;
                 if vis.is_empty() {
                     if loading {
                         weak(ui, crate::lang::tr("加载中…", self.lang));
@@ -3238,13 +3251,27 @@ impl Explorer {
                 let mut start = 0usize;
                 while start < vis.len() {
                     let end = (start + cols).min(vis.len());
-                    ui.horizontal(|ui| {
-                        for &i in &vis[start..end] {
-                            let e = &entries[i];
-                            let is_sel = get_panel(self, is_left).multi.contains(&e.name);
-                            self.grid_cell(ui, is_left, e, is_sel, &vis_names, i);
-                        }
-                    });
+                    // Reserve the row; skip building its cells when it is
+                    // scrolled out of view.
+                    let (row_rect, _) =
+                        ui.allocate_exact_size(egui::vec2(row_w, CELL_H), egui::Sense::hover());
+                    if !ui.is_rect_visible(row_rect) {
+                        start = end;
+                        continue;
+                    }
+                    let mut row_ui = ui.new_child(
+                        egui::UiBuilder::new()
+                            .max_rect(row_rect)
+                            .layout(egui::Layout::top_down(egui::Align::LEFT)),
+                    );
+                    let ui = &mut row_ui;
+                        ui.horizontal(|ui| {
+                            for &i in &vis[start..end] {
+                                let e = &entries[i];
+                                let is_sel = get_panel(self, is_left).multi.contains(&e.name);
+                                self.grid_cell(ui, is_left, e, is_sel, &entries, &vis, i);
+                            }
+                        });
                     start = end;
                 }
                 self.pane_bg_menu(ui, is_left, None);
@@ -3258,7 +3285,8 @@ impl Explorer {
         is_left: bool,
         e: &app::Entry,
         is_sel: bool,
-        vis_names: &[String],
+        entries: &[app::Entry],
+        vis: &[usize],
         idx: usize,
     ) {
         let name = e.name.clone();
@@ -3414,12 +3442,15 @@ impl Explorer {
         let resp = cell.response.interact(egui::Sense::click());
         let resp = resp.on_hover_cursor(egui::CursorIcon::PointingHand);
         if resp.double_clicked() {
-            self.open_row(is_left, &name, is_dir);
+            self.open_row(is_left, &name, is_dir, entries);
         } else if resp.clicked() {
             // Same modifier rules as the list view (Ctrl / Shift / plain).
             let (ctrl, shift) = ui.input(|i| (i.modifiers.ctrl, i.modifiers.shift));
             self.set_active_pane(is_left);
-            get_panel(self, is_left).click_select(&name, ctrl, shift, vis_names);
+            // Build the visible-name list only now (on click), not every frame.
+            let vis_names: Vec<String> =
+                vis.iter().map(|&j| entries[j].name.clone()).collect();
+            get_panel(self, is_left).click_select(&name, ctrl, shift, &vis_names);
             // Hand the keyboard back to the pane: the filter box must not keep
             // egui focus after a row click, or the Ctrl+C / Ctrl+V / Delete
             // shortcuts are suppressed (see the list view for the same fix).
@@ -3436,14 +3467,14 @@ impl Explorer {
     // ---------------- shared bits ----------------
 
     /// Double-click / Enter on a row.
-    fn open_row(&mut self, is_left: bool, name: &str, is_dir: bool) {
+    fn open_row(&mut self, is_left: bool, name: &str, is_dir: bool, listing: &[app::Entry]) {
         self.set_active_pane(is_left);
         let path = get_panel(self, is_left).cwd.join(name);
         if is_dir {
             get_panel(self, is_left).navigate(path);
             self.apply_cached_sizes();
         } else if crate::preview::is_image(name) {
-            self.open_viewer(path);
+            self.open_viewer(listing, path);
         } else {
             fs_util::open_default_file(&path);
         }
@@ -3639,7 +3670,9 @@ impl Explorer {
                 ui.ctx().request_repaint();
             }
             if ui.button(crate::lang::tr("放大查看", self.lang)).clicked() {
-                self.open_viewer(path.clone());
+                // No in-memory listing handy here; fall back to a directory read
+                // (only this one folder, and only on an explicit button press).
+                self.open_viewer(&[], path.clone());
             }
         } else if is_dir {
             weak(ui, crate::lang::tr("文件夹没有内置预览，双击可进入。", self.lang));

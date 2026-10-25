@@ -2745,27 +2745,37 @@ fn remove_tree(p: &std::path::Path) -> std::io::Result<()> {
 
     /// Open the built-in image viewer for `path`, building the list of every
     /// image in the active panel so ← / → can walk through them.
-    pub fn open_viewer(&mut self, path: PathBuf) {
-        // NB: the image list must come from a live directory read, *not* from
-        // `panel.entries`. Double-clicks happen inside `render_list` /
-        // `render_grid`, which `mem::take` the listing for the duration of
-        // the frame — so `entries` is empty right here and the viewer used to
-        // open with a single-image list (no arrows, no filmstrip, ←/→ dead).
-        // Reading the directory also makes the list independent of the
-        // current sort, filter and view mode: it is always every image in the
-        // folder.
+    /// Open the built-in image viewer for `path`. The image list is built from
+    /// `listing` (the panel's already-loaded entries) when it is available, so
+    /// opening a picture in a 50k-file folder does not re-read the whole
+    /// directory. Falls back to a live `read_dir` only when `listing` is empty
+    /// (e.g. the listing is still loading).
+    pub fn open_viewer(&mut self, listing: &[crate::app::Entry], path: PathBuf) {
         let dir = path.parent().map(|p| p.to_path_buf()).unwrap_or_default();
         let mut list: Vec<PathBuf> = Vec::new();
-        if let Ok(rd) = fs::read_dir(&dir) {
-            for e in rd.flatten() {
-                let p = e.path();
-                let is_file = e.file_type().map(|t| t.is_file()).unwrap_or(false);
-                if !is_file {
+        if listing.is_empty() {
+            // Fallback: read the directory fresh.
+            if let Ok(rd) = fs::read_dir(&dir) {
+                for e in rd.flatten() {
+                    let p = e.path();
+                    let is_file = e.file_type().map(|t| t.is_file()).unwrap_or(false);
+                    if !is_file {
+                        continue;
+                    }
+                    let name = e.file_name().to_string_lossy().into_owned();
+                    if crate::preview::is_image(&name) {
+                        list.push(p);
+                    }
+                }
+            }
+        } else {
+            // Reuse the in-memory listing — avoids 50k disk stat calls.
+            for e in listing {
+                if e.is_dir {
                     continue;
                 }
-                let name = e.file_name().to_string_lossy().into_owned();
-                if crate::preview::is_image(&name) {
-                    list.push(p);
+                if crate::preview::is_image(&e.name) {
+                    list.push(dir.join(&e.name));
                 }
             }
         }
@@ -3044,7 +3054,7 @@ fn remove_tree(p: &std::path::Path) -> std::io::Result<()> {
             ui.close_menu();
         }
         if is_img && ui.button(crate::lang::tr("预览图片", self.lang)).clicked() {
-            self.open_viewer(path.clone());
+            self.open_viewer(&[], path.clone());
             ui.close_menu();
         }
         if ui.button(crate::lang::tr("在资源管理器中显示", self.lang)).clicked() {
