@@ -393,6 +393,32 @@ fn lookup(key: &str) -> Option<(&'static str, &'static str, &'static str)> {
         ("图片", "Pictures", "ピクチャ", "圖片"),
         ("音乐", "Music", "ミュージック", "音樂"),
         ("视频", "Videos", "ビデオ", "影片"),
+        ("播放", "Play", "再生", "播放"),
+        ("暂停", "Pause", "一時停止", "暫停"),
+        ("播放视频", "Play video", "ビデオを再生", "播放影片"),
+        ("正在准备视频…", "Preparing video…", "ビデオを準備中…", "正在準備影片…"),
+        ("正在准备 GIF…", "Preparing GIF…", "GIFを準備中…", "正在準備 GIF…"),
+        ("视频文件，点击在查看器中播放", "Video file — open the viewer to play", "ビデオファイル — ビューアで再生", "影片檔案，點擊在檢視器中播放"),
+        ("无法解码此视频（格式不受 Media Foundation 支持，如 MKV/WebM/FLV，或 HEVC/H.265 等需额外解码器的编码）", "Cannot decode this video (format not supported by Media Foundation, e.g. MKV/WebM/FLV, or HEVC/H.265 requiring an extra decoder)", "このビデオはデコードできません（Media Foundation 非対応形式、例: MKV/WebM/FLV、または追加デコーダー要の HEVC/H.265）", "無法解碼此影片（Media Foundation 不支援的格式，如 MKV/WebM/FLV，或需額外解碼器的 HEVC/H.265）"),
+        // --- viewer slideshow ---
+        ("循环播放", "Loop", "ループ再生", "循環播放"),
+        ("自动下一页", "Auto next", "自動で次へ", "自動下一頁"),
+        (" 秒", " s", " 秒", " 秒"),
+        // --- viewer sound ---
+        ("静音", "Mute", "ミュート", "靜音"),
+        ("取消静音", "Unmute", "ミュート解除", "取消靜音"),
+        ("声音", "Sound", "音声", "聲音"),
+        // --- viewer performance ---
+        ("性能", "Performance", "パフォーマンス", "效能"),
+        ("小（最低开销）", "Low (least overhead)", "小（最低負荷）", "小（最低開銷）"),
+        ("中（均衡）", "Medium (balanced)", "中（標準）", "中（均衡）"),
+        ("大（最流畅）", "High (smoothest)", "大（最滑らか）", "大（最流暢）"),
+        (
+            "全局：缩略图解码 · 文件夹大小扫描 · 重绘频率",
+            "Global: thumbnail decode · folder-size scan · repaint rate",
+            "全体：サムネイル展開 · フォルダサイズ走査 · 再描画頻度",
+            "全域：縮圖解碼 · 資料夾大小掃描 · 重繪頻率",
+        ),
     ];
     t.iter()
         .find(|(k, _, _, _)| *k == key)

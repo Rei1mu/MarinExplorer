@@ -1,6 +1,6 @@
 [package]
 name = "MarinExplorer"
-version = "0.1.12"
+version = "0.1.13"
 edition = "2021"
 description = "A lightweight Windows two-pane file manager (x86_64 + ARM64), built with Rust + egui"
 build = "build.rs"
@@ -31,6 +31,16 @@ png = "0.18"
 # resolves to the same version. Used to *validate* a font file before handing
 # it to egui — epaint panics on an unparseable font, so we pre-check instead.
 ttf-parser = "0.25"
+# Windows Media Foundation — used to decode video frames (poster + playback)
+# for the built-in viewer. Ships with Windows, so no extra binary is shipped.
+# Only the Media Foundation + COM surface is pulled in.
+windows = { version = "0.52", features = [
+    "Win32_Foundation",
+    "Win32_System_Com",
+    "Win32_System_Com_StructuredStorage",
+    "Win32_System_Variant",
+    "Win32_Media_MediaFoundation",
+] }
 
 [profile.release]
 opt-level = "z"      # optimize for size

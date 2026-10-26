@@ -23,9 +23,11 @@ mod cache;
 mod convert;
 mod explorer;
 mod fs_util;
+mod gif;
 mod icons;
 mod lang;
 mod preview;
+mod video;
 mod quickaccess;
 mod shell;
 mod shellicon;
@@ -82,6 +84,34 @@ struct Cols {
 // ---- grid geometry (thumbnail view) ----
 const CELL_W: f32 = 108.0;
 const CELL_H: f32 = 134.0;
+/// Max cached grid video thumbnails (LRU; oldest evicted first).
+const THUMB_VIDEO_CACHE: usize = 48;
+/// Max concurrent grid video-poster decodes (each is a worker thread).
+const THUMB_VIDEO_INFLIGHT: usize = 4;
+/// Longest side of a playback frame. Full-size 1080p RGBA costs ~8 MB per
+/// frame to convert, copy and upload; scaling in the worker keeps playback
+/// cheap. Raise only if clips look soft on a large display.
+const PLAY_MAX_DIM: u32 = 1024;
+
+/// A background video-poster decode job. `rx` yields exactly one result
+/// (`None` = undecodable, e.g. MKV without a third-party decoder).
+pub struct VideoJob {
+    pub path: std::path::PathBuf,
+    pub rx: std::sync::mpsc::Receiver<Option<(u32, u32, Vec<u8>)>>,
+    pub kind: VideoJobKind,
+}
+
+/// Which surface a poster is decoded for — decides the size cap and the cache
+/// the finished texture lands in.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum VideoJobKind {
+    /// Poster for the open viewer (largest, ~1280 px).
+    Viewer,
+    /// Poster for the side preview pane (~640 px).
+    Side,
+    /// Thumbnail for the grid view (~256 px).
+    Thumb,
+}
 
 fn main() -> eframe::Result {
     // ---- single instance -------------------------------------------------
@@ -575,6 +605,18 @@ impl eframe::App for Explorer {
         self.text_focus = false;
         // Each frame starts fresh: set when the address editor consumes Enter.
         self.enter_consumed = false;
+        // ----- video poster jobs / playback pacing -----
+        // Poster jobs and playback advance on background threads, so the UI
+        // must keep painting while any is in flight (bounded: only while
+        // something is actually pending, never an unconditional repaint).
+        self.poll_video_jobs(ctx);
+        let perf_ms = self.perf_repaint_ms();
+        if !self.video_jobs.is_empty() {
+            ctx.request_repaint_after(std::time::Duration::from_millis(perf_ms));
+        }
+        if self.video_playing {
+            ctx.request_repaint_after(std::time::Duration::from_millis(perf_ms));
+        }
         // ----- drain background channels -----
         let mut sizes_arrived = false;
         // Full-scan progress first: draining it before the results means the
@@ -670,7 +712,15 @@ impl eframe::App for Explorer {
         // 400ms, each opens its own tab.
         self.poll_inbox_throttled();
         self.maybe_flush();
+        // 小 perf mode: no new grid thumbnail decodes (cached ones still show).
+        self.previews.set_allow_grid(self.viewer_perf != 0);
         self.previews.poll(ctx);
+        // A decode lands on a background thread and produces no input event,
+        // so without this the freshly decoded picture would sit in the cache
+        // until the user happened to move the mouse.
+        if self.previews.busy() {
+            ctx.request_repaint_after(std::time::Duration::from_millis(perf_ms));
+        }
 
         // ----- top toolbar -----
         egui::TopBottomPanel::top("toolbar").show(ctx, |ui| {
@@ -828,6 +878,35 @@ impl eframe::App for Explorer {
                             }
                         }
                     });
+                    ui.separator();
+                    ui.label(t("性能"));
+                    // Direct hit targets (like the language row) — a ComboBox
+                    // nested here swallowed clicks. This is the *global* CPU
+                    // dial: it scales grid thumbnail decoding, folder-size
+                    // scanning, side-pane poster decoding and the main window's
+                    // repaint cadence — the viewer's playback pacing too.
+                    ui.horizontal_wrapped(|ui| {
+                        let opts: [(u8, &str); 3] = [
+                            (0, &t("小（最低开销）")),
+                            (1, &t("中（均衡）")),
+                            (2, &t("大（最流畅）")),
+                        ];
+                        for (v, name) in opts {
+                            if ui
+                                .selectable_label(self.viewer_perf == v, name)
+                                .clicked()
+                                && self.viewer_perf != v
+                            {
+                                self.viewer_perf = v;
+                                self.persist_viewer_opts();
+                            }
+                        }
+                    });
+                    ui.label(
+                        egui::RichText::new(t("全局：缩略图解码 · 文件夹大小扫描 · 重绘频率"))
+                            .small()
+                            .weak(),
+                    );
                 });
                 if icons::button(ui, &icons::BACK, &t("后退"), can_back, "").clicked() {
                     self.active_panel().back();
@@ -1520,6 +1599,7 @@ impl eframe::App for Explorer {
                         .show(vctx, |ui| self.viewer_body(ui, &vpath, n_imgs));
                     if !open {
                         self.viewer = None;
+                        self.reset_video_state();
                     }
                     return;
                 }
@@ -1531,9 +1611,45 @@ impl eframe::App for Explorer {
                     || vctx.input(|i| i.key_pressed(egui::Key::Escape))
                 {
                     self.viewer = None;
+                    self.reset_video_state();
                 }
                 egui::CentralPanel::default()
                     .show(vctx, |ui| self.viewer_body(ui, &vpath, n_imgs));
+                // This OS window has its own repaint schedule: the main
+                // window's request never reaches it, and the decode finishing
+                // in the background raises no input event. Without this the
+                // viewer would sit on "加载中…" until the mouse moved.
+                // GIF playback is driven here too: its clip decodes on a
+                // worker thread and the control bar must keep repainting to
+                // pick the result up and advance frames.
+                //
+                // CRUCIAL: the viewport stops processing input the moment it
+                // stops repainting. A paused clip (video_playing == false,
+                // gif_playing == false) would otherwise ignore its own
+                // play/pause click and feel "stuck". So we ALWAYS request a
+                // repaint while the viewer is open — fast while something is
+                // animating, slow-but-alive otherwise.
+                let animating = self.video_playing
+                    || self.gif_playing
+                    || self.previews.busy()
+                    || !self.video_jobs.is_empty()
+                    || self.gif_rx.is_some()
+                    || self.side_gif_rx.is_some();
+                // Perf mode sets the baseline repaint cadence while a clip plays.
+                // 小 = 50 ms (lowest overhead), 中 = 33 ms, 大 = 16 ms (smoothest).
+                // Media code (e.g. GIF) overrides this with a precise per-frame
+                // hint so we only wake when the next frame is actually due.
+                let anim_base: u64 = match self.viewer_perf {
+                    0 => 50,
+                    2 => 16,
+                    _ => 33,
+                };
+                let ms = if animating {
+                    self.repaint_hint_ms.unwrap_or(anim_base)
+                } else {
+                    200
+                };
+                vctx.request_repaint_after(std::time::Duration::from_millis(ms));
                 // Dialogs reached from the viewer's right-click menu show up
                 // in *this* window — the main window may sit behind it.
                 if self.convert.is_some() {
@@ -1691,10 +1807,15 @@ impl eframe::App for Explorer {
             !self.status.is_empty() && self.status_at.elapsed() < Duration::from_secs(8);
         // Only repaint while something actually changes. Unconditional
         // repainting keeps egui in continuous mode and burns a whole core on
-        // an idle window; when there *is* a reason, 10 fps is plenty for a
-        // progress bar or a status highlight.
+        // an idle window. Perf mode scales the polling cadence: even when
+        // something is in flight, 小 polls slower (fewer wakeups), 大 faster.
         if self.needs_repaint() {
-            ctx.request_repaint_after(Duration::from_millis(100));
+            let ms = match self.viewer_perf {
+                0 => 200, // 小: 5 wakeups/s while a scan job runs
+                2 => 60,  // 大: ~16 wakeups/s, snappier progress
+                _ => 100, // 中: 10 fps is plenty for a progress bar
+            };
+            ctx.request_repaint_after(Duration::from_millis(ms));
         }
     }
 }
@@ -1763,6 +1884,27 @@ impl Explorer {
         });
     }
 
+    // ----- performance baseline -----
+
+    /// Repaint cadence (ms) for the main window while background work is in
+    /// flight: thumbnail decodes, folder-size scans, side-pane posters. This is
+    /// the global throttle behind the 小 / 中 / 大 setting — it governs the
+    /// whole file manager, not just the viewer:
+    ///   小 (0) = 120 ms  → fewest wakeups, lowest CPU (icons instead of grid
+    ///                       thumbnails, lighter folder-size scans)
+    ///   中 (1) = 60 ms   → balanced (default)
+    ///   大 (2) = 30 ms   → smooth, most work per second
+    ///
+    /// Media in the viewer viewport keeps its own precise per-frame hint; this
+    /// only bounds *polling* while something is decoding in the background.
+    pub fn perf_repaint_ms(&self) -> u64 {
+        match self.viewer_perf {
+            0 => 120,
+            2 => 30,
+            _ => 60,
+        }
+    }
+
     // ----- image conversion dialog (ICO / PNG) -----
 
     /// Window shell for the convert dialog. The state is taken out of
@@ -1774,94 +1916,35 @@ impl Explorer {
     /// the viewer's own OS window (a viewport `CentralPanel`) or a plain
     /// in-app `Window` on backends without multi-window support.
     fn viewer_body(&mut self, ui: &mut egui::Ui, vpath: &std::path::Path, n_imgs: usize) {
-        ui.horizontal_wrapped(|ui| {
-        // Greyed out when the folder has a single image: the
-        // buttons must not look alive and do nothing.
-        ui.add_enabled_ui(n_imgs > 1, |ui| {
-        if icons::small_button(ui, &icons::CHEV_LEFT, &crate::lang::tr("上一张", self.lang)).clicked() {
-        self.viewer_nav(-1);
+        // Reset the per-frame repaint hint; media code re-sets it if it has a
+        // precise wake time (GIF). Video leaves it None and the viewport falls
+        // back to the perf-mode base cadence.
+        self.repaint_hint_ms = None;
+        // One viewer for both media kinds: stills and clips share the toolbar,
+        // the prev / next navigation and the filmstrip; only the content area
+        // differs (decoded picture vs. video surface).
+        if self.is_video_viewer(vpath) {
+            self.viewer_toolbar(ui, vpath, n_imgs, true);
+            ui.separator();
+            self.viewer_key_nav(ui, n_imgs);
+            self.render_video_surface(ui, vpath, n_imgs);
+            if n_imgs > 1 {
+                self.viewer_filmstrip(ui, n_imgs);
+            }
+            return;
         }
-        if icons::small_button(ui, &icons::CHEV_RIGHT, &crate::lang::tr("下一张", self.lang)).clicked() {
-        self.viewer_nav(1);
-        }
-        });
+        self.viewer_toolbar(ui, vpath, n_imgs, false);
         ui.separator();
-        if ui.button(crate::lang::tr("适应窗口", self.lang)).clicked() {
-        self.viewer_zoom = 0.0;
-        self.viewer_pan = egui::Vec2::ZERO;
-        }
-        if ui.button("1:1").clicked() {
-        self.viewer_zoom = 1.0;
-        self.viewer_pan = egui::Vec2::ZERO;
-        }
-        if icons::small_button(ui, &icons::ZOOM_IN, &crate::lang::tr("放大", self.lang)).clicked() {
-        let z = if self.viewer_zoom <= 0.0 { 1.0 } else { self.viewer_zoom };
-        self.viewer_zoom = (z * 1.25).min(8.0);
-        self.viewer_pan = egui::Vec2::ZERO;
-        }
-        if icons::small_button(ui, &icons::ZOOM_OUT, &crate::lang::tr("缩小", self.lang)).clicked() {
-        let z = if self.viewer_zoom <= 0.0 { 1.0 } else { self.viewer_zoom };
-        self.viewer_zoom = (z / 1.25).max(0.05);
-        self.viewer_pan = egui::Vec2::ZERO;
-        }
-        ui.separator();
-        if ui.button(crate::lang::tr("用默认程序打开", self.lang)).clicked() {
-        fs_util::open_default_file(&vpath);
-        }
-        if ui.button(crate::lang::tr("在资源管理器中显示", self.lang)).clicked() {
-        fs_util::reveal_in_explorer(&vpath);
-        }
-        ui.separator();
-        if self.viewer_zoom <= 0.0 {
-        weak(ui, crate::lang::tr("缩放: 适应窗口", self.lang));
-        } else {
-        weak(
-        ui,
-        format!(
-        "{} {:.0}%",
-        crate::lang::tr("缩放", self.lang),
-        self.viewer_zoom * 100.0
-        ),
-        );
-        }
-        if n_imgs > 1 {
-        weak(ui, format!("({}/{})", self.viewer_index + 1, n_imgs));
-        }
-        });
-        ui.separator();
-        // Arrow keys step through the images. The viewer lives in its own
-        // OS window now, so these events arrive on the viewport's context.
-        if n_imgs > 1 {
-        let nav = ui.input(|i| {
-        if i.key_pressed(egui::Key::ArrowLeft) {
-        Some(-1)
-        } else if i.key_pressed(egui::Key::ArrowRight) {
-        Some(1)
-        } else {
-        None
-        }
-        });
-        if let Some(d) = nav {
-        self.viewer_nav(d);
-        }
-        }
-        // Mouse wheel steps through the images (one step per notch).
-        let wheel_dy = ui.input(|i| i.raw_scroll_delta.y);
-        if wheel_dy.abs() > 0.01 && n_imgs > 1 {
-        let ok = self
-        .viewer_wheel_at
-        .map(|t| t.elapsed().as_millis() >= 100)
-        .unwrap_or(true);
-        if ok {
-        self.viewer_wheel_at = Some(std::time::Instant::now());
-        self.viewer_nav(if wheel_dy > 0.0 { 1 } else { -1 });
-        }
-        }
+        self.viewer_key_nav(ui, n_imgs);
+        // A GIF shows a play/pause + frame-scrubber bar below the picture, so
+        // reserve its height up front or the bar gets pushed off-screen.
+        let is_gif = self.is_gif_viewer(vpath);
         // Main image: centred in the space left above the filmstrip, drag to
         // pan when zoomed, and left/right overlay arrows at the window edges.
         let film_h = if n_imgs > 1 { 84.0 } else { 0.0 };
+        let gifbar_h = if is_gif { 26.0 } else { 0.0 };
         let area_w = ui.available_width().max(40.0);
-        let area_h = (ui.available_height() - film_h).max(60.0);
+        let area_h = (ui.available_height() - film_h - gifbar_h).max(60.0);
         let area = egui::Rect::from_min_size(
         ui.cursor().min,
         egui::vec2(area_w, area_h),
@@ -1878,8 +1961,97 @@ impl Explorer {
         if area_resp.dragged() {
         self.viewer_pan += area_resp.drag_delta();
         }
-        // Main image.
-        if let Some(t) = self.previews.get(&vpath, preview::FULL, preview::Priority::Urgent) {
+        // ---- animated GIF? ----
+        // A GIF is decoded as a whole clip (background thread) and animated
+        // frame by frame here; everything else goes through the still path.
+        if is_gif {
+            self.ensure_gif_clip(vpath);
+            let mut landed: Option<(std::path::PathBuf, Option<crate::gif::GifClip>)> = None;
+            let mut disconnected = false;
+            if let Some((p, rx)) = self.gif_rx.as_ref() {
+                match rx.try_recv() {
+                    Ok(clip) => landed = Some((p.clone(), clip)),
+                    Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                        // Worker panicked (or file vanished): never hangs.
+                        disconnected = true;
+                    }
+                    Err(std::sync::mpsc::TryRecvError::Empty) => {}
+                }
+            }
+            if let Some((p, clip)) = landed {
+                self.gif_rx = None;
+                match clip {
+                    Some(c) => {
+                        self.gif_clip = Some((p, c));
+                        self.gif_idx = 0;
+                        self.gif_due = None;
+                        self.gif_playing = true;
+                    }
+                    None => {
+                        self.gif_failed.insert(p);
+                    }
+                }
+            } else if disconnected {
+                if let Some((p, _)) = self.gif_rx.take() {
+                    self.gif_failed.insert(p);
+                }
+            }
+            // GIF: animate and show the play/pause + scrubber bar. The bar is
+            // drawn on every frame (even while the clip is still decoding) so
+            // the user always sees controls instead of a silent static image.
+            if self.gif_clip.is_none() {
+                // Clip still decoding: show the cached first frame at once
+                // (poster, like a video) instead of a blank "准备中" screen.
+                self.paint_gif_poster_still(ui, area, vpath);
+            }
+            let gif_finished = self.step_gif(ui, area);
+            self.viewer_edge_arrows(ui, area, &vpath, n_imgs);
+            // Centre play/pause badge — mirrors the video viewer. Clicking it
+            // toggles the animation; it shows ⏸ while playing and ▶ when
+            // Centre click toggles play/pause (like the video surface) but we
+            // draw no button — the user wanted the visible badge gone, yet
+            // clicking the middle should still pause/resume. An invisible
+            // interaction over the centre handles that.
+            if self.gif_clip.is_some() {
+                let badge =
+                    egui::Rect::from_center_size(area.center(), egui::vec2(96.0, 96.0));
+                let badge_resp = ui.interact(
+                    badge,
+                    egui::Id::new("gif_center_badge"),
+                    egui::Sense::click(),
+                );
+                if badge_resp.clicked() {
+                    self.gif_playing = !self.gif_playing;
+                    self.viewer_play_on = self.gif_playing;
+                    if self.gif_playing {
+                        self.gif_due = None;
+                    }
+                }
+            }
+            ui.advance_cursor_after_rect(area);
+            self.gif_play_controls(ui, n_imgs);
+            if n_imgs > 1 {
+                self.viewer_filmstrip(ui, n_imgs);
+            }
+            if gif_finished && self.viewer_auto_next && n_imgs > 1 {
+                self.viewer_nav(1);
+            }
+            return;
+        } else if self.gif_clip.is_some() || self.gif_rx.is_some() {
+            // Left a GIF behind: free the frames.
+            self.reset_gif_state();
+        }
+
+        // Main image. While the full-size decode is still running, any smaller
+        // size already in the cache (the grid thumbnail, usually) is stretched
+        // into place first, so stepping through a folder never shows a blank
+        // frame. `ready` says whether what we painted is the real thing.
+        let weak_col = self.weak_color();
+        let loading_txt = crate::lang::tr("加载中…", self.lang);
+        let (tex, ready) = self
+            .previews
+            .get_or_smaller(&vpath, preview::FULL, preview::Priority::Urgent);
+        if let Some(t) = tex {
         let (mut w, mut h) = (t.w as f32, t.h as f32);
         if self.viewer_zoom <= 0.0 {
         let s = (area_w / w).min(area_h / h).min(1.0);
@@ -1900,48 +2072,25 @@ impl Explorer {
         // after the image so, on a pointer-hit tie, the arrow wins over the
         // drag area underneath it. A dark translucent pill keeps the glyph
         // readable over any photo.
-        if n_imgs > 1 {
-        let pill = egui::vec2(34.0, 54.0);
-        for (side, delta) in [(-1.0f32, -1isize), (1.0, 1)] {
-        let glyph = if side < 0.0 {
-        &icons::CHEV_LEFT
-        } else {
-        &icons::CHEV_RIGHT
-        };
-        let cx = if side < 0.0 {
-        area.min.x + 6.0
-        } else {
-        area.max.x - pill.x - 6.0
-        };
-        let brect = egui::Rect::from_center_size(
-        egui::pos2(cx + pill.x * 0.5, area.center().y),
-        pill,
-        );
-        let r = ui.interact(
-        brect,
-        egui::Id::new(("viewer_arrow", side < 0.0)),
-        egui::Sense::click(),
-        );
-        if r.clicked() {
-        self.viewer_nav(delta);
-        }
-        let _ = r.context_menu(|ui| self.viewer_context_menu(ui, &vpath));
-        ui.painter().rect_filled(
-        brect,
-        egui::CornerRadius { nw: 6, ne: 6, se: 6, sw: 6 },
-        egui::Color32::from_black_alpha(90),
-        );
-        let col = ui.visuals().text_color();
-        icons::paint(ui.painter(), glyph.0, brect.shrink(9.0), col, 2.0);
-        }
+        self.viewer_edge_arrows(ui, area, &vpath, n_imgs);
+        if !ready {
+            // A smaller cached size is on screen; say so while the sharp one
+            // decodes instead of pretending this is final.
+            ui.painter().text(
+                area.left_bottom() + egui::vec2(10.0, -10.0),
+                egui::Align2::LEFT_BOTTOM,
+                &loading_txt,
+                egui::FontId::proportional(13.0),
+                weak_col,
+            );
         }
         } else {
         ui.painter().text(
         area.center(),
         egui::Align2::CENTER_CENTER,
-        "加载中…",
+        &loading_txt,
         egui::FontId::proportional(18.0),
-        self.weak_color(),
+        weak_col,
         );
         }
         // The main image + its interaction area are painted directly onto the
@@ -1950,10 +2099,223 @@ impl Explorer {
         // actually lands at the bottom instead of overlapping the top of the
         // image. The reserved `film_h` slice is exactly what's left.
         ui.advance_cursor_after_rect(area);
-        // Filmstrip: pinned to the very bottom by the vertical flow above.
-        // When every thumbnail fits we centre the row; when they would
-        // overflow we fall back to a sideways scroll.
         if n_imgs > 1 {
+            self.viewer_filmstrip(ui, n_imgs);
+        }
+        // 自动下一页 on a still: hold it for `viewer_slide_secs`, then step on.
+        if self.tick_slide(vpath, n_imgs) {
+            self.viewer_nav(1);
+        } else if self.viewer_auto_next && n_imgs > 1 {
+            // Wake up in time to make the step, without repainting at full
+            // frame rate for the whole wait.
+            let left = self
+                .slide_at
+                .map(|t| t.elapsed().as_secs())
+                .map(|e| self.viewer_slide_secs.max(1) as u64 - e)
+                .unwrap_or(1);
+            ui.ctx()
+                .request_repaint_after(std::time::Duration::from_millis(left.min(500) * 1000));
+        }
+    }
+
+
+    /// Toolbar shared by both media kinds: prev / next, the per-kind controls
+    /// (zoom for images, play-pause for clips), the file actions and the
+    /// position inside the folder.
+    fn viewer_toolbar(
+        &mut self,
+        ui: &mut egui::Ui,
+        vpath: &std::path::Path,
+        n_imgs: usize,
+        is_video: bool,
+    ) {
+        ui.horizontal_wrapped(|ui| {
+            // Greyed out when the folder holds a single item: the buttons must
+            // not look alive and do nothing.
+            ui.add_enabled_ui(n_imgs > 1, |ui| {
+                if icons::small_button(ui, &icons::CHEV_LEFT, &crate::lang::tr("上一张", self.lang))
+                    .clicked()
+                {
+                    self.viewer_nav(-1);
+                }
+                if icons::small_button(ui, &icons::CHEV_RIGHT, &crate::lang::tr("下一张", self.lang))
+                    .clicked()
+                {
+                    self.viewer_nav(1);
+                }
+            });
+            ui.separator();
+            if is_video {
+                self.video_play_controls(ui, vpath);
+            } else {
+                self.image_zoom_controls(ui);
+            }
+            ui.separator();
+            if ui.button(crate::lang::tr("用默认程序打开", self.lang)).clicked() {
+                fs_util::open_default_file(&vpath);
+            }
+            if ui.button(crate::lang::tr("在资源管理器中显示", self.lang)).clicked() {
+                fs_util::reveal_in_explorer(&vpath);
+            }
+            ui.separator();
+            // Slideshow options, shared by stills and clips and remembered
+            // across restarts (written to the store the moment they change).
+            let mut lp = self.viewer_loop;
+            if ui
+                .checkbox(&mut lp, crate::lang::tr("循环播放", self.lang))
+                .changed()
+            {
+                self.viewer_loop = lp;
+                self.persist_viewer_opts();
+            }
+            let mut an = self.viewer_auto_next;
+            if ui
+                .checkbox(&mut an, crate::lang::tr("自动下一页", self.lang))
+                .changed()
+            {
+                self.viewer_auto_next = an;
+                self.persist_viewer_opts();
+            }
+            if self.viewer_auto_next {
+                let mut secs = self.viewer_slide_secs as i32;
+                if ui
+                    .add(
+                        egui::DragValue::new(&mut secs)
+                            .range(1..=3600)
+                            .suffix(crate::lang::tr(" 秒", self.lang)),
+                    )
+                    .changed()
+                {
+                    self.viewer_slide_secs = secs.clamp(1, 3600) as u32;
+                    self.persist_viewer_opts();
+                }
+            }
+            ui.separator();
+            if n_imgs > 1 {
+                weak(ui, format!("({}/{})", self.viewer_index + 1, n_imgs));
+            }
+        });
+    }
+
+    /// Zoom buttons plus the current-zoom readout (still images only).
+    fn image_zoom_controls(&mut self, ui: &mut egui::Ui) {
+        if ui.button(crate::lang::tr("适应窗口", self.lang)).clicked() {
+            self.viewer_zoom = 0.0;
+            self.viewer_pan = egui::Vec2::ZERO;
+        }
+        if ui.button("1:1").clicked() {
+            self.viewer_zoom = 1.0;
+            self.viewer_pan = egui::Vec2::ZERO;
+        }
+        if icons::small_button(ui, &icons::ZOOM_IN, &crate::lang::tr("放大", self.lang)).clicked() {
+            let z = if self.viewer_zoom <= 0.0 { 1.0 } else { self.viewer_zoom };
+            self.viewer_zoom = (z * 1.25).min(8.0);
+            self.viewer_pan = egui::Vec2::ZERO;
+        }
+        if icons::small_button(ui, &icons::ZOOM_OUT, &crate::lang::tr("缩小", self.lang)).clicked() {
+            let z = if self.viewer_zoom <= 0.0 { 1.0 } else { self.viewer_zoom };
+            self.viewer_zoom = (z / 1.25).max(0.05);
+            self.viewer_pan = egui::Vec2::ZERO;
+        }
+        if self.viewer_zoom <= 0.0 {
+            weak(ui, crate::lang::tr("缩放: 适应窗口", self.lang));
+        } else {
+            weak(
+                ui,
+                format!(
+                    "{} {:.0}%",
+                    crate::lang::tr("缩放", self.lang),
+                    self.viewer_zoom * 100.0
+                ),
+            );
+        }
+    }
+
+    /// Arrow keys and the mouse wheel step through the folder, for images and
+    /// clips alike. One step per wheel notch (throttled to 100 ms).
+    fn viewer_key_nav(&mut self, ui: &mut egui::Ui, n_imgs: usize) {
+        if n_imgs <= 1 {
+            return;
+        }
+        // The viewer lives in its own OS window, so these events arrive on the
+        // viewport's context.
+        let nav = ui.input(|i| {
+            if i.key_pressed(egui::Key::ArrowLeft) {
+                Some(-1)
+            } else if i.key_pressed(egui::Key::ArrowRight) {
+                Some(1)
+            } else {
+                None
+            }
+        });
+        if let Some(d) = nav {
+            self.viewer_nav(d);
+        }
+        let wheel_dy = ui.input(|i| i.raw_scroll_delta.y);
+        if wheel_dy.abs() > 0.01 {
+            let ok = self
+                .viewer_wheel_at
+                .map(|t| t.elapsed().as_millis() >= 100)
+                .unwrap_or(true);
+            if ok {
+                self.viewer_wheel_at = Some(std::time::Instant::now());
+                self.viewer_nav(if wheel_dy > 0.0 { 1 } else { -1 });
+            }
+        }
+    }
+
+    /// Prev / next pills pinned to the left and right edges of the content
+    /// area. Allocated after the picture so, on a pointer-hit tie, the arrow
+    /// wins over the surface underneath it.
+    fn viewer_edge_arrows(
+        &mut self,
+        ui: &mut egui::Ui,
+        area: egui::Rect,
+        vpath: &std::path::Path,
+        n_imgs: usize,
+    ) {
+        if n_imgs <= 1 {
+            return;
+        }
+        let pill = egui::vec2(34.0, 54.0);
+        for (side, delta) in [(-1.0f32, -1isize), (1.0, 1)] {
+            let glyph = if side < 0.0 {
+                &icons::CHEV_LEFT
+            } else {
+                &icons::CHEV_RIGHT
+            };
+            let cx = if side < 0.0 {
+                area.min.x + 6.0
+            } else {
+                area.max.x - pill.x - 6.0
+            };
+            let brect = egui::Rect::from_center_size(
+                egui::pos2(cx + pill.x * 0.5, area.center().y),
+                pill,
+            );
+            let r = ui.interact(
+                brect,
+                egui::Id::new(("viewer_arrow", side < 0.0)),
+                egui::Sense::click(),
+            );
+            if r.clicked() {
+                self.viewer_nav(delta);
+            }
+            let _ = r.context_menu(|ui| self.viewer_context_menu(ui, vpath));
+            ui.painter().rect_filled(
+                brect,
+                egui::CornerRadius { nw: 6, ne: 6, se: 6, sw: 6 },
+                egui::Color32::from_black_alpha(90),
+            );
+            let col = ui.visuals().text_color();
+            icons::paint(ui.painter(), glyph.0, brect.shrink(9.0), col, 2.0);
+        }
+    }
+
+    /// Filmstrip: pinned to the very bottom by the vertical flow above. When
+    /// every thumbnail fits we centre the row; when they would overflow we fall
+    /// back to a sideways scroll.
+    fn viewer_filmstrip(&mut self, ui: &mut egui::Ui, n_imgs: usize) {
         ui.separator();
         let avail_w = ui.available_width();
         let start = self.viewer_index.saturating_sub(5);
@@ -1961,16 +2323,755 @@ impl Explorer {
         let cnt = end.saturating_sub(start) + 1;
         let total = cnt as f32 * 64.0 + (cnt.saturating_sub(1) as f32) * 6.0;
         if total <= avail_w {
-        ui.horizontal(|ui| {
-        ui.add_space((avail_w - total) / 2.0);
-        self.draw_film_thumbs(ui, n_imgs);
-        });
+            ui.horizontal(|ui| {
+                ui.add_space((avail_w - total) / 2.0);
+                self.draw_film_thumbs(ui, n_imgs);
+            });
         } else {
-        egui::ScrollArea::horizontal()
-        .id_salt("filmstrip")
-        .auto_shrink([false, true])
-        .show(ui, |ui| self.draw_film_thumbs(ui, n_imgs));
+            egui::ScrollArea::horizontal()
+                .id_salt("filmstrip")
+                .auto_shrink([false, true])
+                .show(ui, |ui| self.draw_film_thumbs(ui, n_imgs));
         }
+    }
+
+    /// `true` when the viewer's current file is a video. Caches the decision per
+    /// path and resets all per-clip video state whenever the clip changes.
+    fn is_video_viewer(&mut self, vpath: &std::path::Path) -> bool {
+        if self.viewer_kind_path.as_deref() != Some(vpath) {
+            let name = vpath
+                .file_name()
+                .map(|n| n.to_string_lossy().into_owned())
+                .unwrap_or_default();
+            self.viewer_is_video = crate::preview::is_video(&name, vpath);
+            self.viewer_is_gif = crate::preview::is_gif(&name, vpath);
+            self.viewer_kind_path = Some(vpath.to_path_buf());
+            // New clip: drop any in-flight worker, cached frames and playback
+            // state. A failed poster decode is simply absent — the job is gone,
+            // so nothing retries it until the clip is reopened.
+            self.reset_video_state();
+            // …and whatever the previous file animated: GIF frames and the
+            // slide timer both belong to the file we just left.
+            self.reset_gif_state();
+            if self.viewer_is_video {
+                self.spawn_video_job(vpath, VideoJobKind::Viewer);
+            }
+        }
+        self.viewer_is_video
+    }
+
+    /// `true` when the viewer's current file is an animated GIF. Shares the
+    /// per-path cache in [`Self::is_video_viewer`], which must run first.
+    fn is_gif_viewer(&mut self, vpath: &std::path::Path) -> bool {
+        let _ = self.is_video_viewer(vpath);
+        self.viewer_is_gif
+    }
+
+    /// Drop all per-clip video state (worker, textures, playback position).
+    fn reset_video_state(&mut self) {
+        self.video_playing = false;
+        self.video_playback = None;
+        self.video_poster = None;
+        self.video_frame = None;
+        self.video_pos_ns = 0;
+        self.video_dur_ns = None;
+        self.video_eos = false;
+        self.video_seek_frac = None;
+    }
+
+    /// Drop the decoded GIF for the file we just left. Called whenever the
+    /// viewer moves to another file (or closes).
+    fn reset_gif_state(&mut self) {
+        self.gif_rx = None;
+        self.gif_clip = None;
+        self.gif_idx = 0;
+        self.gif_due = None;
+        self.gif_playing = true;
+        self.gif_tex = None;
+        self.gif_painted_idx = usize::MAX;
+        self.repaint_hint_ms = None;
+        self.slide_path = None;
+        self.slide_at = None;
+    }
+
+    /// Make sure a whole-clip GIF decode is running for `vpath` (once), and
+    /// pick it up when it lands.
+    fn ensure_gif_clip(&mut self, vpath: &std::path::Path) {
+        let clip_current = self.gif_clip.as_ref().map(|(p, _)| p.as_path()) == Some(vpath);
+        if clip_current {
+            return;
+        }
+        let job_current = self.gif_rx.as_ref().map(|(p, _)| p.as_path()) == Some(vpath);
+        // Only clear when the in-flight / cached clip belongs to a *different*
+        // file. While the same file is still decoding we must NOT reset it on
+        // every repaint, or the worker would be killed before it finishes and
+        // the viewer would hang on "正在准备 GIF…".
+        if !job_current {
+            self.reset_gif_state();
+        }
+        if self.gif_failed.contains(vpath) || self.gif_rx.is_some() {
+            return;
+        }
+        let (tx, rx) = std::sync::mpsc::channel();
+        let path = vpath.to_path_buf();
+        std::thread::spawn(move || {
+            let clip = crate::gif::decode(&path);
+            let _ = tx.send(clip);
+        });
+        self.gif_rx = Some((vpath.to_path_buf(), rx));
+    }
+
+    /// Draw the current GIF frame into `area`, fitted, using one reused
+    /// texture (a new `TextureHandle` per frame would leak GPU memory).
+    fn paint_gif(&mut self, ui: &mut egui::Ui, area: egui::Rect) {
+        let Some((_, clip)) = self.gif_clip.as_ref() else {
+            return;
+        };
+        let Some(frame) = clip.frames.get(self.gif_idx) else {
+            return;
+        };
+        // Upload to the GPU only when the visible frame index changed (or the
+        // texture was dropped for a new clip). Re-painting the same frame is a
+        // cheap texture blit; the old code rebuilt a ~1 MB RGBA buffer and
+        // re-uploaded it every frame, which is what burned CPU.
+        if self.gif_painted_idx != self.gif_idx || self.gif_tex.is_none() {
+            let img = egui::ColorImage::from_rgba_unmultiplied(
+                [clip.w as usize, clip.h as usize],
+                &frame.rgba,
+            );
+            match self.gif_tex.as_mut() {
+                Some(t) => t.set(img, egui::TextureOptions::LINEAR),
+                None => {
+                    self.gif_tex = Some(
+                        ui.ctx()
+                            .load_texture("gif:frame", img, egui::TextureOptions::LINEAR),
+                    );
+                }
+            }
+            self.gif_painted_idx = self.gif_idx;
+        }
+        let Some(tex) = self.gif_tex.as_ref() else {
+            return;
+        };
+        let ar = (clip.w as f32 / clip.h as f32).max(0.01);
+        let mut w = area.width();
+        let mut h = w / ar;
+        if h > area.height() {
+            h = area.height();
+            w = h * ar;
+        }
+        let dest = egui::Rect::from_center_size(area.center(), egui::vec2(w, h));
+        ui.painter().image(
+            tex.id(),
+            dest,
+            egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)),
+            egui::Color32::WHITE,
+        );
+    }
+
+    /// While the full clip is still decoding, show the already-cached still
+    /// first frame (the grid thumbnail is usually present) so the viewer feels
+    /// instant — exactly like a video poster — instead of sitting on a blank
+    /// "正在准备 GIF…" for the ~1.7 s the whole 121-frame decode takes.
+    fn paint_gif_poster_still(&mut self, ui: &mut egui::Ui, area: egui::Rect, vpath: &std::path::Path) {
+        let (tex, _ready) = self
+            .previews
+            .get_or_smaller(vpath, preview::FULL, preview::Priority::Urgent);
+        let Some(t) = tex else {
+            return;
+        };
+        let (mut w, mut h) = (t.w as f32, t.h as f32);
+        let s = (area.width() / w).min(area.height() / h).min(1.0);
+        w *= s;
+        h *= s;
+        let dest = egui::Rect::from_center_size(area.center(), egui::vec2(w, h));
+        ui.painter().image(
+            t.tex.id(),
+            dest,
+            egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)),
+            egui::Color32::WHITE,
+        );
+    }
+
+    /// Advance the GIF frame when its time is up and repaint it. Returns `true`
+    /// once a full pass has finished — the caller turns that into 循环播放
+    /// (already handled here) or 自动下一页.
+    fn step_gif(&mut self, ui: &mut egui::Ui, area: egui::Rect) -> bool {
+        let n = self.gif_clip.as_ref().map(|(_, c)| c.frames.len()).unwrap_or(0);
+        if n == 0 {
+            return false;
+        }
+        // Paused: hold the current frame, never advance, never finish. The
+        // viewport falls back to its 200 ms idle repaint, which keeps input
+        // (the play button) alive without burning CPU.
+        if !self.gif_playing {
+            self.repaint_hint_ms = None;
+            self.paint_gif(ui, area);
+            return false;
+        }
+        let now = std::time::Instant::now();
+        if let Some(due) = self.gif_due {
+            if now < due {
+                // Wait for the next frame: hold the current one on screen and
+                // wake exactly when it is due — no 60 fps redraws in between.
+                let remaining = (due - now).as_millis() as u64;
+                self.repaint_hint_ms = Some(remaining.max(8));
+                self.paint_gif(ui, area);
+                return false;
+            }
+        }
+        // 循环播放 wins over 自动下一页: looping restarts from frame 0 and
+        // never reports "finished", so it stays put instead of paging on.
+        let looping = self.viewer_loop;
+        if self.gif_idx + 1 >= n {
+            if looping {
+                self.gif_idx = 0;
+            } else if self.gif_idx == n - 1 {
+                // Parked on the last frame: keep showing it, no timer.
+                self.gif_due = None;
+                self.repaint_hint_ms = None;
+                self.paint_gif(ui, area);
+                return true;
+            } else {
+                self.gif_idx = n - 1;
+            }
+        } else {
+            self.gif_idx += 1;
+        }
+        let delay = self
+            .gif_clip
+            .as_ref()
+            .and_then(|(_, c)| c.frames.get(self.gif_idx))
+            .map(|f| f.delay_ms)
+            .unwrap_or(100);
+        self.gif_due = Some(now + std::time::Duration::from_millis(delay as u64));
+        // Wake when this frame's delay elapses — the next step_gif advances it.
+        self.repaint_hint_ms = Some((delay as u64).max(8));
+        self.paint_gif(ui, area);
+        false
+    }
+
+    /// Play / pause toggle plus a frame scrubber for the current GIF, drawn in
+    /// the viewer's bottom bar (mirrors the video seek bar). Pausing holds the
+    /// current frame; the scrubber jumps to any frame and resumes from there.
+    fn gif_play_controls(&mut self, ui: &mut egui::Ui, n_imgs: usize) {
+        let n = self.gif_clip.as_ref().map(|(_, c)| c.frames.len()).unwrap_or(0);
+        ui.horizontal(|ui| {
+            // While the clip is still decoding there is no play state yet: say
+            // so instead of showing a blank bar.
+            if n == 0 {
+                weak(ui, crate::lang::tr("正在准备 GIF…", self.lang));
+                let _ = n_imgs;
+                return;
+            }
+            let label = if self.gif_playing {
+                crate::lang::tr("暂停", self.lang)
+            } else {
+                crate::lang::tr("播放", self.lang)
+            };
+            if ui.button(label).clicked() {
+                self.gif_playing = !self.gif_playing;
+                // Remember the intent so stepping to the next file keeps the
+                // animation going (or stays paused, if the user paused).
+                self.viewer_play_on = self.gif_playing;
+                // Resume from the current frame's own timing.
+                if self.gif_playing {
+                    self.gif_due = None;
+                }
+            }
+            let total = n.max(1);
+            let frac = if total <= 1 {
+                1.0
+            } else {
+                (self.gif_idx as f32 / (total - 1) as f32).clamp(0.0, 1.0)
+            };
+            let bar_w = (ui.available_width() - 72.0).max(40.0);
+            let (rect, resp) = ui.allocate_exact_size(
+                egui::vec2(bar_w, 16.0),
+                egui::Sense::click_and_drag(),
+            );
+            let painter = ui.painter();
+            painter.rect_filled(
+                rect,
+                egui::CornerRadius::same(8),
+                ui.visuals().widgets.inactive.bg_fill,
+            );
+            if frac > 0.0 {
+                let fill = egui::Rect::from_min_size(
+                    rect.min,
+                    egui::vec2(rect.width() * frac, rect.height()),
+                );
+                painter.rect_filled(fill, egui::CornerRadius::same(8), ui.visuals().selection.bg_fill);
+            }
+            let kx = rect.min.x + rect.width() * frac;
+            painter.circle_filled(
+                egui::pos2(kx, rect.center().y),
+                6.0,
+                ui.visuals().selection.bg_fill,
+            );
+            if (resp.drag_started() || resp.dragged() || resp.clicked()) && rect.width() > 0.0 {
+                if let Some(p) = resp.interact_pointer_pos() {
+                    let f = ((p.x - rect.min.x) / rect.width()).clamp(0.0, 1.0);
+                    let idx = if total <= 1 {
+                        0
+                    } else {
+                        (f * (total - 1) as f32).round() as usize
+                    };
+                    self.gif_idx = idx.min(total - 1);
+                    // Recompute the delay on the next step from the new frame.
+                    self.gif_due = None;
+                }
+            }
+            weak(ui, format!("{}/{}", self.gif_idx + 1, total));
+            let _ = n_imgs;
+        });
+    }
+
+    /// Start (or restart) the still-image slide timer for `vpath`.
+    fn tick_slide(&mut self, vpath: &std::path::Path, n_imgs: usize) -> bool {
+        if !self.viewer_auto_next || n_imgs <= 1 {
+            return false;
+        }
+        if self.slide_path.as_deref() != Some(vpath) {
+            self.slide_path = Some(vpath.to_path_buf());
+            self.slide_at = Some(std::time::Instant::now());
+            return false;
+        }
+        let secs = self.viewer_slide_secs.max(1) as u64;
+        let elapsed = self.slide_at.map(|t| t.elapsed().as_secs()).unwrap_or(0);
+        elapsed >= secs
+    }
+
+    /// Spawn a background poster-decode job for `path` unless one is already
+    /// running. Viewer/side keep a single slot (switching replaces the old
+    /// job); grid thumbnails cap concurrency and skip already-cached paths.
+    fn spawn_video_job(&mut self, path: &std::path::Path, kind: VideoJobKind) {
+        // A clip that already failed to decode is never retried: the job is
+        // dropped on completion, so without this every repaint would spawn a
+        // new (doomed) worker and pin a core.
+        if self.video_poster_failed.contains(path) {
+            return;
+        }
+        if self.video_jobs.iter().any(|j| j.path == path && j.kind == kind) {
+            return;
+        }
+        match kind {
+            VideoJobKind::Viewer | VideoJobKind::Side => {
+                self.video_jobs.retain(|j| j.kind != kind);
+            }
+            VideoJobKind::Thumb => {
+                if self
+                    .video_jobs
+                    .iter()
+                    .filter(|j| j.kind == VideoJobKind::Thumb)
+                    .count()
+                    >= THUMB_VIDEO_INFLIGHT
+                {
+                    return;
+                }
+                if self.thumb_video_cache.iter().any(|(p, _)| p == path) {
+                    return;
+                }
+            }
+        }
+        let max_dim = match kind {
+            VideoJobKind::Viewer => 1280,
+            VideoJobKind::Side => 640,
+            VideoJobKind::Thumb => 256,
+        };
+        self.video_jobs.push(VideoJob {
+            path: path.to_path_buf(),
+            rx: crate::video::poster_rgba_scaled_async(path, max_dim),
+            kind,
+        });
+    }
+
+    /// Collect finished poster jobs and upload their frames as textures.
+    /// Called once per frame before the panels render.
+    fn poll_video_jobs(&mut self, ctx: &egui::Context) {
+        let mut i = 0;
+        while i < self.video_jobs.len() {
+            let done = match self.video_jobs[i].rx.try_recv() {
+                Ok(res) => Some(res),
+                Err(std::sync::mpsc::TryRecvError::Empty) => None,
+                // Worker died without a result (should not happen).
+                Err(_) => Some(None),
+            };
+            let Some(res) = done else {
+                i += 1;
+                continue;
+            };
+            let job = self.video_jobs.remove(i);
+            let Some((w, h, rgba)) = res else {
+                // Decode failed (or the worker died): remember it so the pane
+                // stops asking for another poster.
+                self.video_poster_failed.insert(job.path.clone());
+                continue;
+            };
+            let img = egui::ColorImage::from_rgba_unmultiplied([w as usize, h as usize], &rgba);
+            let name = match job.kind {
+                VideoJobKind::Viewer => format!("video:poster:{}", job.path.display()),
+                VideoJobKind::Side => format!("video:side:{}", job.path.display()),
+                VideoJobKind::Thumb => format!("video:thumb:{}", job.path.display()),
+            };
+            let tex = ctx.load_texture(name, img, egui::TextureOptions::LINEAR);
+            match job.kind {
+                VideoJobKind::Viewer => {
+                    // Only if the viewer still shows this clip.
+                    if self.viewer.as_deref() == Some(job.path.as_path()) {
+                        self.video_poster = Some(tex);
+                    }
+                }
+                VideoJobKind::Side => {
+                    self.side_video_tex = Some((job.path, tex));
+                }
+                VideoJobKind::Thumb => {
+                    self.thumb_video_cache.push((job.path, tex));
+                    while self.thumb_video_cache.len() > THUMB_VIDEO_CACHE {
+                        // Evicting frees the texture (TextureHandle::drop).
+                        let _ = self.thumb_video_cache.remove(0);
+                    }
+                }
+            }
+        }
+    }
+
+    /// Toggle play/pause for the viewer's current clip. Starts playback on a
+    /// fresh clip (or replays after the end of stream), resumes a paused
+    /// worker, pauses while playing. No-op when the clip cannot be decoded.
+    fn toggle_video_play(&mut self, vpath: &std::path::Path) {
+        let has_mf = self.video_poster.is_some() || self.video_playback.is_some();
+        if self.video_playing {
+            // Pause keeps the worker alive (it just stops reading samples), so
+            // 播放 resumes at the current position.
+            if let Some(pb) = self.video_playback.as_ref() {
+                pb.set_paused(true);
+            }
+            self.video_playing = false;
+            // User paused: don't keep playing on the next file.
+            self.viewer_play_on = false;
+        } else if has_mf {
+            match self.video_playback.as_ref() {
+                // Paused mid-clip: resume where we left off.
+                Some(pb) if !self.video_eos => {
+                    pb.set_paused(false);
+                    self.video_playing = true;
+                    self.viewer_play_on = true;
+                }
+                // Fresh clip, or replay after the end of stream.
+                _ => {
+                    if let Some(pb) = crate::video::start_playback(vpath, PLAY_MAX_DIM) {
+                        self.video_playback = Some(pb);
+                        self.video_playing = true;
+                        self.video_eos = false;
+                        self.video_pos_ns = 0;
+                        self.viewer_play_on = true;
+                    }
+                }
+            }
+        }
+    }
+
+    /// Render the video viewer: poster frame, play/pause, a seek bar with
+    /// position / duration at the bottom, and the live playback surface.
+    /// Frames are decoded on a background thread and uploaded as egui
+    /// textures — the same path the image viewer uses.
+    /// Play / pause button and decode status for the clip in the viewer.
+    /// Rendered inside the shared [`Self::viewer_toolbar`].
+    fn video_play_controls(&mut self, ui: &mut egui::Ui, vpath: &std::path::Path) {
+        let has_mf = self.video_poster.is_some() || self.video_playback.is_some();
+        let label = if self.video_playing {
+            crate::lang::tr("暂停", self.lang)
+        } else {
+            crate::lang::tr("播放", self.lang)
+        };
+        if ui
+            .add_enabled(has_mf || self.video_playing, egui::Button::new(label))
+            .clicked()
+        {
+            self.toggle_video_play(vpath);
+        }
+        // Sound: a muted/unmuted toggle, persisted. Default is muted.
+        let sound_label = if self.viewer_muted {
+            crate::lang::tr("取消静音", self.lang)
+        } else {
+            crate::lang::tr("静音", self.lang)
+        };
+        if ui.button(sound_label).clicked() {
+            self.viewer_muted = !self.viewer_muted;
+            self.persist_viewer_opts();
+        }
+        if !has_mf && self.video_jobs.is_empty() {
+            weak(
+                ui,
+                crate::lang::tr(
+                    "无法解码此视频（格式不受 Media Foundation 支持，如 MKV/WebM/FLV）",
+                    self.lang,
+                ),
+            );
+        } else if !has_mf {
+            weak(ui, crate::lang::tr("正在准备视频…", self.lang));
+        }
+    }
+
+    /// The clip surface (poster while idle, live frames while playing) plus the
+    /// seek bar below it. The surface reserves its rect, so the bars that
+    /// follow land at the bottom instead of overlapping the picture.
+    fn render_video_surface(&mut self, ui: &mut egui::Ui, vpath: &std::path::Path, n_imgs: usize) {
+        // The seek bar lives at the bottom of the viewer: reserve its height
+        // before laying out the video surface so the picture never overlaps it.
+        let bar_h = if self.video_playback.is_some() || self.video_eos {
+            26.0
+        } else {
+            0.0
+        };
+
+        // The caller draws the filmstrip after this: keep its band clear too.
+        let film_h = if n_imgs > 1 { 84.0 } else { 0.0 };
+        let area_w = ui.available_width().max(40.0);
+        let area_h = (ui.available_height() - bar_h - film_h).max(60.0);
+        let area = egui::Rect::from_min_size(ui.cursor().min, egui::vec2(area_w, area_h));
+
+        // Drain the playback worker into locals first (the borrow of
+        // `video_playback` must end before the rest of `self` is touched).
+        let mut info_dur: Option<u64> = None;
+        let mut latest: Option<(u32, u32, Vec<u8>)> = None;
+        let mut latest_ts: Option<u64> = None;
+        let mut eos = false;
+        // End of stream: step to the next file, or start over with no gap.
+        let mut pending_next = false;
+        let mut pending_restart = false;
+        if let Some(pb) = self.video_playback.as_mut() {
+            loop {
+                match pb.rx.try_recv() {
+                    Ok(crate::video::PbMsg::Info { dur_ns }) => info_dur = Some(dur_ns),
+                    Ok(crate::video::PbMsg::Frame { ts, w, h, rgba }) => {
+                        latest_ts = Some(ts.max(0) as u64);
+                        latest = Some((w, h, rgba));
+                    }
+                    Ok(crate::video::PbMsg::Eos) => {
+                        eos = true;
+                        break;
+                    }
+                    Err(_) => break,
+                }
+            }
+        }
+        if let Some(d) = info_dur {
+            self.video_dur_ns = Some(d);
+        }
+        // Adopt the worker's latest frame timestamp for the playhead — but
+        // while a seek is pinned we hold the playhead at the target until the
+        // worker actually emits a frame there, so the bar never snaps back to
+        // a stale in-flight frame.
+        if let Some(t) = latest_ts {
+            if let Some(frac) = self.video_seek_frac {
+                let target = self
+                    .video_dur_ns
+                    .map(|d| (frac as f64 * d as f64))
+                    .unwrap_or(0.0);
+                let eps = (self.video_dur_ns.unwrap_or(0) as f64) * 0.02;
+                if (t as f64) >= target - eps {
+                    self.video_seek_frac = None;
+                    self.video_pos_ns = t;
+                }
+                // else: keep video_pos_ns pinned at the target (set on seek)
+            } else {
+                self.video_pos_ns = t;
+            }
+        }
+        if eos {
+            // Keep the last frame on screen; 播放 replays from the start.
+            self.video_eos = true;
+            self.video_playing = false;
+            self.video_seek_frac = None;
+            if let Some(d) = self.video_dur_ns {
+                self.video_pos_ns = d;
+            }
+            // What happens next is decided once the borrow above has ended.
+            if self.viewer_auto_next && n_imgs > 1 {
+                pending_next = true;
+            } else if self.viewer_loop {
+                pending_restart = true;
+            }
+        }
+        // 自动下一页：进入视频即自动开播，播完由上面的 EOS 分支翻到下一张。
+        // 也支持「用户点过播放」：只要 viewer_play_on 为真（手动点过播放，或
+        // 自动下一页触发），切到新视频就自动接着播。仅在解码就绪（海报已出）
+        // 后触发；首帧海报未到时不动作，下一帧再判。
+        if (self.viewer_auto_next || self.viewer_play_on)
+            && !self.video_playing
+            && !self.video_eos
+        {
+            let has_mf = self.video_poster.is_some() || self.video_playback.is_some();
+            if has_mf {
+                self.toggle_video_play(vpath);
+            }
+        }
+        if let Some((w, h, rgba)) = latest {
+            let img = egui::ColorImage::from_rgba_unmultiplied([w as usize, h as usize], &rgba);
+            if self.video_frame.is_none() {
+                let tex = ui.ctx().load_texture(
+                    format!("video:frame:{}", vpath.display()),
+                    img,
+                    egui::TextureOptions::LINEAR,
+                );
+                self.video_frame = Some(tex);
+            } else if let Some(tex) = self.video_frame.as_mut() {
+                tex.set(img, egui::TextureOptions::LINEAR);
+            }
+        }
+
+        // Live frame while a worker exists (playing, paused or ended); the
+        // poster before the first play.
+        let mut surface_clicked = false;
+        let tex = self.video_frame.as_ref().or(self.video_poster.as_ref());
+        match tex {
+            Some(tex) => {
+                let (tw, th) = (tex.size()[0] as f32, tex.size()[1] as f32);
+                let ar = (tw / th).max(0.01);
+                let mut w = area_w.min(area_h * ar);
+                let mut h = w / ar;
+                if h > area_h {
+                    h = area_h;
+                    w = h * ar;
+                }
+                let dest = egui::Rect::from_center_size(area.center(), egui::vec2(w, h));
+                // One click anywhere on the surface toggles play/pause. The ▶
+                // badge in the middle is only painted — this rect is what
+                // actually makes the whole picture clickable.
+                let hot = ui.interact(
+                    area,
+                    egui::Id::new("video_surface"),
+                    egui::Sense::click(),
+                );
+                surface_clicked = hot.clicked();
+                ui.painter().image(
+                    tex.id(),
+                    dest,
+                    egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)),
+                    egui::Color32::WHITE,
+                );
+                if !self.video_playing {
+                    // ▶ overlay hint in the centre.
+                    let r = egui::Rect::from_center_size(area.center(), egui::vec2(64.0, 64.0));
+                    ui.painter().circle_filled(
+                        r.center(),
+                        32.0,
+                        egui::Color32::from_black_alpha(120),
+                    );
+                    ui.painter().text(
+                        area.center() + egui::vec2(2.0, 0.0),
+                        egui::Align2::CENTER_CENTER,
+                        "▶",
+                        egui::FontId::proportional(34.0),
+                        egui::Color32::WHITE,
+                    );
+                }
+            }
+            None => {
+                ui.painter().text(
+                    area.center(),
+                    egui::Align2::CENTER_CENTER,
+                    crate::lang::tr("无法解码此视频（格式不受 Media Foundation 支持，如 MKV/WebM/FLV）", self.lang),
+                    egui::FontId::proportional(15.0),
+                    self.weak_color(),
+                );
+            }
+        }
+        if surface_clicked {
+            self.toggle_video_play(vpath);
+        }
+        // Same prev / next pills the image viewer shows, so a clip can be
+        // stepped through without hunting for the toolbar buttons.
+        self.viewer_edge_arrows(ui, area, vpath, n_imgs);
+        // The surface is painted straight onto the painter and consumes no
+        // layout space: advance past it so the seek bar (and the filmstrip the
+        // caller adds) land below the picture instead of on top of it.
+        ui.advance_cursor_after_rect(area);
+
+        // ---- bottom: seek bar (position / duration) ----
+        // Shown once playback has started: the duration arrives from the
+        // worker as its first message.
+        let mut want_seek: Option<f32> = None;
+        if self.video_playback.is_some() || self.video_eos {
+            ui.horizontal(|ui| {
+                weak(ui, crate::video::fmt_time(self.video_pos_ns));
+                let bar_w = (ui.available_width() - 78.0).max(60.0);
+                let (rect, resp) = ui
+                    .allocate_exact_size(egui::vec2(bar_w, 16.0), egui::Sense::click_and_drag());
+                let frac = match self.video_dur_ns {
+                    Some(d) if d > 0 => (self.video_pos_ns as f64 / d as f64).clamp(0.0, 1.0) as f32,
+                    _ => 0.0,
+                };
+                let shown = self.video_seek_frac.unwrap_or(frac);
+                let painter = ui.painter();
+                painter.rect_filled(
+                    rect,
+                    egui::CornerRadius::same(8),
+                    ui.visuals().widgets.inactive.bg_fill,
+                );
+                if shown > 0.0 {
+                    let fill =
+                        egui::Rect::from_min_size(rect.min, egui::vec2(rect.width() * shown, rect.height()));
+                    painter.rect_filled(fill, egui::CornerRadius::same(8), ui.visuals().selection.bg_fill);
+                }
+                let kx = rect.min.x + rect.width() * shown;
+                painter.circle_filled(
+                    egui::pos2(kx, rect.center().y),
+                    6.0,
+                    ui.visuals().selection.bg_fill,
+                );
+                if (resp.drag_started() || resp.dragged() || resp.clicked())
+                    && rect.width() > 0.0
+                {
+                    if let Some(p) = resp.interact_pointer_pos() {
+                        let f = ((p.x - rect.min.x) / rect.width()).clamp(0.0, 1.0);
+                        self.video_seek_frac = Some(f);
+                    }
+                }
+                if resp.drag_stopped() || resp.clicked() {
+                    // Keep the fraction set (don't take it) so the bar stays
+                    // pinned on the target until the worker confirms the seek.
+                    let f = self.video_seek_frac;
+                    if let (Some(f), Some(d)) = (f, self.video_dur_ns) {
+                        if d > 0 {
+                            want_seek = Some(f);
+                        }
+                    }
+                }
+                weak(
+                    ui,
+                    match self.video_dur_ns {
+                        Some(d) => crate::video::fmt_time(d),
+                        None => "--:--".to_string(),
+                    },
+                );
+            });
+        }
+        // A committed drag: jump the worker, and resume if it was paused.
+        if let Some(f) = want_seek {
+            if let (Some(pb), Some(d)) = (self.video_playback.as_ref(), self.video_dur_ns) {
+                let target = (f as f64 * d as f64) as u64;
+                pb.seek(target);
+                self.video_pos_ns = target;
+                // Pin the playhead on the target until the worker emits a frame
+                // there; see the latest_ts handling above.
+                self.video_seek_frac = Some(f);
+                self.video_eos = false;
+                if !self.video_playing {
+                    pb.set_paused(false);
+                    self.video_playing = true;
+                }
+            }
+        }
+        // ---- end of stream: auto-next wins, otherwise loop with no gap ----
+        if pending_next {
+            self.viewer_nav(1);
+        } else if pending_restart {
+            // Restarted in the same frame the old stream ended, so there is no
+            // black frame between the last and the first.
+            self.toggle_video_play(vpath);
         }
     }
 
@@ -1988,14 +3089,30 @@ impl Explorer {
         continue;
         }
         let i = i as usize;
-        let p = &self.viewer_list[i];
+        // Owned clone: the filmstrip spawns decode jobs for clips, which needs
+        // `&mut self` while the path is still in use below.
+        let p = self.viewer_list[i].clone();
         let is_cur = i == self.viewer_index;
         let thumb_rect =
         egui::Rect::from_min_size(ui.cursor().min, egui::vec2(64.0, 64.0));
         let resp = ui.allocate_rect(thumb_rect, egui::Sense::click());
         let inner = resp.rect.shrink(4.0);
-        if let Some(t) = self.previews.get(p, preview::THUMB, preview::Priority::Film) {
-        let ar = t.aspect().max(0.01);
+        // Images come from the thumbnail cache; clips have no image thumbnail,
+        // so fall back to a decoded poster (spawning its job when missing).
+        let cell: Option<(egui::TextureId, f32)> = self
+        .previews
+        .get(&p, preview::THUMB, preview::Priority::Film)
+        .map(|t| (t.tex.id(), t.aspect().max(0.01)))
+        .or_else(|| {
+        self.thumb_video_cache
+        .iter()
+        .find(|(cp, _)| *cp == p)
+        .map(|(_, tex)| {
+        let s = tex.size();
+        (tex.id(), s[0] as f32 / s[1].max(1) as f32)
+        })
+        });
+        if let Some((tid, ar)) = cell {
         let mut w = inner.width();
         let mut h = w / ar;
         if h > inner.height() {
@@ -2004,12 +3121,19 @@ impl Explorer {
         }
         let dest = egui::Rect::from_center_size(inner.center(), egui::vec2(w, h));
         ui.painter().image(
-        t.tex.id(),
+        tid,
         dest,
         egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)),
         egui::Color32::WHITE,
         );
         } else {
+        let name = p
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_default();
+        if !self.video_poster_failed.contains(&p) && crate::preview::is_video(&name, &p) {
+        self.spawn_video_job(&p, VideoJobKind::Thumb);
+        }
         ui.painter().text(
         inner.center(),
         egui::Align2::CENTER_CENTER,
@@ -3331,11 +4455,14 @@ impl Explorer {
                                 LARGE_ICON,
                                 egui::Color32::from_rgb(225, 180, 70),
                             );
-                        } else if crate::preview::is_image(&name) {
+                        } else if crate::preview::is_image(&name, &path) {
                             let mut painted = false;
                             // Only request a thumbnail for on-screen cells; off-
                             // screen cells in a huge folder must not flood the
                             // decode queue (they are lowest priority anyway).
+                            // 小 perf mode stops *new* grid decodes (see
+                            // Previews::set_allow_grid); cached thumbnails still
+                            // show. Off-screen cells never enqueue either way.
                             if ui.is_rect_visible(rect) {
                                 if let Some(t) = self.previews.get(&path, preview::THUMB, preview::Priority::Grid) {
                                     let ar = t.aspect().max(0.01);
@@ -3369,6 +4496,66 @@ impl Explorer {
                                     tex,
                                     emoji,
                                     IconKind::Image,
+                                    rect,
+                                    LARGE_ICON,
+                                    self.weak_color(),
+                                );
+                            }
+                        } else if crate::preview::is_video(&name, &path) {
+                            // Video thumbnail: the decoded first frame, cached
+                            // per path. Only visible cells request a decode
+                            // (off-screen cells in a huge folder must not flood
+                            // the job queue).
+                            let mut painted = false;
+                            if ui.is_rect_visible(rect) {
+                                let cached = self
+                                    .thumb_video_cache
+                                    .iter()
+                                    .find(|(p, _)| p == &path)
+                                    .map(|(_, t)| t.clone());
+                                match cached {
+                                    Some(t) => {
+                                        let ar = t.aspect_ratio().max(0.01);
+                                        let mut w = rect.width();
+                                        let mut h = w / ar;
+                                        if h > rect.height() {
+                                            h = rect.height();
+                                            w = h * ar;
+                                        }
+                                        let dest = egui::Rect::from_center_size(
+                                            rect.center(),
+                                            egui::vec2(w, h),
+                                        );
+                                        ui.painter().image(
+                                            t.id(),
+                                            dest,
+                                            egui::Rect::from_min_max(
+                                                egui::pos2(0.0, 0.0),
+                                                egui::pos2(1.0, 1.0),
+                                            ),
+                                            egui::Color32::WHITE,
+                                        );
+                                        painted = true;
+                                    }
+                                    None => {
+                                        // 小 perf mode skips decoding video
+                                        // posters in the grid: the icon stands
+                                        // in, and no Media Foundation session is
+                                        // opened per cell.
+                                        if self.viewer_perf != 0 {
+                                            self.spawn_video_job(&path, VideoJobKind::Thumb);
+                                        }
+                                    }
+                                }
+                            }
+                            if !painted {
+                                // Still decoding (or undecodable): the shell's
+                                // own video icon stands in.
+                                draw_row_icon(
+                                    ui.painter(),
+                                    tex,
+                                    emoji,
+                                    IconKind::File,
                                     rect,
                                     LARGE_ICON,
                                     self.weak_color(),
@@ -3473,7 +4660,7 @@ impl Explorer {
         if is_dir {
             get_panel(self, is_left).navigate(path);
             self.apply_cached_sizes();
-        } else if crate::preview::is_image(name) {
+        } else if crate::preview::is_previewable(name, &path) {
             self.open_viewer(listing, path);
         } else {
             fs_util::open_default_file(&path);
@@ -3651,23 +4838,101 @@ impl Explorer {
         }
         ui.separator();
 
-        if !is_dir && crate::preview::is_image(&name) {
-            if let Some(t) = self.previews.get(&path, preview::PREVIEW, preview::Priority::Urgent) {
-                let ar = t.aspect().max(0.01);
-                let mut w = ui.available_width().max(40.0);
-                let mut h = w / ar;
-                let max_h = (ui.available_height() - 40.0).max(80.0);
-                if h > max_h {
-                    h = max_h;
-                    w = h * ar;
+        if !is_dir
+            && (crate::preview::is_image(&name, &path) || crate::preview::is_video(&name, &path))
+        {
+            if crate::preview::is_image(&name, &path) {
+                // Animated GIFs play inline in the pane (with a play/pause
+                // key); everything else is a still decode.
+                if crate::preview::is_gif(&name, &path) {
+                    self.render_side_gif(ui, &path);
+                } else {
+                // Same progressive trick as the viewer: the grid thumbnail
+                // shows up immediately while the 720 px decode runs.
+                let (t, ready) = self
+                    .previews
+                    .get_or_smaller(&path, preview::PREVIEW, preview::Priority::Urgent);
+                if let Some(t) = t {
+                    let ar = t.aspect().max(0.01);
+                    let mut w = ui.available_width().max(40.0);
+                    let mut h = w / ar;
+                    let max_h = (ui.available_height() - 40.0).max(80.0);
+                    if h > max_h {
+                        h = max_h;
+                        w = h * ar;
+                    }
+                    let tex = egui::load::SizedTexture::new(t.tex.id(), egui::vec2(w, h));
+                    ui.add(egui::Image::new(tex));
+                    if !ready {
+                        weak(ui, crate::lang::tr("解码中…", self.lang));
+                        ui.ctx()
+                            .request_repaint_after(std::time::Duration::from_millis(
+                                self.perf_repaint_ms(),
+                            ));
+                    }
+                } else if self.previews.failed(&path, preview::PREVIEW) {
+                    weak(ui, crate::lang::tr("无法解码此图片", self.lang));
+                } else {
+                    weak(ui, crate::lang::tr("解码中…", self.lang));
+                    ui.ctx()
+                        .request_repaint_after(std::time::Duration::from_millis(
+                            self.perf_repaint_ms(),
+                        ));
                 }
-                let tex = egui::load::SizedTexture::new(t.tex.id(), egui::vec2(w, h));
-                ui.add(egui::Image::new(tex));
-            } else if self.previews.failed(&path, preview::PREVIEW) {
-                weak(ui, crate::lang::tr("无法解码此图片", self.lang));
+                }
             } else {
-                weak(ui, crate::lang::tr("解码中…", self.lang));
-                ui.ctx().request_repaint();
+                // Video: decode the first frame in the background and show it
+                // as the preview; the viewer adds inline playback.
+                let cached = self
+                    .side_video_tex
+                    .as_ref()
+                    .filter(|(p, _)| p == &path)
+                    .map(|(_, t)| t.clone());
+                // Only ask for a decode while there is nothing to show — the
+                // poster job is dropped once it lands, so an unconditional
+                // spawn would loop every frame.
+                if cached.is_none() {
+                    self.spawn_video_job(&path, VideoJobKind::Side);
+                }
+                match cached {
+                    Some(tex) => {
+                        let ar = tex.aspect_ratio().max(0.01);
+                        let mut w = ui.available_width().max(40.0);
+                        let mut h = w / ar;
+                        let max_h = (ui.available_height() - 60.0).max(80.0);
+                        if h > max_h {
+                            h = max_h;
+                            w = h * ar;
+                        }
+                        let sized = egui::load::SizedTexture::new(tex.id(), egui::vec2(w, h));
+                        ui.add(egui::Image::new(sized));
+                    }
+                    None => {
+                        if self.video_poster_failed.contains(&path) {
+                            weak(
+                                ui,
+                                crate::lang::tr(
+                                    "无法解码此视频（格式不受 Media Foundation 支持，如 MKV/WebM/FLV，或 HEVC/H.265 等需额外解码器的编码）",
+                                    self.lang,
+                                ),
+                            );
+                        } else if self
+                            .video_jobs
+                            .iter()
+                            .any(|j| j.path == path && j.kind == VideoJobKind::Side)
+                        {
+                            weak(ui, crate::lang::tr("正在准备视频…", self.lang));
+                            ui.ctx().request_repaint_after(
+                                std::time::Duration::from_millis(self.perf_repaint_ms()),
+                            );
+                        } else {
+                            weak(ui, crate::lang::tr("视频文件，点击在查看器中播放", self.lang));
+                        }
+                    }
+                }
+                if ui.button(crate::lang::tr("播放视频", self.lang)).clicked() {
+                    self.open_viewer(&[], path.clone());
+                }
             }
             if ui.button(crate::lang::tr("放大查看", self.lang)).clicked() {
                 // No in-memory listing handy here; fall back to a directory read
@@ -3694,6 +4959,182 @@ impl Explorer {
             weak(ui, crate::lang::tr("此类文件没有内置预览", self.lang));
             if ui.button(crate::lang::tr("用默认程序打开", self.lang)).clicked() {
                 fs_util::open_default_file(&path);
+            }
+        }
+    }
+
+    /// Animated-GIF playback inside the side preview pane: decodes the whole
+    /// clip once (background thread), animates frame-by-frame, and shows a
+    /// play/pause key. Static images and videos go through their own paths.
+    fn render_side_gif(&mut self, ui: &mut egui::Ui, path: &std::path::Path) {
+        // Reset everything when the selected file changes.
+        if self.side_gif_path.as_deref() != Some(path) {
+            self.side_gif = None;
+            self.side_gif_rx = None;
+            self.side_gif_idx = 0;
+            self.side_gif_due = None;
+            self.side_gif_playing = true;
+            self.side_gif_tex = None;
+            self.side_gif_path = Some(path.to_path_buf());
+            if !self.side_gif_failed.contains(path) {
+                let (tx, rx) = std::sync::mpsc::channel();
+                let p = path.to_path_buf();
+                std::thread::spawn(move || {
+                    let c = crate::gif::decode(&p);
+                    let _ = tx.send(c);
+                });
+                self.side_gif_rx = Some((path.to_path_buf(), rx));
+            }
+        }
+        // Land a finished decode.
+        let mut landed: Option<(std::path::PathBuf, Option<crate::gif::GifClip>)> = None;
+        if let Some((p, rx)) = self.side_gif_rx.as_ref() {
+            if let Ok(clip) = rx.try_recv() {
+                landed = Some((p.clone(), clip));
+            }
+        }
+        if let Some((p, clip)) = landed {
+            self.side_gif_rx = None;
+            match clip {
+                Some(c) => {
+                    self.side_gif = Some((p, c));
+                    self.side_gif_idx = 0;
+                    self.side_gif_due = None;
+                    self.side_gif_playing = true;
+                }
+                None => {
+                    self.side_gif_failed.insert(p);
+                }
+            }
+        }
+        let n = self
+            .side_gif
+            .as_ref()
+            .map(|(_, c)| c.frames.len())
+            .unwrap_or(0);
+        if n == 0 {
+            if self.side_gif_failed.contains(path) {
+                weak(ui, crate::lang::tr("无法解码此 GIF", self.lang));
+            } else {
+                // Show the cached first frame at once (poster) while the whole
+                // clip keeps decoding in the background, instead of a blank
+                // "准备中" wait.
+                let (t, _ready) = self
+                    .previews
+                    .get_or_smaller(path, preview::PREVIEW, preview::Priority::Urgent);
+                if let Some(t) = t {
+                    let ar = t.aspect().max(0.01);
+                    let mut w = ui.available_width().max(40.0);
+                    let mut h = w / ar;
+                    let max_h = (ui.available_height() - 60.0).max(80.0);
+                    if h > max_h {
+                        h = max_h;
+                        w = h * ar;
+                    }
+                    let tex = egui::load::SizedTexture::new(t.tex.id(), egui::vec2(w, h));
+                    ui.add(egui::Image::new(tex));
+                }
+                weak(ui, crate::lang::tr("正在准备 GIF…", self.lang));
+                ui.ctx()
+                    .request_repaint_after(std::time::Duration::from_millis(
+                        self.perf_repaint_ms(),
+                    ));
+            }
+            return;
+        }
+        // Advance the animation when playing (loop honours 循环播放).
+        if self.side_gif_playing {
+            let now = std::time::Instant::now();
+            let due = self.side_gif_due;
+            let at_end = self.side_gif_idx + 1 >= n;
+            if due.map_or(true, |d| now >= d) {
+                if at_end {
+                    if self.viewer_loop {
+                        self.side_gif_idx = 0;
+                    } else {
+                        self.side_gif_idx = n - 1;
+                        self.side_gif_due = None;
+                    }
+                } else {
+                    self.side_gif_idx += 1;
+                }
+                let delay = self
+                    .side_gif
+                    .as_ref()
+                    .and_then(|(_, c)| c.frames.get(self.side_gif_idx))
+                    .map(|f| f.delay_ms)
+                    .unwrap_or(100);
+                self.side_gif_due =
+                    Some(now + std::time::Duration::from_millis(delay.clamp(20, 1000) as u64));
+            }
+        }
+        // Upload the current frame to a reused texture only when the visible
+        // frame index changed — re-decoding + re-uploading every frame is what
+        // burned CPU. Then draw it fitted.
+        let (cw, ch, rgba) = {
+            let c = self.side_gif.as_ref().unwrap();
+            let fr = &c.1.frames[self.side_gif_idx];
+            (c.1.w, c.1.h, &fr.rgba as &[u8])
+        };
+        let id = if self.side_gif_painted_idx != self.side_gif_idx
+            || self.side_gif_tex.is_none()
+        {
+            let img = egui::ColorImage::from_rgba_unmultiplied([cw as usize, ch as usize], rgba);
+            let id = match self.side_gif_tex.as_mut() {
+                Some(t) => {
+                    t.set(img, egui::TextureOptions::LINEAR);
+                    t.id()
+                }
+                None => {
+                    let t = ui
+                        .ctx()
+                        .load_texture("side_gif:frame", img, egui::TextureOptions::LINEAR);
+                    let id = t.id();
+                    self.side_gif_tex = Some(t);
+                    id
+                }
+            };
+            self.side_gif_painted_idx = self.side_gif_idx;
+            id
+        } else {
+            self.side_gif_tex.as_ref().map(|t| t.id()).unwrap()
+        };
+        let ar = (cw as f32 / ch as f32).max(0.01);
+        let mut w = ui.available_width().max(40.0);
+        let mut h = w / ar;
+        let max_h = (ui.available_height() - 60.0).max(80.0);
+        if h > max_h {
+            h = max_h;
+            w = h * ar;
+        }
+        let sized = egui::load::SizedTexture::new(id, egui::vec2(w, h));
+        ui.add(egui::Image::new(sized));
+        // Play / pause key + frame readout.
+        ui.horizontal(|ui| {
+            let label = if self.side_gif_playing {
+                crate::lang::tr("暂停", self.lang)
+            } else {
+                crate::lang::tr("播放", self.lang)
+            };
+            if ui.button(label).clicked() {
+                self.side_gif_playing = !self.side_gif_playing;
+                if self.side_gif_playing {
+                    self.side_gif_due = None;
+                }
+            }
+            weak(ui, format!("{}/{}", self.side_gif_idx + 1, n));
+        });
+        if self.side_gif_playing {
+            // Wake exactly when the next frame is due instead of forcing 60 fps.
+            if let Some(due) = self.side_gif_due {
+                let remaining = (due - std::time::Instant::now()).as_millis() as u64;
+                ui.ctx()
+                    .request_repaint_after(std::time::Duration::from_millis(remaining.max(8)));
+            } else {
+                ui.ctx()
+                    .request_repaint_after(std::time::Duration::from_millis(
+                        self.perf_repaint_ms(),
+                    ));
             }
         }
     }

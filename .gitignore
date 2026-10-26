@@ -25,6 +25,8 @@ _keep.pid
 /_t/
 
 # ---- Dev helper scripts (personal tooling, may contain local paths) ----
+reload.ps1
+reload.md
 _*.py
 _*.ps1
 _*.cmd

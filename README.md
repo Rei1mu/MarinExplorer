@@ -11,6 +11,20 @@
 
 ## 更新日志 / Changelog
 
+### v0.1.13 — 2026-10-26
+- **视频预览 / 播放器**：双击视频（MP4 / MOV / AVI / WMV / H.264 / HEVC / VP9 等）直接在查看器里播放。基于 Windows 自带的 Media Foundation，不捆绑任何解码器或播放器内核（exe 体积不变、无授权问题）。画面正中有暂停/播放键，底部是可拖拽的进度条 + 时间码；点画面正中即暂停/播放，拖动进度条可任意跳转。MKV / WebM / FLV 等 MF 不支持的格式会明确提示「无法解码」，不会卡住。
+- **GIF 播放器**：GIF 不再当静态图片显示——有播放/暂停键、可拖拽的帧进度条和帧计数；点画面正中同样可播放/暂停。整段解码改为「首帧海报优先」：先瞬时显示第一帧，解码在后台继续，不再干等「正在准备 GIF」。
+- **性能档（设置 → 性能 → 小 / 中 / 大）**：全局控制所有耗 CPU 的地方，不只查看器——后台重绘频率、进度轮询、文件夹大小扫描间隔与并发、网格缩略图解码、查看器播放节奏。**小（最低开销）**：网格不再新生成缩略图（已缓存的照常显示，直接显示文件类型图标）、大小扫描放到最慢、各类轮询降到约 5 次/秒，适合后台常驻；**中（均衡）**为默认；**大（最流畅）**按最高帧率跑。切换即时生效并记住。
+- **播放 CPU 开销大幅下降**：GIF 纹理只在帧变化时才上传 GPU（原来每帧重建并重传约 1 MB 像素数据），重绘也改按 GIF 自身帧延迟调度，不再固定 60 fps 空转。侧边预览的 GIF 同样处理。
+- **修复**：拖动视频进度条后画面又跳回开头（后台解码的旧帧会冲掉播放头）、点「下一张」到视频时不自动续播、GIF 暂停后按钮点不动、GIF 一直卡在「正在准备 GIF」。
+
+**English**
+- **Video preview / player**: double-click a video (MP4 / MOV / AVI / WMV / H.264 / HEVC / VP9 …) and it plays right in the viewer. Built on Windows' own Media Foundation — no bundled decoder, no bundled player core (exe size unchanged, no licensing concerns). A pause/play button sits at the centre of the picture, with a draggable progress bar and timecode at the bottom; click the centre to pause/resume, drag the bar to seek anywhere. Formats MF cannot decode (MKV / WebM / FLV …) say "cannot decode" instead of hanging.
+- **GIF player**: GIFs are no longer treated as still images — they get a play/pause button, a draggable frame scrubber and a frame counter, and clicking the centre of the picture toggles playback. Whole-file decoding is now poster-first: the first frame appears instantly while decoding continues in the background, so you no longer sit on "preparing GIF".
+- **Performance mode (Settings → Performance → Low / Medium / High)**: a global throttle over everything CPU-hungry, not just the viewer — background repaint rate, progress polling, folder-size scan interval and concurrency, grid thumbnail decoding, viewer playback cadence. **Low (least CPU)**: the grid stops generating new thumbnails (already-cached ones still show; everything else shows its file-type icon), size scanning runs at the slowest cadence, and polling drops to about 5 times a second — good for leaving it running in the background. **Medium (balanced)** is the default; **High (smoothest)** runs at the fastest rate. Switching applies instantly and is remembered.
+- **Much lower playback CPU cost**: GIF textures upload to the GPU only when the frame actually changes (the old code rebuilt and re-uploaded ~1 MB of pixels every frame), and repaints are scheduled by the GIF's own frame delay instead of a fixed 60 fps spin. The side-pane GIF preview got the same treatment.
+- **Fixes**: dragging a video's progress bar no longer snaps back to the start (stale decoded frames used to overwrite the playhead), clicking "next" onto a video now auto-plays it, the GIF pause button responds after pausing, and GIFs no longer stick on "preparing GIF".
+
 ### v0.1.12 — 2026-10-25
 - **列表 / 网格视图虚拟化**：超大文件夹（如 5 万条图片+视频）不再逐帧重排全部条目。每帧只布局视口内可见行（屏外行只占位、不建单元格、不解析图标），每帧工作量从 O(5万) 降到 O(约 50 行)。拖动窗口、整体响应、以及打开查看器后的所有操作都恢复流畅。
 - **双击打开不再整目录重读**：查看器的图片列表直接复用面板已加载的 `entries`，不再每次 `read_dir` 重新扫整目录。双击打开从几百 ms 降到近乎即时。

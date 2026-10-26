@@ -234,9 +234,104 @@ pub struct Explorer {
     /// Last time the mouse wheel switched images in the viewer; one notch =
     /// one step, so a long continuous scroll doesn't skip a dozen images.
     pub viewer_wheel_at: Option<std::time::Instant>,
+    // video preview (Media Foundation): the viewer can also show a video file
+    pub viewer_is_video: bool,
+    /// Same idea, for animated GIFs: sniffing costs a file read, so it is done
+    /// once per opened file rather than once per frame.
+    pub viewer_is_gif: bool,
+    /// Path the two flags above were computed for; recomputed on nav.
+    pub viewer_kind_path: Option<PathBuf>,
+    /// Decoded poster (first frame) texture, built once when a video opens.
+    pub video_poster: Option<egui::TextureHandle>,
+    /// Latest playback frame texture (overlays the poster while playing).
+    pub video_frame: Option<egui::TextureHandle>,
+    /// Whether playback is running (false while paused or after EOS).
+    pub video_playing: bool,
+    /// Owns the decode worker thread; dropping it stops playback. Kept while
+    /// paused so resume continues at the current position.
+    pub video_playback: Option<crate::video::Playback>,
+    /// Playback position / duration of the open clip, in 100-ns units.
+    pub video_pos_ns: u64,
+    pub video_dur_ns: Option<u64>,
+    /// End-of-stream reached: keep the last frame on screen until replay.
+    pub video_eos: bool,
+    /// Fraction the user is currently dragging on the seek bar (visual only
+    /// until release).
+    pub video_seek_frac: Option<f32>,
+    /// In-flight video poster jobs (viewer / side pane / grid thumbnails).
+    pub video_jobs: Vec<crate::VideoJob>,
+    /// Side-pane video poster: (path, texture) for the selected file.
+    pub side_video_tex: Option<(PathBuf, egui::TextureHandle)>,
+    /// Grid thumbnail posters, oldest first (LRU cap `THUMB_VIDEO_CACHE`).
+    pub thumb_video_cache: Vec<(PathBuf, egui::TextureHandle)>,
+    /// Paths whose poster decode already failed once. Never retried, otherwise
+    /// every repaint would re-spawn a doomed job (100% CPU on an unreadable
+    /// clip).
+    pub video_poster_failed: HashSet<PathBuf>,
     /// Cached side-pane text preview: (path, text). Files up to 10 KiB are
     /// read once and kept, so a repaint never hits the disk again.
     pub preview_text: Option<(PathBuf, String)>,
+    // ---- viewer slideshow / loop options (persisted) ----
+    /// 循环播放: a clip (video or GIF) restarts from the first frame the moment
+    /// it ends, with no gap. Still images are unaffected.
+    pub viewer_loop: bool,
+    /// 自动下一页: step to the next file when a clip ends or a still has been
+    /// shown for `viewer_slide_secs`. Only applies with more than one file.
+    pub viewer_auto_next: bool,
+    /// How long a still image stays on screen under 自动下一页, in seconds.
+    pub viewer_slide_secs: u32,
+    /// Whether the user wants the current media to keep playing. Set true when a
+    /// clip is started (manual play or 自动下一页); false on pause. After a clip
+    /// is playing, stepping to the next file keeps it playing.
+    pub viewer_play_on: bool,
+    /// Mute the viewer's audio. Default true (muted); persisted.
+    pub viewer_muted: bool,
+    /// Playback performance level: 0 = 小 (minimal repaint), 1 = 中 (balanced),
+    /// 2 = 大 (smoothest). Persisted as `viewer_perf`; governs how often the
+    /// viewer window repaints while a clip plays.
+    pub viewer_perf: u8,
+    /// File the slide timer is currently running for (reset when it changes).
+    pub slide_path: Option<PathBuf>,
+    pub slide_at: Option<std::time::Instant>,
+    // ---- animated GIF ----
+    /// In-flight whole-clip decode: (path, reply channel).
+    pub gif_rx: Option<(PathBuf, std::sync::mpsc::Receiver<Option<crate::gif::GifClip>>)>,
+    /// Decoded clip for the file currently in the viewer.
+    pub gif_clip: Option<(PathBuf, crate::gif::GifClip)>,
+    /// Frame being shown / the instant it must be replaced.
+    pub gif_idx: usize,
+    pub gif_due: Option<std::time::Instant>,
+    /// Whether the GIF animation is advancing. Paused keeps the current frame
+    /// on screen; the play/pause key in the viewer toggles it.
+    pub gif_playing: bool,
+    /// Texture holding the current GIF frame (reused, not recreated).
+    pub gif_tex: Option<egui::TextureHandle>,
+    /// Frame index currently uploaded to `gif_tex`. Lets `paint_gif` skip the
+    /// 1 MB RGBA re-decode + GPU upload when the same frame is drawn again.
+    pub gif_painted_idx: usize,
+    /// Repaint hint (ms) set by the media code each frame: the viewer viewport
+    /// repaints at this cadence while playing. `None` = use the perf-mode base.
+    pub repaint_hint_ms: Option<u64>,
+    /// GIFs that could not be decoded: never retried (see `video_poster_failed`).
+    pub gif_failed: HashSet<PathBuf>,
+    // ---- animated GIF in the side preview pane ----
+    /// Path the side-pane GIF state currently belongs to (reset on change).
+    pub side_gif_path: Option<PathBuf>,
+    /// In-flight whole-clip decode for the side pane.
+    pub side_gif_rx: Option<(PathBuf, std::sync::mpsc::Receiver<Option<crate::gif::GifClip>>)>,
+    /// Decoded clip shown in the side pane.
+    pub side_gif: Option<(PathBuf, crate::gif::GifClip)>,
+    /// Current frame index / the instant it must be replaced.
+    pub side_gif_idx: usize,
+    pub side_gif_due: Option<std::time::Instant>,
+    /// Whether the side-pane GIF is advancing.
+    pub side_gif_playing: bool,
+    /// Reused texture for the current side-pane GIF frame.
+    pub side_gif_tex: Option<egui::TextureHandle>,
+    /// Frame index currently uploaded to `side_gif_tex` (skip re-upload on redraw).
+    pub side_gif_painted_idx: usize,
+    /// Side-pane GIFs that failed to decode.
+    pub side_gif_failed: HashSet<PathBuf>,
     /// Image → ICO / PNG conversion dialog (opened from the viewer's
     /// right-click menu). Holds the decoded source until it closes.
     pub convert: Option<crate::convert::ConvertState>,
@@ -430,6 +525,22 @@ impl Explorer {
             .unwrap_or(0);
         let ui_font =
             crate::normalize_font_key(store.meta("ui_font").unwrap_or(crate::DEFAULT_FONT));
+        // Viewer slideshow options. Looping is on by default: a clip that
+        // simply stops on its last frame looks broken.
+        let viewer_loop = store.meta("viewer_loop").map_or(true, |v| v == "1");
+        let viewer_auto_next = store.meta("viewer_auto_next") == Some("1");
+        let viewer_slide_secs = store
+            .meta("viewer_slide_secs")
+            .and_then(|v| v.parse::<u32>().ok())
+            .unwrap_or(5)
+            .clamp(1, 3600);
+        let viewer_play_on = store.meta("viewer_play_on") == Some("1");
+        let viewer_muted = store.meta("viewer_muted").map_or(true, |v| v == "1");
+        let viewer_perf = store
+            .meta("viewer_perf")
+            .and_then(|v| v.parse::<u8>().ok())
+            .unwrap_or(1)
+            .clamp(0, 2);
         let text_dark = Self::meta_color(&store, "text_dark").unwrap_or(egui::Color32::from_gray(240));
         let weak_dark = Self::meta_color(&store, "weak_dark").unwrap_or(egui::Color32::from_gray(170));
         let text_light = Self::meta_color(&store, "text_light").unwrap_or(egui::Color32::from_gray(20));
@@ -504,7 +615,48 @@ impl Explorer {
             viewer_index: 0,
             viewer_pan: egui::Vec2::ZERO,
             viewer_wheel_at: None,
+            viewer_is_video: false,
+            viewer_is_gif: false,
+            viewer_kind_path: None,
+            video_poster: None,
+            video_frame: None,
+            video_playing: false,
+            video_playback: None,
+            video_pos_ns: 0,
+            video_dur_ns: None,
+            video_eos: false,
+            video_seek_frac: None,
+            video_jobs: Vec::new(),
+            side_video_tex: None,
+            thumb_video_cache: Vec::new(),
+            video_poster_failed: HashSet::new(),
             preview_text: None,
+            viewer_loop,
+            viewer_auto_next,
+            viewer_slide_secs,
+            viewer_play_on,
+            viewer_muted,
+            viewer_perf,
+            slide_path: None,
+            slide_at: None,
+            gif_rx: None,
+            gif_clip: None,
+            gif_idx: 0,
+            gif_due: None,
+            gif_playing: true,
+            gif_tex: None,
+            gif_painted_idx: usize::MAX,
+            repaint_hint_ms: None,
+            gif_failed: HashSet::new(),
+            side_gif_path: None,
+            side_gif_rx: None,
+            side_gif: None,
+            side_gif_idx: 0,
+            side_gif_due: None,
+            side_gif_playing: true,
+            side_gif_tex: None,
+            side_gif_painted_idx: usize::MAX,
+            side_gif_failed: HashSet::new(),
             convert: None,
             dark,
             lang,
@@ -813,6 +965,21 @@ impl Explorer {
             tab.panes[if is_left { 0 } else { 1 }].view = view;
         }
         self.persist_layout();
+    }
+
+    /// Write the viewer's loop / auto-next options to the store. Called the
+    /// moment the user flips one, so a crash cannot lose them.
+    pub fn persist_viewer_opts(&mut self) {
+        self.store
+            .set_meta("viewer_loop", if self.viewer_loop { "1" } else { "0" });
+        self.store
+            .set_meta("viewer_auto_next", if self.viewer_auto_next { "1" } else { "0" });
+        self.store
+            .set_meta("viewer_slide_secs", &self.viewer_slide_secs.to_string());
+        self.store
+            .set_meta("viewer_muted", if self.viewer_muted { "1" } else { "0" });
+        self.store
+            .set_meta("viewer_perf", &self.viewer_perf.to_string());
     }
 
     /// Persist the tab list and every layout bit that must survive a restart.
@@ -1553,8 +1720,16 @@ impl Explorer {
     /// delivers something or the user navigates. It is now called from
     /// navigation as well, so the periodic call is only a top-up.
     pub fn refresh_folder_sizes_throttled(&mut self) {
-        const INTERVAL: std::time::Duration = std::time::Duration::from_millis(1000);
-        if self.last_size_poll.elapsed() < INTERVAL {
+        // Perf mode scales how often the background size scan is kicked. The
+        // scan itself (Win32 batch enumeration) is the heaviest background CPU
+        // in the file manager, so the 小 setting thins it out a lot.
+        let interval_ms = match self.viewer_perf {
+            0 => 2500, // 小: ~2.5s, minimal background disk/CPU activity
+            2 => 500,  // 大: ~0.5s, keeps sizes fresh
+            _ => 1000, // 中: 1s (default)
+        };
+        let interval = std::time::Duration::from_millis(interval_ms);
+        if self.last_size_poll.elapsed() < interval {
             return;
         }
         self.last_size_poll = std::time::Instant::now();
@@ -1569,7 +1744,14 @@ impl Explorer {
     /// folder 300's size), and a value that is still inside its TTL is reused
     /// instead of rescanned.
     pub fn request_folder_sizes(&mut self) {
-        self.request_sizes_limited(FOLDERS_PER_PANEL, MAX_PENDING_SIZES, false);
+        // 小 scans fewer folders per tick and keeps a shallow queue, so a
+        // folder full of sub-directories does not spin the disk flat out.
+        let (per_panel, max_pending) = match self.viewer_perf {
+            0 => (8, 16),
+            2 => (48, 128),
+            _ => (FOLDERS_PER_PANEL, MAX_PENDING_SIZES),
+        };
+        self.request_sizes_limited(per_panel, max_pending, false);
     }
 
     /// Same, with caller-chosen ceilings and scan mode. The manual
@@ -2763,7 +2945,7 @@ fn remove_tree(p: &std::path::Path) -> std::io::Result<()> {
                         continue;
                     }
                     let name = e.file_name().to_string_lossy().into_owned();
-                    if crate::preview::is_image(&name) {
+                    if crate::preview::is_previewable(&name, &p) {
                         list.push(p);
                     }
                 }
@@ -2774,7 +2956,7 @@ fn remove_tree(p: &std::path::Path) -> std::io::Result<()> {
                 if e.is_dir {
                     continue;
                 }
-                if crate::preview::is_image(&e.name) {
+                if crate::preview::is_previewable(&e.name, &dir.join(&e.name)) {
                     list.push(dir.join(&e.name));
                 }
             }
@@ -3006,7 +3188,7 @@ fn remove_tree(p: &std::path::Path) -> std::io::Result<()> {
     ) {
         let path = path.to_path_buf();
         let is_left = self.active_pane == 0;
-        let is_img = !is_dir && crate::preview::is_image(name);
+        let is_img = !is_dir && crate::preview::is_previewable(name, &path);
 
         if is_dir {
             if ui.button(crate::lang::tr("打开", self.lang)).clicked() {
@@ -3053,7 +3235,7 @@ fn remove_tree(p: &std::path::Path) -> std::io::Result<()> {
             crate::fs_util::open_with_notepad(&path);
             ui.close_menu();
         }
-        if is_img && ui.button(crate::lang::tr("预览图片", self.lang)).clicked() {
+        if is_img && ui.button(crate::lang::tr("预览", self.lang)).clicked() {
             self.open_viewer(&[], path.clone());
             ui.close_menu();
         }
