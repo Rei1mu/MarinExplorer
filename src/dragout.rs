@@ -22,11 +22,21 @@ mod imp {
     const E_NOTIMPL: i32 = 0x8000_4001u32 as i32;
     const DV_E_FORMATETC: i32 = 0x8004_0064u32 as i32;
 
+    const MK_LBUTTON: u32 = 0x0001;
+    const MK_RBUTTON: u32 = 0x0002;
+    const COINIT_APARTMENTTHREADED: u32 = 0x0000_0002;
+    const DRAGDROP_S_DROP: i32 = 0x0004_0100;
+    const DRAGDROP_S_CANCEL: i32 = 0x0004_0101;
+    const DRAGDROP_S_USEDEFAULTCURSORS: i32 = 0x0004_0102;
+
     // IUnknown = 00000000-0000-0000-C000-000000000046
     const IID_IUNKNOWN: [u8; 16] = [0, 0, 0, 0, 0, 0, 0, 0, 0xC0, 0, 0, 0, 0, 0, 0, 0x46];
     // IDataObject = 0000010E-0000-0000-C000-000000000046
     const IID_IDATAOBJECT: [u8; 16] =
         [0x0E, 0x01, 0x00, 0x00, 0, 0, 0, 0, 0xC0, 0, 0, 0, 0, 0, 0, 0x46];
+    // IDropSource = 00000101-0000-0000-C000-000000000046
+    const IID_IDROPSOURCE: [u8; 16] =
+        [0x01, 0x01, 0x00, 0x00, 0, 0, 0, 0, 0xC0, 0, 0, 0, 0, 0, 0, 0x46];
 
     #[repr(C)]
     #[derive(Clone, Copy)]
@@ -326,6 +336,89 @@ mod imp {
         Box::into_raw(obj)
     }
 
+    // ---- IDropSource ----
+    // `DoDragDrop` requires a non-null `IDropSource` — the system does NOT
+    // supply a default one (passing null makes the call fail immediately,
+    // which is why drag-out never started). These two methods are all a
+    // "copy these files" drag needs.
+    #[repr(C)]
+    struct IDropSourceVtbl {
+        query_interface: extern "system" fn(*mut IDropSource, *const u8, *mut *mut ()) -> i32,
+        add_ref: extern "system" fn(*mut IDropSource) -> u32,
+        release: extern "system" fn(*mut IDropSource) -> u32,
+        query_continue_drag: extern "system" fn(*mut IDropSource, i32, u32) -> i32,
+        give_feedback: extern "system" fn(*mut IDropSource, u32) -> i32,
+    }
+
+    #[repr(C)]
+    struct IDropSource {
+        vtbl: *const IDropSourceVtbl,
+        refs: AtomicI32,
+    }
+
+    extern "system" fn src_query_interface(
+        this: *mut IDropSource,
+        riid: *const u8,
+        out: *mut *mut (),
+    ) -> i32 {
+        unsafe {
+            let id = std::slice::from_raw_parts(riid, 16);
+            if id == IID_IUNKNOWN || id == IID_IDROPSOURCE {
+                *out = this as *mut ();
+                (*this).refs.fetch_add(1, Ordering::Relaxed);
+                S_OK
+            } else {
+                *out = ptr::null_mut();
+                E_NOINTERFACE
+            }
+        }
+    }
+    extern "system" fn src_add_ref(this: *mut IDropSource) -> u32 {
+        unsafe { ((*this).refs.fetch_add(1, Ordering::Relaxed) as u32) + 1 }
+    }
+    extern "system" fn src_release(this: *mut IDropSource) -> u32 {
+        unsafe {
+            let n = (*this).refs.fetch_sub(1, Ordering::Relaxed) - 1;
+            if n == 0 {
+                drop(Box::from_raw(this));
+            }
+            n as u32
+        }
+    }
+    // Keep dragging while a mouse button is held; drop on release, cancel on Esc.
+    extern "system" fn src_query_continue_drag(
+        _this: *mut IDropSource,
+        f_escape_pressed: i32,
+        grf_key_state: u32,
+    ) -> i32 {
+        if f_escape_pressed != 0 {
+            return DRAGDROP_S_CANCEL;
+        }
+        if (grf_key_state & MK_LBUTTON) == 0 && (grf_key_state & MK_RBUTTON) == 0 {
+            return DRAGDROP_S_DROP;
+        }
+        S_OK
+    }
+    extern "system" fn src_give_feedback(_this: *mut IDropSource, _dw_effect: u32) -> i32 {
+        DRAGDROP_S_USEDEFAULTCURSORS
+    }
+
+    unsafe fn make_drop_source() -> *mut IDropSource {
+        let vtbl = IDropSourceVtbl {
+            query_interface: src_query_interface,
+            add_ref: src_add_ref,
+            release: src_release,
+            query_continue_drag: src_query_continue_drag,
+            give_feedback: src_give_feedback,
+        };
+        let vtbl_box = Box::new(vtbl);
+        let obj = Box::new(IDropSource {
+            vtbl: Box::into_raw(vtbl_box),
+            refs: AtomicI32::new(1),
+        });
+        Box::into_raw(obj)
+    }
+
     unsafe extern "system" {
         fn GlobalAlloc(flags: u32, bytes: usize) -> *mut u8;
         fn GlobalFree(handle: *mut u8) -> *mut u8;
@@ -333,6 +426,7 @@ mod imp {
         fn GlobalUnlock(handle: *mut u8) -> i32;
         fn GlobalSize(handle: *mut u8) -> usize;
         fn OleInitialize(pv: *const ()) -> i32;
+        fn CoInitializeEx(pvReserved: *const (), dwCoInit: u32) -> i32;
         fn DoDragDrop(
             pdo: *mut (),
             pdsrc: *mut (), // IDropSource; we pass null and let the system supply
@@ -433,17 +527,22 @@ mod imp {
                 return false;
             }
             let obj = make_data_object(drop_hglobal);
-            // Make sure OLE is available on this thread.
+            let src = make_drop_source();
+            // `DoDragDrop` needs an STA apartment with OLE initialized on the
+            // calling thread. The GUI thread is STA (winit sets it up for drop
+            // targets); explicitly request STA so this also works if nothing
+            // initialized COM yet. OleInitialize's return is ignored — if the
+            // thread is already STA this is a harmless S_FALSE.
+            let _ = CoInitializeEx(ptr::null(), COINIT_APARTMENTTHREADED);
             let _ = OleInitialize(ptr::null());
             let mut effect: u32 = 0;
-            // pdsrc = null → the system provides a default drop source, which is
-            // exactly what a simple "copy these files" drag needs.
             let hr = DoDragDrop(
                 obj as *mut (),
-                ptr::null_mut(),
+                src as *mut (),
                 DROPEFFECT_COPY,
                 &mut effect,
             );
+            let _ = src_release(src);
             let _ = obj_release(obj);
             hr == S_OK
         }

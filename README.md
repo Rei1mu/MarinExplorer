@@ -11,6 +11,12 @@
 
 ## 更新日志 / Changelog
 
+### v0.1.15 — 2026-10-28
+- **修复文件拖拽到外部程序**：之前「拖出文件」功能从未真正生效——底层 `DoDragDrop` 的拖源参数被传成了 null，而 Windows 不会替程序提供默认拖源，调用直接失败、拖拽从未启动。现已补上完整的 `IDropSource`（按住时拖拽、松开即放置、Esc 取消），列表与网格里的文件可以真正拖到 QQ、上传框、资源管理器等任何支持的地方。
+
+**English**
+- **Fixed dragging files out to other programs**: the "drag out" feature never actually engaged — `DoDragDrop` was called with a null drop source, and Windows does not supply a default one, so the call failed instantly and no drag ever started. A proper `IDropSource` is now provided (drag while a button is held, drop on release, Esc cancels), so files in the list and grid can now be dragged into QQ, upload boxes, Explorer, anything.
+
 ### v0.1.14 — 2026-10-28
 - **不再自动提权（普通用户权限运行）**：此前程序每次启动都自提权到管理员，导致 Windows 的 UIPI 隔离禁止普通程序（QQ、资源管理器）读取它放进剪贴板或拖出去的内容——复制/拖拽到外部程序因此无效。现在默认以普通权限运行，剪贴板复制、拖拽到 QQ/上传框全部可用。仅「清空回收站」这一种需要管理员的操作改为点击时临时申请 UAC，用完即退。
 - **GIF / 视频可复制成文件**：查看器工具栏和右键菜单的「复制文件」把整个 GIF/视频文件（CF_HDROP）放进剪贴板，可直接粘贴到 QQ 发送原文件，而不是复制某一帧静态图。查看器对 GIF/视频自动隐藏「复制图片」（那只复制单帧）。
