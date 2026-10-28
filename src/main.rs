@@ -114,46 +114,62 @@ pub enum VideoJobKind {
 }
 
 fn main() -> eframe::Result {
+    // Put the UI thread in an STA apartment + initialize OLE up front, so the
+    // in-window OLE file drag (DoDragDrop) runs on an STA thread and never
+    // hangs. Must happen before any window / GUI is created.
+    crate::dragout::init_com_sta();
+
     // ---- one-shot elevated actions --------------------------------------
-    // The app no longer self-elevates (see below): running as a normal user is
-    // what lets the clipboard and OLE drag-drop reach other programs (QQ,
-    // Explorer) — UIPI otherwise blocks those from reading anything a higher
-    // integrity process put on the clipboard. The only thing that still needs
-    // admin is emptying *every* account's Recycle Bin, so that one action is
-    // launched elevated on demand and exits immediately.
+    // Emptying *every* account's Recycle Bin needs admin, so it is launched
+    // elevated on demand and exits immediately (see the button handler).
     if std::env::args().any(|a| a == "--empty-recycle") {
         let _ = crate::shell::empty_recycle_bin(None);
         return Ok(());
     }
 
-    // ---- single instance -------------------------------------------------
-    // A second launch must not open a second window: it activates the one the
-    // first instance owns and hands over any path it carried. Both instances
-    // now run at the same (medium) integrity, so UIPI is never in the way and
-    // no UAC hop is needed for take-over.
+    // ---- single instance (checked BEFORE elevation) ---------------------
+    // A plain double-click while we are already open must only bring the
+    // window to the front — never a UAC prompt. `EnumWindows` /
+    // `SetForegroundWindow` and the file-drop inbox all work from the
+    // unelevated launcher against the elevated instance's window (see
+    // `single.rs`), so activation needs no elevation. A replace (`--take-over`)
+    // needs elevation to terminate the higher-integrity instance.
     let take_over = std::env::args().any(|a| a == "--take-over");
     let path_arg = std::env::args()
         .skip(1)
         .find(|a| a != "--elevated" && a != "--take-over");
-    // Same-integrity single instance: no elevation hops anywhere.
     if let Some(found) = crate::single::find_existing() {
-        if take_over {
-            // Tray 重启 / explicit replace: close the old window directly.
+        if take_over || !crate::single::same_build(&found) {
+            // Replace the running instance. Both normally run at medium
+            // integrity now, so `take_over` terminates it directly — no UAC.
+            // Only a leftover *elevated* build survives that; then (and only
+            // then) we hop up with `runas` to terminate it.
             crate::single::take_over(&found);
-        } else if crate::single::same_build(&found) {
-            // Same binary: hand the path over (if any) and bring the window
-            // forward. No UAC, no second process.
+            if crate::single::find_existing().is_some() {
+                if !crate::shell::is_elevated() {
+                    crate::shell::relaunch_elevated_with(&["--take-over"]);
+                }
+                return Ok(());
+            }
+            // The old window is gone: fall through to start a fresh one.
+        } else {
+            // Same binary already running: hand the path over (if any) and
+            // show its window. No UAC, no second process.
             if let Some(p) = &path_arg {
                 crate::single::write_inbox(p);
             }
             crate::single::activate(found.hwnd);
             return Ok(());
-        } else {
-            // Older build owns the window: replace it directly (same integrity,
-            // so no UAC needed).
-            crate::single::take_over(&found);
         }
     }
+
+    // ---- run at normal (medium) integrity -------------------------------
+    // Do NOT self-elevate. A medium-integrity process shares the Windows
+    // clipboard with Explorer / QQ / browsers, which is what lets Ctrl+C here
+    // paste *into* them. An elevated window's clipboard is invisible to those
+    // programs (UIPI), which broke cross-app paste. The few actions that truly
+    // need admin (empty every account's Recycle Bin, replace an elevated
+    // leftover) are launched elevated on demand, see `--empty-recycle` above.
 
     let store = Store::load();
 
@@ -517,6 +533,14 @@ impl eframe::App for Explorer {
     }
 
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        // Run a deferred OLE file drag requested during the last frame's
+        // interaction. Must run HERE (top of update, outside any widget
+        // callback): `DoDragDrop` opens a modal loop and blocks until the mouse
+        // is released, so it must never re-enter the UI state.
+        if let Some(paths) = self.pending_os_drag.take() {
+            crate::dragout::begin_file_drag(&paths);
+            return;
+        }
         // Light / dark theme. Only re-applied when `dark` changes — rebuilding
         // the whole `Visuals` every frame was pure waste (the toggle is still
         // instant because `set_dark` flips `self.dark` and the next frame
@@ -580,6 +604,52 @@ impl eframe::App for Explorer {
         self.text_focus = false;
         // Each frame starts fresh: set when the address editor consumes Enter.
         self.enter_consumed = false;
+        // ----- live key echo (bottom-left) -------------------------------
+        // Mirror the chord the user just pressed: bare Ctrl / Shift / Alt as
+        // soon as the modifier goes down, then the full chord once a second
+        // key lands (Ctrl+A, Ctrl+C, Del, Enter, …). Purely a visual ack.
+        {
+            let (prev_c, prev_s, prev_a) = (self.prev_ctrl, self.prev_shift, self.prev_alt);
+            let mut echo: Option<String> = None;
+            ctx.input(|i| {
+                let m = i.modifiers;
+                let mut last: Option<String> = None;
+                for ev in &i.events {
+                    match ev {
+                        egui::Event::Key { key, pressed: true, .. } => {
+                            last = Some(key_name(*key))
+                        }
+                        // egui-winit rewrites Ctrl+C/X/V into clipboard
+                        // commands and never emits the Key event, so rebuild
+                        // the label from the command itself.
+                        egui::Event::Copy => last = Some("C".into()),
+                        egui::Event::Cut => last = Some("X".into()),
+                        egui::Event::Paste(_) => last = Some("V".into()),
+                        _ => {}
+                    }
+                }
+                let mut s = String::new();
+                if m.ctrl { s.push_str("Ctrl+"); }
+                if m.shift { s.push_str("Shift+"); }
+                if m.alt { s.push_str("Alt+"); }
+                if let Some(k) = last {
+                    s.push_str(&k);
+                    echo = Some(s);
+                } else if (m.ctrl && !prev_c) || (m.shift && !prev_s) || (m.alt && !prev_a) {
+                    // Only modifiers down so far: drop the trailing '+'.
+                    while s.ends_with('+') { s.pop(); }
+                    echo = Some(s);
+                }
+            });
+            if let Some(s) = echo {
+                self.key_echo = s;
+            }
+            let (c, s, a) =
+                ctx.input(|i| (i.modifiers.ctrl, i.modifiers.shift, i.modifiers.alt));
+            self.prev_ctrl = c;
+            self.prev_shift = s;
+            self.prev_alt = a;
+        }
         // ----- video poster jobs / playback pacing -----
         // Poster jobs and playback advance on background threads, so the UI
         // must keep painting while any is in flight (bounded: only while
@@ -990,6 +1060,13 @@ impl eframe::App for Explorer {
         // ----- bottom status bar -----
         egui::TopBottomPanel::bottom("statusbar").show(ctx, |ui| {
             ui.horizontal(|ui| {
+                // Bottom-left: echo the key chord just pressed (Ctrl+A, Del, …).
+                if !self.key_echo.is_empty() {
+                    ui.label(
+                        egui::RichText::new(format!("[{}]", self.key_echo)).strong(),
+                    );
+                    ui.separator();
+                }
                 ui.strong(&self.status);
                 // The folder-size box. It owns its own slot so that neither
                 // the running line nor the finish line ever lands in the
@@ -1732,6 +1809,15 @@ impl eframe::App for Explorer {
                     self.do_delete();
                 }
             }
+            // A confirmation dialog is open: Enter confirms it. Esc is handled
+            // by the global handler above (it cancels every dialog), so only
+            // the confirm side is wired here. The destructive one is delete;
+            // Enter on it commits the deletion the user just asked for.
+            if key(egui::Key::Enter) {
+                if self.delete_open {
+                    self.confirm_delete();
+                }
+            }
             if !any_dialog && !self.enter_consumed && key(egui::Key::Enter) { self.open_selected(); }
             if !any_dialog {
                 if key(egui::Key::ArrowUp) { self.move_selection(-1, false, false); }
@@ -1763,15 +1849,25 @@ impl eframe::App for Explorer {
                 if ctx.input(|i| i.modifiers.ctrl && i.key_pressed(egui::Key::A)) {
                     self.select_all();
                 }
-                if ctx.input(|i| i.modifiers.ctrl && i.key_pressed(egui::Key::C)) {
-                    self.do_copy();
-                }
-                if ctx.input(|i| i.modifiers.ctrl && i.key_pressed(egui::Key::X)) {
-                    self.do_move();
-                }
-                if ctx.input(|i| i.modifiers.ctrl && i.key_pressed(egui::Key::V)) {
-                    self.do_paste();
-                }
+                // egui-winit rewrites Ctrl+C / Ctrl+X / Ctrl+V into clipboard
+                // *commands* (`Event::Copy` / `Cut` / `Paste`) and never emits
+                // a `Key::C` / `X` / `V` event, so `key_pressed()` above can
+                // never see them. Drive the file clipboard off those commands.
+                let (copy_ev, cut_ev, paste_ev) = ctx.input(|i| {
+                    let (mut c, mut x, mut v) = (false, false, false);
+                    for e in &i.events {
+                        match e {
+                            egui::Event::Copy => c = true,
+                            egui::Event::Cut => x = true,
+                            egui::Event::Paste(_) => v = true,
+                            _ => {}
+                        }
+                    }
+                    (c, x, v)
+                });
+                if copy_ev { self.do_copy(); }
+                if cut_ev { self.do_move(); }
+                if paste_ev { self.do_paste(); }
             }
             if ctx.input(|i| i.modifiers.ctrl && i.key_pressed(egui::Key::Tab)) {
                 let next = (self.active_tab + 1) % self.tabs.len();
@@ -1805,6 +1901,41 @@ impl eframe::App for Explorer {
             };
             ctx.request_repaint_after(Duration::from_millis(ms));
         }
+    }
+}
+
+/// Human-friendly label for a key in the bottom-left echo. Letters/digits
+/// fall through to `Debug` (which already gives `A`, `Z`, …); the ones a user
+/// actually reaches for get short names (`Del`, `Esc`, arrows).
+fn key_name(k: egui::Key) -> String {
+    use egui::Key::*;
+    match k {
+        Delete => "Del".into(),
+        Enter => "Enter".into(),
+        Escape => "Esc".into(),
+        Space => "Space".into(),
+        Backspace => "Backspace".into(),
+        Tab => "Tab".into(),
+        Insert => "Ins".into(),
+        ArrowUp => "↑".into(),
+        ArrowDown => "↓".into(),
+        ArrowLeft => "←".into(),
+        ArrowRight => "→".into(),
+        Home => "Home".into(),
+        End => "End".into(),
+        PageUp => "PgUp".into(),
+        PageDown => "PgDn".into(),
+        Num0 => "0".into(),
+        Num1 => "1".into(),
+        Num2 => "2".into(),
+        Num3 => "3".into(),
+        Num4 => "4".into(),
+        Num5 => "5".into(),
+        Num6 => "6".into(),
+        Num7 => "7".into(),
+        Num8 => "8".into(),
+        Num9 => "9".into(),
+        _ => format!("{k:?}"),
     }
 }
 
@@ -4681,7 +4812,11 @@ impl Explorer {
         if paths.is_empty() {
             return false;
         }
-        crate::dragout::begin_file_drag(&paths)
+        // Defer the actual OLE drag to the top of the next `update` so
+        // `DoDragDrop`'s modal loop runs outside any widget callback (no
+        // re-entrant UI access). It blocks until the mouse is released.
+        self.pending_os_drag = Some(paths);
+        true
     }
 
     /// Double-click / Enter on a row.

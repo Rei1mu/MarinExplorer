@@ -362,11 +362,13 @@ pub fn is_elevated() -> bool {
 /// Returns false when nothing was launched (declined, cancelled, or the
 /// platform has no UAC).
 #[cfg(target_os = "windows")]
+#[allow(dead_code)] // kept for on-demand elevation; the default path is unelevated
 pub fn relaunch_elevated() -> bool {
     win::relaunch_elevated()
 }
 
 #[cfg(not(target_os = "windows"))]
+#[allow(dead_code)]
 pub fn relaunch_elevated() -> bool {
     false
 }

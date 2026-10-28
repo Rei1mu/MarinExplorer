@@ -290,6 +290,10 @@ pub struct Explorer {
     /// 2 = 大 (smoothest). Persisted as `viewer_perf`; governs how often the
     /// viewer window repaints while a clip plays.
     pub viewer_perf: u8,
+    /// Deferred OLE file drag requested during a widget interaction. Run at the
+    /// top of the next `update` so `DoDragDrop`'s modal loop never re-enters UI
+    /// state (which crashed before).
+    pub pending_os_drag: Option<Vec<std::path::PathBuf>>,
     /// File the slide timer is currently running for (reset when it changes).
     pub slide_path: Option<PathBuf>,
     pub slide_at: Option<std::time::Instant>,
@@ -377,6 +381,14 @@ pub struct Explorer {
     pub last_flush: Instant,
     /// Set every frame: true when the filter text-edit currently has focus.
     pub text_focus: bool,
+    /// Live echo of the last key chord the user pressed (`Ctrl+A`, `Del`, …).
+    /// Drawn bottom-left so every keypress is visibly acknowledged.
+    pub key_echo: String,
+    /// Modifier state from the previous frame, so a bare Ctrl / Shift / Alt
+    /// press is echoed even before a second key joins the chord.
+    pub prev_ctrl: bool,
+    pub prev_shift: bool,
+    pub prev_alt: bool,
     // ---- list-view column widths (user-resizable; persisted) ----
     // The 修改日期 column is not stored: it flexes to absorb the leftover
     // horizontal space, so the table never overflows or leaves a gap.
@@ -560,6 +572,10 @@ impl Explorer {
             status_at: Instant::now(),
             status_fresh: false,
             status: String::new(),
+            key_echo: String::new(),
+            prev_ctrl: false,
+            prev_shift: false,
+            prev_alt: false,
             show_hidden: false,
             drives: vec![],
             drives_rx: None,
@@ -637,6 +653,7 @@ impl Explorer {
             viewer_play_on,
             viewer_muted,
             viewer_perf,
+            pending_os_drag: None,
             slide_path: None,
             slide_at: None,
             gif_rx: None,
@@ -2439,9 +2456,11 @@ impl Explorer {
         if paths.is_empty() {
             return;
         }
-        // One code path for both: `delete_paths` keeps a lone *file*
-        // synchronous (instant) and sends everything heavier to a worker.
-        self.delete_paths(paths, false);
+        // Same confirmation path as right-click / Shift+Delete: keyboard
+        // Delete must not wipe files silently, so it opens the dialog too.
+        self.delete_targets = paths;
+        self.delete_permanent = false;
+        self.delete_open = true;
     }
 
     /// Shift+Delete: permanent deletion, guarded by a confirmation dialog.

@@ -9,6 +9,16 @@
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
+/// Spawn a child with no console window. Every helper below that shells out to
+/// a console-subsystem tool (`powershell`, `cmd`, `where.exe`) passes this, so
+/// the GUI never flashes a black window. `open_terminal` deliberately uses
+/// `CREATE_NEW_CONSOLE` instead — it *wants* a visible terminal.
+#[cfg(target_os = "windows")]
+const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+
+#[cfg(target_os = "windows")]
+use std::os::windows::process::CommandExt;
+
 /// One fixed drive with its capacity.
 #[derive(Clone)]
 pub struct DriveInfo {
@@ -106,6 +116,7 @@ pub fn get_user_sid() -> Option<String> {
                 "-Command",
                 "[System.Security.Principal.WindowsIdentity]::GetCurrent().User.Value",
             ])
+            .creation_flags(CREATE_NO_WINDOW)
             .output()
             .ok()?;
         let text = String::from_utf8_lossy(&out.stdout);
@@ -129,6 +140,7 @@ pub fn open_default_file(path: &Path) {
         // `start` needs an empty title slot before the real path.
         Command::new("cmd")
             .args(["/C", "start", "", &path.to_string_lossy()])
+            .creation_flags(CREATE_NO_WINDOW)
             .spawn()
             .ok();
     }
@@ -151,7 +163,11 @@ pub fn vscode_exe() -> Option<&'static Path> {
         static FOUND: OnceLock<Option<PathBuf>> = OnceLock::new();
         FOUND
             .get_or_init(|| {
-                if let Ok(out) = Command::new("where.exe").arg("code").output() {
+                if let Ok(out) = Command::new("where.exe")
+                    .arg("code")
+                    .creation_flags(CREATE_NO_WINDOW)
+                    .output()
+                {
                     if out.status.success() {
                         if let Some(line) = String::from_utf8_lossy(&out.stdout).lines().next() {
                             let p = PathBuf::from(line.trim());
@@ -772,6 +788,7 @@ pub fn set_clipboard_files(paths: &[PathBuf]) {
         }
 
         const CF_HDROP: u32 = 15;
+        const CF_UNICODETEXT: u32 = 13;
         const GMEM_MOVEABLE: u32 = 0x0002;
 
         if paths.is_empty() {
@@ -790,8 +807,8 @@ pub fn set_clipboard_files(paths: &[PathBuf]) {
         if h.is_null() {
             return;
         }
-        let p = GlobalLock(h);
-        if p.is_null() {
+        let lp = GlobalLock(h);
+        if lp.is_null() {
             GlobalFree(h);
             return;
         }
@@ -804,21 +821,58 @@ pub fn set_clipboard_files(paths: &[PathBuf]) {
         };
         std::ptr::copy_nonoverlapping(
             &df as *const Dropfiles as *const u8,
-            p,
+            lp,
             std::mem::size_of::<Dropfiles>(),
         );
-        std::ptr::copy_nonoverlapping(wide.as_ptr() as *const u8, p.add(hdr as usize), wide.len() * 2);
+        std::ptr::copy_nonoverlapping(wide.as_ptr() as *const u8, lp.add(hdr as usize), wide.len() * 2);
         GlobalUnlock(h);
+
+        // Publish the same paths as plain text (CF_UNICODETEXT), as Explorer
+        // does. Besides letting a text target accept the paths, this is what
+        // makes egui-winit emit a Paste event for Ctrl+V — that integration
+        // only reports a paste when the clipboard actually holds *text*.
+        let mut text: Vec<u16> = Vec::new();
+        for (i, p) in paths.iter().enumerate() {
+            if i > 0 {
+                text.extend("\r\n".encode_utf16());
+            }
+            text.extend(p.as_os_str().encode_wide());
+        }
+        text.push(0);
+        let h_text = GlobalAlloc(GMEM_MOVEABLE, text.len() * 2);
+        let mut text_ok = false;
+        if !h_text.is_null() {
+            let tp = GlobalLock(h_text);
+            if tp.is_null() {
+                GlobalFree(h_text);
+            } else {
+                std::ptr::copy_nonoverlapping(text.as_ptr() as *const u8, tp, text.len() * 2);
+                GlobalUnlock(h_text);
+                text_ok = true;
+            }
+        }
+
         if OpenClipboard(std::ptr::null_mut()) == 0 {
             GlobalFree(h);
+            if text_ok {
+                GlobalFree(h_text);
+            }
             return;
         }
         EmptyClipboard();
         let got = SetClipboardData(CF_HDROP, h);
+        let got_text = if text_ok {
+            SetClipboardData(CF_UNICODETEXT, h_text)
+        } else {
+            std::ptr::null_mut()
+        };
         let _ = CloseClipboard();
         // On failure the caller keeps ownership of the block.
         if got.is_null() {
             GlobalFree(h);
+        }
+        if text_ok && got_text.is_null() {
+            GlobalFree(h_text);
         }
     }
     #[cfg(not(target_os = "windows"))]

@@ -11,6 +11,24 @@
 
 ## 更新日志 / Changelog
 
+### v0.1.16 — 2026-10-28
+- **修复 Ctrl+C / Ctrl+X / Ctrl+V 完全失效**：这不是权限问题，底层 UI 框架会把这三个组合键改写成「剪贴板命令」而不再产生普通按键事件，程序因此一直收不到。现改为直接响应剪贴板命令，复制、剪切、粘贴恢复；同时给文件剪贴板补写一份文本格式（与资源管理器一致），让粘贴事件能稳定触发。
+- **拖出文件稳定化**：拖拽改到 UI 线程的 COM 单线程套间里执行，并在每帧开头统一发起（不再从界面回调里直接调用），修复了拖拽时界面「未响应」和偶发崩溃（后者源于旧版格式枚举器永不结束，被系统越界读取）。列表与网格里的文件可拖到 Chrome / Edge 上传框、QQ、资源管理器，多选拖出整个选择。
+- **键盘 Delete 也弹确认框**：与右键删除、Shift+Delete 走同一条确认路径，不再一按就删。
+- **确认框支持键盘**：弹出后 `Enter` 确认、`Esc` 取消。
+- **左下角实时回显按键**：按 `Ctrl` 显示 `[Ctrl]`，再按 `A` / `C` / `X` / `V` 显示 `[Ctrl+A]`、`[Ctrl+C]` 等，Delete 显示 `[Del]`。
+- **默认普通用户权限运行**：跨程序复制粘贴要求双方同一完整性级别，提权会让外部程序读不到本程序放上剪贴板的内容；仅「清空回收站」等少数操作按需申请提权。
+- **内部命令不再弹出控制台窗口**：打开文件、定位回收站 SID、查找 VS Code 等改为无窗口启动子进程。
+
+**English**
+- **Fixed Ctrl+C / Ctrl+X / Ctrl+V being completely dead**: not a permissions issue — the UI framework rewrites these chords into clipboard *commands* and never emits key events, so the app never saw them. The app now handles the commands directly, restoring copy/cut/paste; the file clipboard also gets a text flavour (as Explorer does) so the paste command fires reliably.
+- **Drag-out made stable**: the OLE drag now runs on the UI thread inside a single-threaded COM apartment and is started at the top of a frame instead of from inside a widget callback, fixing both the "not responding" hang and the occasional crash (the old format enumerator never reported end-of-list, so the shell read past it). Files in the list and grid drag into Chrome / Edge upload zones, QQ and Explorer; a multi-selection drags the whole set.
+- **Keyboard Delete now asks for confirmation**: same path as right-click delete and Shift+Delete, instead of deleting immediately.
+- **Confirmation dialogs take the keyboard**: `Enter` confirms, `Esc` cancels.
+- **Live key echo in the bottom-left corner**: pressing `Ctrl` shows `[Ctrl]`, then `A` / `C` / `X` / `V` shows `[Ctrl+A]`, `[Ctrl+C]` and so on; Delete shows `[Del]`.
+- **Runs as a normal user by default**: cross-program copy/paste requires both sides at the same integrity level, and elevation makes the clipboard unreadable to other apps. The few actions that need admin (emptying the Recycle Bin) ask for UAC on demand.
+- **No console window from internal commands**: opening a file, locating the Recycle Bin SID, and probing for VS Code now spawn their child processes windowless.
+
 ### v0.1.15 — 2026-10-28
 - **修复文件拖拽到外部程序**：之前「拖出文件」功能从未真正生效——底层 `DoDragDrop` 的拖源参数被传成了 null，而 Windows 不会替程序提供默认拖源，调用直接失败、拖拽从未启动。现已补上完整的 `IDropSource`（按住时拖拽、松开即放置、Esc 取消），列表与网格里的文件可以真正拖到 QQ、上传框、资源管理器等任何支持的地方。
 
@@ -137,7 +155,7 @@
 
 首次打开会读取并缓存磁盘信息，之后都很快。
 
-💡 **建议以管理员身份运行**：访问受保护的系统目录、写入系统路径时，管理员权限能避免因权限不足导致的功能受限。
+💡 **权限说明**：默认以普通用户权限运行——复制粘贴、拖拽文件到浏览器或 QQ 都要求与对方同一权限级别，提权反而会让外部程序读不到本程序放上剪贴板的内容。确需访问受保护的系统目录时，右键以管理员身份运行即可（此时复制到外部程序会受限）。
 
 📌 **建议固定到任务栏**：安装后右键开始菜单（或桌面）里的 MarinExplorer 图标 →「固定到任务栏」，之后随点随用，不必每次翻开始菜单。
 
@@ -175,7 +193,7 @@
 - **转换为 PNG**：可选 0–9 压缩级别（0 = 不压缩，9 = 最小），导出到新文件夹，不会覆盖同名源文件。
 
 **拖拽与外壳集成**
-- 从面板**拖出文件**到外部程序。
+- 从面板**拖出文件**到外部程序：浏览器上传框（Chrome / Edge）、QQ、资源管理器等，光标跟随文件图标，松开即复制；多选时整组拖出。
 - 使用系统**真实文件图标**（shell icon），而不是自己画一套。
 - 支持 Windows 原生：深色标题栏、应用图标、系统托盘常驻。
 - **右键菜单集成**：「通过 MarinExplorer 打开」可出现在文件、文件夹、磁盘以及文件夹空白处，开关在设置里（也由安装包代为注册）。只写 `HKCU` 当前用户 hive，**不需要管理员权限**，随时可关。
@@ -256,7 +274,7 @@ You may change the install directory; the default is `%LOCALAPPDATA%\Programs\Ma
 
 The first open reads and caches disk info; afterwards it's fast.
 
-💡 **Run as Administrator** is recommended: it avoids permission errors when reaching protected system folders or writing to system paths.
+💡 **About permissions**: the app runs at normal user integrity by default — copy/paste and dragging files into browsers or QQ require the same integrity level on both sides, and elevating would make the clipboard unreadable to other programs. If you do need protected system folders, right-click and run as administrator (copying to external programs is limited in that mode).
 
 📌 **Pin it to the taskbar**: after install, right-click the MarinExplorer icon in the Start menu (or on the desktop) → "Pin to taskbar", so it's one click away every time.
 
@@ -294,7 +312,7 @@ Current form: a Rust + egui Windows desktop file manager focused on "works and f
 - **Convert to PNG**: choose a deflate level 0–9 (0 = none, 9 = smallest); output goes into a new folder so the same-named source is never overwritten.
 
 **Drag & shell integration**
-- Drag files **out** of a panel into other apps.
+- Drag files **out** of a panel into other apps: a browser upload box (Chrome / Edge), QQ, Explorer — a file icon follows the cursor and releasing copies it; a multi-selection drags the whole set.
 - Uses the system's **real file icons** (shell icons), not a hand-drawn set.
 - Native Windows: dark title bar, app icon, system tray resident.
 - **Right-click menu integration**: "Open with MarinExplorer" can appear on files, folders, drives and empty folder space, toggled from Settings (and registered for you by the installer). It only writes the current-user `HKCU` hive — **no administrator rights**, and it can be switched off at any time.
