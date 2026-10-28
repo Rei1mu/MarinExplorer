@@ -334,6 +334,7 @@ fn lookup(key: &str) -> Option<(&'static str, &'static str, &'static str)> {
         ("已清空回收站", "Emptied Recycle Bin", "ゴミ箱を空にしました", "已清空資源回收筒"),
         ("回收站已清空，但 %s 项无法删除（可尝试以管理员身份运行后重试）", "Recycle Bin emptied, but %s items could not be deleted (try running as administrator)", "ゴミ箱は空にしましたが、%s 項目を削除できませんでした（管理者として実行して再試行してください）", "資源回收筒已清空，但 %s 項無法刪除（可嘗試以管理員身分執行後重試）"),
         ("清空回收站…", "Emptying Recycle Bin…", "ゴミ箱を空にしています…", "清空資源回收筒…"),
+        ("已请求提权清空回收站…", "Requested elevated Recycle Bin empty…", "管理者権限でゴミ箱を空にすることを要求しました…", "已請求提權清空資源回收筒…"),
         ("已永久删除", "Permanently deleted", "完全削除しました", "已徹底刪除"),
         ("已移到回收站", "Moved to Recycle Bin", "ゴミ箱へ移動しました", "已移到資源回收筒"),
         ("新名称为空", "New name is empty", "名前が空です", "新名稱為空"),

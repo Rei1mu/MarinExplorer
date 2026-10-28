@@ -3016,16 +3016,28 @@ fn remove_tree(p: &std::path::Path) -> std::io::Result<()> {
     /// reveal actions plus the two conversion entries.
     pub fn viewer_context_menu(&mut self, ui: &mut egui::Ui, path: &std::path::Path) {
         let path = path.to_path_buf();
-        if ui
-            .button(crate::lang::tr("复制图片", self.lang))
-            .clicked()
-        {
-            self.status = if crate::fs_util::set_clipboard_image(&path) {
-                crate::lang::tr("已复制图片", self.lang).into()
-            } else {
-                crate::lang::tr("复制失败", self.lang).into()
-            };
-            ui.close_menu();
+        let name = path
+            .file_name()
+            .map(|s| s.to_string_lossy().into_owned())
+            .unwrap_or_default();
+        // "Copy image" copies a single still frame — wrong for a GIF/video,
+        // where the user wants the real (animated) file. Hide it there; the
+        // "Copy file" entry below always carries the whole file.
+        let is_still = crate::preview::is_image(&name, &path)
+            && !crate::preview::is_gif(&name, &path)
+            && !crate::preview::is_video(&name, &path);
+        if is_still {
+            if ui
+                .button(crate::lang::tr("复制图片", self.lang))
+                .clicked()
+            {
+                self.status = if crate::fs_util::set_clipboard_image(&path) {
+                    crate::lang::tr("已复制图片", self.lang).into()
+                } else {
+                    crate::lang::tr("复制失败", self.lang).into()
+                };
+                ui.close_menu();
+            }
         }
         if ui
             .button(crate::lang::tr("复制文件", self.lang))
@@ -3072,6 +3084,17 @@ fn remove_tree(p: &std::path::Path) -> std::io::Result<()> {
                 path.clone(),
                 ui.ctx(),
             );
+            ui.close_menu();
+        }
+        ui.separator();
+        if ui
+            .button(crate::lang::tr("删除", self.lang))
+            .clicked()
+        {
+            // Move the currently-shown file to the Recycle Bin, then close the
+            // viewer (its subject no longer exists).
+            self.delete_paths(vec![path.clone()], false);
+            self.viewer = None;
             ui.close_menu();
         }
         ui.separator();

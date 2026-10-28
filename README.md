@@ -11,6 +11,20 @@
 
 ## 更新日志 / Changelog
 
+### v0.1.14 — 2026-10-28
+- **不再自动提权（普通用户权限运行）**：此前程序每次启动都自提权到管理员，导致 Windows 的 UIPI 隔离禁止普通程序（QQ、资源管理器）读取它放进剪贴板或拖出去的内容——复制/拖拽到外部程序因此无效。现在默认以普通权限运行，剪贴板复制、拖拽到 QQ/上传框全部可用。仅「清空回收站」这一种需要管理员的操作改为点击时临时申请 UAC，用完即退。
+- **GIF / 视频可复制成文件**：查看器工具栏和右键菜单的「复制文件」把整个 GIF/视频文件（CF_HDROP）放进剪贴板，可直接粘贴到 QQ 发送原文件，而不是复制某一帧静态图。查看器对 GIF/视频自动隐藏「复制图片」（那只复制单帧）。
+- **查看器右键可删除**：双击预览窗口右键新增「删除」，把正在看的这个文件移入回收站并关闭预览。
+- **查看器滚轮方向修正**：滚轮向上 = 上一张，向下 = 下一张（之前是反的）。
+- **列表 / 网格可直接拖出文件**：在文件上按下并拖动即可发起 Windows OLE 拖拽，拖到 QQ、上传框、资源管理器等任何支持的地方。多选时拖出整个选择。
+
+**English**
+- **No more auto-elevation (runs as a normal user)**: the app used to self-elevate to admin on every launch, and Windows UIPI then blocked other (medium-integrity) programs — QQ, Explorer — from reading anything it put on the clipboard or dragged out, so copy/drag to external programs silently failed. It now runs at normal integrity, so clipboard copy and drag-and-drop to QQ / upload boxes all work. The only admin-needing action, emptying the Recycle Bin, now asks for UAC on demand and exits right after.
+- **GIF / video copy as a file**: the viewer toolbar and right-click "Copy file" put the whole GIF/video file (CF_HDROP) on the clipboard, ready to paste into QQ as the original file instead of a single still frame. "Copy image" (one frame) is now hidden for GIFs/videos.
+- **Viewer right-click delete**: the double-click preview window's right-click menu gains "Delete", which moves the file being viewed to the Recycle Bin and closes the preview.
+- **Viewer wheel direction fixed**: scroll up = previous image, scroll down = next (it was reversed).
+- **Drag files out of the list / grid**: press and drag a file to start a Windows OLE drag — drop it into QQ, an upload box, Explorer, anything. A multi-selection drags the whole set.
+
 ### v0.1.13 — 2026-10-26
 - **视频预览 / 播放器**：双击视频（MP4 / MOV / AVI / WMV / H.264 / HEVC / VP9 等）直接在查看器里播放。基于 Windows 自带的 Media Foundation，不捆绑任何解码器或播放器内核（exe 体积不变、无授权问题）。画面正中有暂停/播放键，底部是可拖拽的进度条 + 时间码；点画面正中即暂停/播放，拖动进度条可任意跳转。MKV / WebM / FLV 等 MF 不支持的格式会明确提示「无法解码」，不会卡住。
 - **GIF 播放器**：GIF 不再当静态图片显示——有播放/暂停键、可拖拽的帧进度条和帧计数；点画面正中同样可播放/暂停。整段解码改为「首帧海报优先」：先瞬时显示第一帧，解码在后台继续，不再干等「正在准备 GIF」。

@@ -114,31 +114,31 @@ pub enum VideoJobKind {
 }
 
 fn main() -> eframe::Result {
+    // ---- one-shot elevated actions --------------------------------------
+    // The app no longer self-elevates (see below): running as a normal user is
+    // what lets the clipboard and OLE drag-drop reach other programs (QQ,
+    // Explorer) — UIPI otherwise blocks those from reading anything a higher
+    // integrity process put on the clipboard. The only thing that still needs
+    // admin is emptying *every* account's Recycle Bin, so that one action is
+    // launched elevated on demand and exits immediately.
+    if std::env::args().any(|a| a == "--empty-recycle") {
+        let _ = crate::shell::empty_recycle_bin(None);
+        return Ok(());
+    }
+
     // ---- single instance -------------------------------------------------
     // A second launch must not open a second window: it activates the one the
-    // first instance owns and hands over any path it carried. Decided here,
-    // *before* the elevation relaunch below, so the common case costs no UAC
-    // prompt — and it can be decided here: UIPI blocks messages, not
-    // `EnumWindows` / `ShowWindow` / `SetForegroundWindow`, so an unelevated
-    // launcher can still find and foreground the elevated instance's window.
+    // first instance owns and hands over any path it carried. Both instances
+    // now run at the same (medium) integrity, so UIPI is never in the way and
+    // no UAC hop is needed for take-over.
     let take_over = std::env::args().any(|a| a == "--take-over");
     let path_arg = std::env::args()
         .skip(1)
         .find(|a| a != "--elevated" && a != "--take-over");
-    // True once this process has already been through a UAC prompt: never
-    // ask twice (a declined prompt must not loop).
-    let mut elevation_attempted = false;
+    // Same-integrity single instance: no elevation hops anywhere.
     if let Some(found) = crate::single::find_existing() {
         if take_over {
-            // Spawned to replace a running instance (tray 重启, or our own
-            // elevated relaunch after finding an older build). Closing an
-            // elevated window needs elevation, so hop through UAC first.
-            if !crate::shell::is_elevated() {
-                elevation_attempted = true;
-                if crate::shell::relaunch_elevated() {
-                    return Ok(());
-                }
-            }
+            // Tray 重启 / explicit replace: close the old window directly.
             crate::single::take_over(&found);
         } else if crate::single::same_build(&found) {
             // Same binary: hand the path over (if any) and bring the window
@@ -148,35 +148,10 @@ fn main() -> eframe::Result {
             }
             crate::single::activate(found.hwnd);
             return Ok(());
-        } else if crate::shell::is_elevated() {
-            // An older build owns the window — a reload whose taskkill could
-            // not reach the elevated instance. We may close it ourselves.
-            crate::single::take_over(&found);
         } else {
-            // Older build, no rights yet: relaunch elevated carrying the
-            // replace flag, so the elevated copy does the closing.
-            elevation_attempted = true;
-            if crate::shell::relaunch_elevated_with(&["--take-over"]) {
-                return Ok(());
-            }
-            // UAC declined: best effort (the close will fail — the window
-            // belongs to a higher integrity process), then start anyway.
+            // Older build owns the window: replace it directly (same integrity,
+            // so no UAC needed).
             crate::single::take_over(&found);
-        }
-    }
-
-    // Run elevated. Emptying the Recycle Bin has to delete entries that belong
-    // to other accounts or sit in protected folders — an unelevated process
-    // cannot remove those no matter how the delete is attempted, which is why
-    // "empty" could leave thousands of items behind.
-    //
-    // The relaunch is a soft failure on purpose: if the UAC prompt is declined
-    // the app still starts, just without those rights.
-    let elevation_tried = std::env::args().any(|a| a == "--elevated");
-    if !elevation_attempted && !elevation_tried && !crate::shell::is_elevated() {
-        if crate::shell::relaunch_elevated() {
-            // The elevated copy owns the window from here on.
-            return Ok(());
         }
     }
 
@@ -1440,7 +1415,20 @@ impl eframe::App for Explorer {
                     ui.label(format!("{}{}{}", crate::lang::tr("确定清空回收站吗？共", self.lang), count, crate::lang::tr("项。", self.lang)));
                     ui.label(crate::lang::tr("后台逐个删除 $R/$I 文件，界面不卡顿。", self.lang));
                     ui.horizontal(|ui| {
-                        if ui.button(crate::lang::tr("清空", self.lang)).clicked() { self.spawn_empty_recycle(); }
+                        if ui.button(crate::lang::tr("清空", self.lang)).clicked() {
+                            self.empty_open = false;
+                            // Emptying the whole bin can touch other accounts'
+                            // items, which needs admin — launch one elevated
+                            // instance just for this, then it exits. If UAC is
+                            // declined, fall back to the in-process empty
+                            // (current user only).
+                            if crate::shell::relaunch_elevated_with(&["--empty-recycle"]) {
+                                self.status =
+                                    crate::lang::tr("已请求提权清空回收站…", self.lang).into();
+                            } else {
+                                self.spawn_empty_recycle();
+                            }
+                        }
                         if ui.button(crate::lang::tr("取消", self.lang)).clicked() { self.empty_open = false; }
                     });
                 });
@@ -2158,6 +2146,14 @@ impl Explorer {
                 fs_util::reveal_in_explorer(&vpath);
             }
             ui.separator();
+            if ui.button(crate::lang::tr("复制文件", self.lang)).clicked() {
+                // Put the *file* on the clipboard (CF_HDROP) so it can be pasted
+                // into QQ / Explorer / an upload box. For an animated GIF or a
+                // video this copies the real file, not a single still frame.
+                fs_util::set_clipboard_files(std::slice::from_ref(&vpath.to_path_buf()));
+                self.status = crate::lang::tr("已复制文件", self.lang).into();
+            }
+            ui.separator();
             // Slideshow options, shared by stills and clips and remembered
             // across restarts (written to the store the moment they change).
             let mut lp = self.viewer_loop;
@@ -2259,7 +2255,9 @@ impl Explorer {
                 .unwrap_or(true);
             if ok {
                 self.viewer_wheel_at = Some(std::time::Instant::now());
-                self.viewer_nav(if wheel_dy > 0.0 { 1 } else { -1 });
+                // Scroll up (negative delta.y) → previous image, like a film
+                // strip being wound back. Scroll down → next.
+                self.viewer_nav(if wheel_dy > 0.0 { -1 } else { 1 });
             }
         }
     }
@@ -4159,16 +4157,23 @@ impl Explorer {
                                 table_cell(ui, cols.date, false, ctime_txt);
                             });
                         });
-                        let resp = row.response.interact(egui::Sense::click());
+                        let resp = row.response.interact(egui::Sense::click_and_drag());
                         let resp = resp.on_hover_cursor(egui::CursorIcon::PointingHand);
+
+                        // Drag the row's file(s) out of the window (to QQ, an
+                        // upload box, Explorer, …) via a Windows OLE drag.
+                        let mut drag_handled = false;
+                        if resp.drag_started() {
+                            drag_handled = self.try_start_os_drag(is_left, &name);
+                        }
 
                         // Double-click must win over single-click: test it first,
                         // otherwise every double-click also fires `clicked()` and
                         // only ever selects (the old bug — folders never opened).
-                        if resp.double_clicked() {
+                        if !drag_handled && resp.double_clicked() {
                             self.open_row(is_left, &name, is_dir, &entries);
                             ui.ctx().request_repaint();
-                        } else if resp.clicked() {
+                        } else if !drag_handled && resp.clicked() {
                             // Explorer-style modifier clicks: Ctrl toggles one row,
                             // Shift extends from the anchor, a plain click starts
                             // a fresh single selection.
@@ -4626,11 +4631,16 @@ impl Explorer {
                     },
                 );
             });
-        let resp = cell.response.interact(egui::Sense::click());
+        let resp = cell.response.interact(egui::Sense::click_and_drag());
         let resp = resp.on_hover_cursor(egui::CursorIcon::PointingHand);
-        if resp.double_clicked() {
+        // Drag the thumbnail's file(s) out of the window (QQ / upload / Explorer).
+        let mut drag_handled = false;
+        if resp.drag_started() {
+            drag_handled = self.try_start_os_drag(is_left, &name);
+        }
+        if !drag_handled && resp.double_clicked() {
             self.open_row(is_left, &name, is_dir, entries);
-        } else if resp.clicked() {
+        } else if !drag_handled && resp.clicked() {
             // Same modifier rules as the list view (Ctrl / Shift / plain).
             let (ctrl, shift) = ui.input(|i| (i.modifiers.ctrl, i.modifiers.shift));
             self.set_active_pane(is_left);
@@ -4652,6 +4662,27 @@ impl Explorer {
     }
 
     // ---------------- shared bits ----------------
+
+    /// Start a Windows OLE drag of the given file(s) so they can be dropped
+    /// into any other program — QQ, an upload box, Explorer, … . Returns true
+    /// if a drag actually began. We drag the whole selection when the dragged
+    /// item is part of a multi-selection, otherwise just that one file.
+    ///
+    /// `DoDragDrop` runs a modal message loop and blocks until the drop (or
+    /// Escape) — the same behaviour as Explorer, and fine on the UI thread.
+    fn try_start_os_drag(&mut self, is_left: bool, name: &str) -> bool {
+        let panel = get_panel(self, is_left);
+        let cwd = panel.cwd.clone();
+        let paths: Vec<std::path::PathBuf> = if panel.multi.contains(name) && panel.multi.len() > 1 {
+            panel.multi.iter().map(|n| cwd.join(n)).collect()
+        } else {
+            vec![cwd.join(name)]
+        };
+        if paths.is_empty() {
+            return false;
+        }
+        crate::dragout::begin_file_drag(&paths)
+    }
 
     /// Double-click / Enter on a row.
     fn open_row(&mut self, is_left: bool, name: &str, is_dir: bool, listing: &[app::Entry]) {
