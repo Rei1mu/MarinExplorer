@@ -14,6 +14,7 @@ use std::collections::{BinaryHeap, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::{channel, Receiver, Sender};
 use std::sync::{Arc, Condvar, Mutex};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 /// Extensions we attempt to decode.
 pub const IMAGE_EXTS: &[&str] = &[
@@ -85,7 +86,23 @@ pub fn is_video(name: &str, path: &Path) -> bool {
 
 /// Image or video — anything the internal viewer can show.
 pub fn is_previewable(name: &str, path: &Path) -> bool {
-    is_image(name, path) || is_video(name, path)
+    is_image(name, path) || is_video(name, path) || is_pdf(name, path)
+}
+
+/// `true` when `name` is a PDF document. Extension first, then a `%PDF` magic
+/// sniff — but only when the file carries no recognised extension, mirroring
+/// [`is_image`]/[`is_video`]. A file whose extension we already classified is
+/// ruled out cheaply, so the grid does not open every non-PDF row just to
+/// exclude a PDF (this runs per visible row, every frame).
+pub fn is_pdf(name: &str, path: &Path) -> bool {
+    if name.to_ascii_lowercase().ends_with(".pdf") {
+        return true;
+    }
+    if kind_from_ext(name).is_some() {
+        return false;
+    }
+    let b = head(path, 5);
+    b.starts_with(b"%PDF")
 }
 
 /// Extension-based guess only (no I/O). `None` means "unknown — sniff it".
@@ -232,8 +249,19 @@ impl Tex {
     }
 }
 
+/// A file's modification time (nanoseconds since the Unix epoch) plus its byte
+/// length. Two decodes of the same path count as "the same" only if both match —
+/// this is how we detect an in-place replacement (same name, newer mtime or
+/// different size) and drop the stale cached texture.
+type Stamp = (u128, u64);
 type Key = (PathBuf, u16);
-type Reply = (PathBuf, u16, Option<(u32, u32, Vec<u8>)>);
+type Reply = (PathBuf, u16, Option<(u32, u32, Vec<u8>)>, Stamp);
+
+/// A decoded texture plus the file stamp it was decoded from (see `Stamp`).
+struct Cached {
+    tex: Tex,
+    stamp: Stamp,
+}
 
 /// Shared decode queue: a max-heap of pending requests, drained by the worker
 /// thread in priority order. `Mutex` + `Condvar` let the worker sleep when
@@ -244,9 +272,9 @@ struct DecodeQueue {
 
 /// LRU-ish cache of decoded images, plus the decode worker.
 pub struct Previews {
-    map: HashMap<Key, Tex>,
+    map: HashMap<Key, Cached>,
     order: Vec<Key>,
-    failed: HashSet<Key>,
+    failed: HashMap<Key, Stamp>,
     pending: HashSet<Key>,
     /// RGBA bytes currently held in `map` (dropped entries give theirs back).
     bytes: usize,
@@ -297,13 +325,17 @@ impl Previews {
                         let (_p, _s, p, m) = g.heap.pop().unwrap();
                         (p, m)
                     };
+                    // A missing/unreadable file still needs a stamp to tag its
+                    // (failed) result; a sentinel that no real mtime can equal
+                    // keeps the cache self-correcting once the file reappears.
+                    let stamp = stamp_of(&path).unwrap_or((u128::MAX, u64::MAX));
                     let out = decode(&path, max);
                     // One disk decode feeds every smaller cache entry, so the
                     // grid and the preview pane reuse this work for free.
                     if let Some((w, h, rgba)) = &out {
-                        derive_smaller(&path, max, *w, *h, rgba, &tx);
+                        derive_smaller(&path, max, *w, *h, rgba, &tx, stamp);
                     }
-                    if tx.send((path, max, out)).is_err() {
+                    if tx.send((path, max, out, stamp)).is_err() {
                         break;
                     }
                 }
@@ -312,7 +344,7 @@ impl Previews {
         Self {
             map: HashMap::new(),
             order: Vec::new(),
-            failed: HashSet::new(),
+            failed: HashMap::new(),
             pending: HashSet::new(),
             bytes: 0,
             seq: 0,
@@ -330,13 +362,13 @@ impl Previews {
 
     /// Drain finished decodes and upload them as textures. Call once per frame.
     pub fn poll(&mut self, ctx: &egui::Context) {
-        while let Ok((path, max, out)) = self.res_rx.try_recv() {
+        while let Ok((path, max, out, stamp)) = self.res_rx.try_recv() {
             let key = (path.clone(), max);
             self.pending.remove(&key);
             match out {
                 Some((w, h, rgba)) => {
                     if w == 0 || h == 0 || rgba.len() < (w as usize * h as usize * 4) {
-                        self.failed.insert(key);
+                        self.failed.insert(key, stamp);
                         continue;
                     }
                     let img = egui::ColorImage::from_rgba_unmultiplied(
@@ -345,26 +377,26 @@ impl Previews {
                     );
                     let name = format!("prev:{}@{}", path.display(), max);
                     let tex = ctx.load_texture(name, img, egui::TextureOptions::LINEAR);
-                    self.insert(key, Tex { tex, w, h });
+                    self.insert(key, Tex { tex, w, h }, stamp);
                 }
                 None => {
-                    self.failed.insert(key);
+                    self.failed.insert(key, stamp);
                 }
             }
         }
     }
 
-    fn insert(&mut self, key: Key, tex: Tex) {
+    fn insert(&mut self, key: Key, tex: Tex, stamp: Stamp) {
         // A re-decode of a cached key replaces its texture; drop the old one
         // from the bookkeeping first so `bytes` stays truthful.
         if let Some(old) = self.map.remove(&key) {
-            self.bytes = self.bytes.saturating_sub(tex_bytes(&old));
+            self.bytes = self.bytes.saturating_sub(tex_bytes(&old.tex));
             if let Some(pos) = self.order.iter().position(|k| *k == key) {
                 self.order.remove(pos);
             }
         }
         self.bytes += tex_bytes(&tex);
-        self.map.insert(key.clone(), tex);
+        self.map.insert(key.clone(), Cached { tex, stamp });
         self.order.push(key);
         // Evict oldest-first until both the count and the byte budget fit.
         // `> 1` keeps one texture even if it alone busts the budget (a single
@@ -374,10 +406,31 @@ impl Previews {
             || (self.bytes > MAX_CACHE_BYTES && self.order.len() > 1)
         {
             let old = self.order.remove(0);
-            if let Some(tex) = self.map.remove(&old) {
-                self.bytes = self.bytes.saturating_sub(tex_bytes(&tex));
+            if let Some(c) = self.map.remove(&old) {
+                self.bytes = self.bytes.saturating_sub(tex_bytes(&c.tex));
             }
         }
+    }
+
+    /// Drop every cached / failed / pending entry for `path`, across all sizes.
+    /// Call this when a file is replaced in place (same name, new bytes) or when
+    /// the user hits 刷新, so the next lookup re-decodes from disk instead of
+    /// serving a stale texture from before the change.
+    pub fn invalidate(&mut self, path: &Path) {
+        let p = path.to_path_buf();
+        let mut drop = 0usize;
+        self.map.retain(|k, v| {
+            if k.0 == p {
+                drop += tex_bytes(&v.tex);
+                false
+            } else {
+                true
+            }
+        });
+        self.bytes = self.bytes.saturating_sub(drop);
+        self.order.retain(|k| k.0 != p);
+        self.failed.retain(|k, _| k.0 != p);
+        self.pending.retain(|k| k.0 != p);
     }
 
     /// Texture for `path` at (at most) `max` pixels on the long edge.
@@ -386,15 +439,47 @@ impl Previews {
     /// backlog, so clicking / double-clicking an image always decodes first.
     pub fn get(&mut self, path: &Path, max: u16, prio: Priority) -> Option<&Tex> {
         let key = (path.to_path_buf(), max);
-        if self.map.contains_key(&key) {
-            // touch: move to the back of the eviction order
-            if let Some(pos) = self.order.iter().position(|k| *k == key) {
-                let k = self.order.remove(pos);
-                self.order.push(k);
+        // Validate any cached / failed entry against the file on disk. A same-name
+        // replacement changes the stamp, so a stale texture must be dropped and
+        // re-decoded. We only `stat()` when there is actually something to
+        // validate — pure cache misses skip the syscall.
+        if self.map.contains_key(&key) || self.failed.contains_key(&key) {
+            // Decide first (borrows released), then act (mutable) — keeps the
+            // borrow checker happy. 0 fresh · 1 stale map · 2 still failing ·
+            // 3 failed for an older version · 4 file gone.
+            let verdict = match stamp_of(path) {
+                Some(cur) => {
+                    if let Some(c) = self.map.get(&key) {
+                        if c.stamp == cur { 0 } else { 1 }
+                    } else if let Some(&fs) = self.failed.get(&key) {
+                        if fs == cur { 2 } else { 3 }
+                    } else {
+                        1
+                    }
+                }
+                None => 4,
+            };
+            match verdict {
+                0 => {
+                    // touch: move to the back of the eviction order
+                    if let Some(pos) = self.order.iter().position(|k| *k == key) {
+                        let k = self.order.remove(pos);
+                        self.order.push(k);
+                    }
+                    return self.map.get(&key).map(|c| &c.tex);
+                }
+                1 => self.invalidate(path),
+                2 => return None,
+                3 => {
+                    self.failed.remove(&key);
+                }
+                _ => {
+                    self.invalidate(path);
+                    return None;
+                }
             }
-            return self.map.get(&key);
         }
-        if self.failed.contains(&key) {
+        if self.failed.contains_key(&key) {
             return None;
         }
         // 小 perf mode: never start a new grid decode — a cache miss falls back
@@ -420,9 +505,14 @@ impl Previews {
         None
     }
 
-    /// `true` when `path` was tried and could not be decoded.
+    /// `true` when `path` was tried and could not be decoded *for its current
+    /// on-disk version*. A replacement clears the stale failure so we retry.
     pub fn failed(&self, path: &Path, max: u16) -> bool {
-        self.failed.contains(&(path.to_path_buf(), max))
+        let key = (path.to_path_buf(), max);
+        match self.failed.get(&key) {
+            Some(&s) => stamp_of(path) == Some(s),
+            None => false,
+        }
     }
 
     /// `true` while any decode is in flight. The caller must keep repainting
@@ -447,15 +537,43 @@ impl Previews {
         prio: Priority,
     ) -> (Option<&Tex>, bool) {
         let key = (path.to_path_buf(), max);
-        if self.map.contains_key(&key) {
-            // touch: move to the back of the eviction order
-            if let Some(pos) = self.order.iter().position(|k| *k == key) {
-                let k = self.order.remove(pos);
-                self.order.push(k);
+        if self.map.contains_key(&key) || self.failed.contains_key(&key) {
+            // Decide first (borrows released), then act (mutable). 0 fresh ·
+            // 1 stale map · 2 still failing · 3 failed for an older version ·
+            // 4 file gone.
+            let verdict = match stamp_of(path) {
+                Some(cur) => {
+                    if let Some(c) = self.map.get(&key) {
+                        if c.stamp == cur { 0 } else { 1 }
+                    } else if let Some(&fs) = self.failed.get(&key) {
+                        if fs == cur { 2 } else { 3 }
+                    } else {
+                        1
+                    }
+                }
+                None => 4,
+            };
+            match verdict {
+                0 => {
+                    // touch: move to the back of the eviction order
+                    if let Some(pos) = self.order.iter().position(|k| *k == key) {
+                        let k = self.order.remove(pos);
+                        self.order.push(k);
+                    }
+                    return (self.map.get(&key).map(|c| &c.tex), true);
+                }
+                1 => self.invalidate(path),
+                2 => return (None, true),
+                3 => {
+                    self.failed.remove(&key);
+                }
+                _ => {
+                    self.invalidate(path);
+                    return (None, true);
+                }
             }
-            return (self.map.get(&key), true);
         }
-        if self.failed.contains(&key) {
+        if self.failed.contains_key(&key) {
             return (None, true);
         }
         if self.pending.insert(key.clone()) {
@@ -481,10 +599,20 @@ impl Previews {
             }
         }
         match best {
-            Some(s) => (self.map.get(&(path.to_path_buf(), s)), false),
+            Some(s) => (self.map.get(&(path.to_path_buf(), s)).map(|c| &c.tex), false),
             None => (None, false),
         }
     }
+}
+
+/// Current on-disk stamp for `path`: mtime (nanoseconds since the Unix epoch)
+/// plus byte length. `None` if the file is missing or its metadata is
+/// unreadable. Two decodes of the same path are only equivalent if both the
+/// stamp and the path match — so a same-name replacement is detected.
+fn stamp_of(path: &Path) -> Option<(u128, u64)> {
+    let m = std::fs::metadata(path).ok()?;
+    let mt = m.modified().ok()?.duration_since(UNIX_EPOCH).ok()?;
+    Some((mt.as_nanos(), m.len()))
 }
 
 /// RGBA bytes a cached texture occupies.
@@ -502,6 +630,7 @@ fn derive_smaller(
     h: u32,
     rgba: &[u8],
     tx: &Sender<Reply>,
+    stamp: Stamp,
 ) {
     let long = w.max(h);
     if long == 0 {
@@ -520,7 +649,7 @@ fn derive_smaller(
         let out = image::imageops::resize(&img, nw, nh, image::imageops::FilterType::Triangle);
         let (ow, oh) = (out.width(), out.height());
         if tx
-            .send((path.to_path_buf(), s, Some((ow, oh, out.into_raw()))))
+            .send((path.to_path_buf(), s, Some((ow, oh, out.into_raw())), stamp))
             .is_err()
         {
             return;
@@ -528,8 +657,62 @@ fn derive_smaller(
     }
 }
 
+/// Render the first page of a PDF to RGBA (long edge ≤ `max`). Returns `None`
+/// when the file cannot be parsed or rendered, so the caller falls back to the
+/// shell icon. Uses `hayro` (a pure-Rust PDF rasterizer) compiled straight into
+/// the executable — no external shared library is required at runtime.
+fn decode_pdf(path: &Path, max: u16) -> Option<(u32, u32, Vec<u8>)> {
+    use hayro::hayro_interpret::InterpreterSettings;
+    use hayro::hayro_syntax::Pdf;
+    use hayro::vello_cpu::color::palette::css::WHITE;
+    use hayro::{PixmapSettings, RenderCache, RenderSettings, render};
+
+    let data = std::fs::read(path).ok()?;
+    let pdf = Pdf::new(data).ok()?;
+    let cache = RenderCache::new();
+    let interpreter = InterpreterSettings::default();
+    let settings = RenderSettings::default();
+
+    let pages = pdf.pages();
+    let page = pages.iter().next()?;
+    let (pw, ph) = page.render_dimensions();
+    if pw <= 0.0 || ph <= 0.0 {
+        return None;
+    }
+    // Scale so the long edge fits `max`. Cap upscaling to avoid huge bitmaps for
+    // tiny pages; hayro is CPU-only and not yet performance-optimised.
+    let scale = (max as f32 / pw.max(ph)).clamp(0.05, 4.0);
+    let pixmap_settings = PixmapSettings {
+        x_scale: scale,
+        y_scale: scale,
+        bg_color: WHITE,
+    };
+    let pixmap = render(page, &cache, &interpreter, &settings, &pixmap_settings);
+    let w = pixmap.width() as u32;
+    let h = pixmap.height() as u32;
+    if w == 0 || h == 0 {
+        return None;
+    }
+    // vello_cpu emits premultiplied RGBA8; with an opaque white background every
+    // pixel is fully opaque, so premultiplied == straight RGBA and we can copy it
+    // directly into the decode cache.
+    let rgba = pixmap.data_as_u8_slice().to_vec();
+    if rgba.len() < (w as usize * h as usize * 4) {
+        return None;
+    }
+    Some((w, h, rgba))
+}
+
 /// Decode `path` down to `max` px on the long edge; returns `(w, h, rgba)`.
 fn decode(path: &Path, max: u16) -> Option<(u32, u32, Vec<u8>)> {
+    if path
+        .extension()
+        .and_then(|e| e.to_str())
+        .map(|e| e.eq_ignore_ascii_case("pdf"))
+        .unwrap_or(false)
+    {
+        return decode_pdf(path, max);
+    }
     let meta = std::fs::metadata(path).ok()?;
     if meta.len() == 0 || meta.len() > MAX_FILE_BYTES {
         return None;

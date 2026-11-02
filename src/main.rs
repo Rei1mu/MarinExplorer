@@ -966,10 +966,17 @@ impl eframe::App for Explorer {
                     self.apply_cached_sizes();
                 }
                 if icons::button(ui, &icons::REFRESH, &t("刷新"), true, "").clicked() {
+                    let sel = self.active_panel().sel_paths();
                     let cwd = self.active_panel().cwd.clone();
                     self.active_panel().load(&cwd);
                     self.apply_cached_sizes();
                     self.refresh_drives();
+                    // A same-name replacement keeps the path but changes the bytes;
+                    // force the preview cache to re-decode so 刷新 shows the new
+                    // image even if the file's mtime did not move.
+                    for p in &sel {
+                        self.previews.invalidate(p);
+                    }
                 }
                 // Manual override for the size cache: 刷新 re-reads the listing
                 // but happily reuses a cached (possibly stale or `~`) size.
@@ -1648,6 +1655,10 @@ impl eframe::App for Explorer {
             );
             let n_imgs = self.viewer_list.len();
             let vp = egui::ViewportId::from_hash_of("image_viewer");
+            if self.viewer_focus {
+                ctx.send_viewport_cmd_to(vp, egui::ViewportCommand::Focus);
+                self.viewer_focus = false;
+            }
             let builder = egui::ViewportBuilder::default()
                 .with_title(title.clone())
                 .with_inner_size([900.0, 700.0])
@@ -4591,7 +4602,9 @@ impl Explorer {
                                 LARGE_ICON,
                                 egui::Color32::from_rgb(225, 180, 70),
                             );
-                        } else if crate::preview::is_image(&name, &path) {
+                        } else if crate::preview::is_image(&name, &path)
+                            || crate::preview::is_pdf(&name, &path)
+                        {
                             let mut painted = false;
                             // Only request a thumbnail for on-screen cells; off-
                             // screen cells in a huge folder must not flood the
@@ -5005,11 +5018,15 @@ impl Explorer {
         ui.separator();
 
         if !is_dir
-            && (crate::preview::is_image(&name, &path) || crate::preview::is_video(&name, &path))
+            && (crate::preview::is_image(&name, &path)
+                || crate::preview::is_video(&name, &path)
+                || crate::preview::is_pdf(&name, &path))
         {
-            if crate::preview::is_image(&name, &path) {
+            if crate::preview::is_image(&name, &path)
+                || crate::preview::is_pdf(&name, &path)
+            {
                 // Animated GIFs play inline in the pane (with a play/pause
-                // key); everything else is a still decode.
+                // key); everything else — including PDFs — is a still decode.
                 if crate::preview::is_gif(&name, &path) {
                     self.render_side_gif(ui, &path);
                 } else {

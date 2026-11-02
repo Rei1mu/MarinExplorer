@@ -1,6 +1,6 @@
 [package]
 name = "MarinExplorer"
-version = "0.1.16"
+version = "0.1.17"
 edition = "2021"
 description = "A lightweight Windows two-pane file manager (x86_64 + ARM64), built with Rust + egui"
 build = "build.rs"
@@ -41,6 +41,10 @@ windows = { version = "0.52", features = [
     "Win32_System_Variant",
     "Win32_Media_MediaFoundation",
 ] }
+
+# PDF preview / thumbnail rendering (first page). Pure-Rust rasterizer compiled
+# into the executable — no external shared library required at runtime.
+hayro = "0.8.0"
 
 [profile.release]
 opt-level = "z"      # optimize for size

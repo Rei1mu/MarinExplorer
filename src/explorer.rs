@@ -224,6 +224,11 @@ pub struct Explorer {
     pub previews: crate::preview::Previews,
     pub show_preview: bool,
     pub viewer: Option<PathBuf>,
+    /// Set whenever `open_viewer` is (re)invoked; the main loop turns it into a
+    /// `ViewportCommand::Focus` so the already-open viewer window pops to the
+    /// front instead of staying behind the panes when you double-click another
+    /// file while it is already showing one.
+    pub viewer_focus: bool,
     pub viewer_zoom: f32,
     /// Built-in viewer: the list of images in the folder the viewer was opened
     /// from, so ← / → can walk through them. `viewer_index` selects the shown.
@@ -626,6 +631,7 @@ impl Explorer {
             previews: crate::preview::Previews::new(),
             show_preview: store_show_preview,
             viewer: None,
+            viewer_focus: false,
             viewer_zoom: 0.0,
             viewer_list: vec![],
             viewer_index: 0,
@@ -2993,6 +2999,7 @@ fn remove_tree(p: &std::path::Path) -> std::io::Result<()> {
         };
         self.viewer_index = idx.min(self.viewer_list.len().saturating_sub(1));
         self.viewer = Some(path);
+        self.viewer_focus = true;
         self.viewer_zoom = 0.0; // 0.0 = fit to window
         self.viewer_pan = egui::Vec2::ZERO;
     }
@@ -3231,6 +3238,12 @@ fn remove_tree(p: &std::path::Path) -> std::io::Result<()> {
         let path = path.to_path_buf();
         let is_left = self.active_pane == 0;
         let is_img = !is_dir && crate::preview::is_previewable(name, &path);
+        // A still raster image (not a GIF / video / PDF) — the only kind the
+        // ICO / PNG conversion dialog can actually handle.
+        let is_still = !is_dir
+            && crate::preview::is_image(name, &path)
+            && !crate::preview::is_gif(name, &path)
+            && !crate::preview::is_video(name, &path);
 
         if is_dir {
             if ui.button(crate::lang::tr("打开", self.lang)).clicked() {
@@ -3280,6 +3293,23 @@ fn remove_tree(p: &std::path::Path) -> std::io::Result<()> {
         if is_img && ui.button(crate::lang::tr("预览", self.lang)).clicked() {
             self.open_viewer(&[], path.clone());
             ui.close_menu();
+        }
+        if is_still {
+            ui.separator();
+            if ui
+                .button(crate::lang::tr("转换为 ICO", self.lang))
+                .clicked()
+            {
+                self.open_convert(crate::convert::ConvertMode::Ico, path.clone(), ui.ctx());
+                ui.close_menu();
+            }
+            if ui
+                .button(crate::lang::tr("转换为 PNG", self.lang))
+                .clicked()
+            {
+                self.open_convert(crate::convert::ConvertMode::Png, path.clone(), ui.ctx());
+                ui.close_menu();
+            }
         }
         if ui.button(crate::lang::tr("在资源管理器中显示", self.lang)).clicked() {
             fs_util::reveal_in_explorer(&path);
@@ -3415,9 +3445,13 @@ fn remove_tree(p: &std::path::Path) -> std::io::Result<()> {
                 ui.close_menu();
             }
             if ui.button(crate::lang::tr("刷新", self.lang)).clicked() {
+                let sel = self.pane_of(is_left).sel_paths();
                 let cwd = self.pane_of(is_left).cwd.clone();
                 self.pane_of(is_left).load(&cwd);
                 self.apply_cached_sizes();
+                for p in &sel {
+                    self.previews.invalidate(p);
+                }
                 ui.close_menu();
             }
             return;
@@ -3440,9 +3474,13 @@ fn remove_tree(p: &std::path::Path) -> std::io::Result<()> {
             ui.close_menu();
         }
         if ui.button(crate::lang::tr("刷新", self.lang)).clicked() {
+            let sel = self.pane_of(is_left).sel_paths();
             let cwd = self.pane_of(is_left).cwd.clone();
             self.pane_of(is_left).load(&cwd);
             self.apply_cached_sizes();
+            for p in &sel {
+                self.previews.invalidate(p);
+            }
             ui.close_menu();
         }
         if ui.button(crate::lang::tr("在此打开终端", self.lang)).clicked() {
