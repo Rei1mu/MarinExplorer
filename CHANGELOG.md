@@ -2,6 +2,12 @@
 
 > MarinExplorer 的全部版本记录。最新功能特性见 [README.md](./README.md#功能)。
 
+### v0.1.20 — 2026-11-04
+- **托盘图标不再依赖 `rc.exe`**：此前托盘图标从 exe 内嵌资源抽取，本机无 `rc.exe` 时资源被跳过、托盘不显示图标。现已改为运行时直接解码二进制中嵌入的 `logo.ico`（与任务栏/标题栏图标同一来源），无论 `rc.exe` 在不在都显示 logo。
+
+**English**
+- **Tray icon no longer depends on `rc.exe`**: previously the tray icon was pulled from the exe's embedded resource, so without `rc.exe` (build.rs skips the resource) the tray showed no icon. It now decodes the `logo.ico` embedded in the binary at runtime (same source as the taskbar / title-bar icon), so the logo shows regardless of `rc.exe`.
+
 ### v0.1.19 — 2026-11-04
 - **修复 ARM64 构建失败**：v0.1.18 的 `build.rs` 在 `rc.exe` 缺失时回退到 MinGW `windres`，产出的 x86_64 对象被 ARM64 链接器拒绝（`LNK1112: module machine type 'x64' conflicts with target machine type 'ARM64'`）。现已**彻底移除 windres / MinGW / gnu 回退**，仅用 MSVC + `rc.exe`；`rc.exe` 缺失时直接跳过资源，ARM64 构建恢复通过。
 
