@@ -7,6 +7,13 @@
 //!
 //! Only compiled on Windows; other platforms get empty stubs so the call
 //! sites stay platform-agnostic.
+//!
+//! The icon is built at runtime from the multi-size `logo.ico` embedded into
+//! the binary (the same `include_bytes!` source the taskbar/title-bar icon
+//! uses in `main.rs`). This keeps the tray glyph correct even when `build.rs`
+//! could not embed a resource into the `.exe` (e.g. `rc.exe` was absent at
+//! build time) — `ExtractIconW` would then return nothing and the tray would
+//! show no icon at all.
 
 #[cfg(target_os = "windows")]
 mod imp {
@@ -156,6 +163,62 @@ mod imp {
         fn CloseHandle(h: usize) -> i32;
     }
 
+    #[link(name = "gdi32")]
+    unsafe extern "system" {
+        fn GetDC(hWnd: usize) -> usize;
+        fn ReleaseDC(hWnd: usize, hdc: usize) -> i32;
+        fn CreateDIBSection(
+            hdc: usize,
+            pbmi: *const BITMAPINFO,
+            iUsage: u32,
+            ppvBits: *mut *mut std::ffi::c_void,
+            hSection: usize,
+            dwOffset: u32,
+        ) -> usize;
+        fn CreateBitmap(
+            nWidth: i32,
+            nHeight: i32,
+            nPlanes: u32,
+            nBitsPerPel: u32,
+            lpBits: *const std::ffi::c_void,
+        ) -> usize;
+        fn CreateIconIndirect(piconinfo: *const ICONINFO) -> usize;
+        fn DeleteObject(ho: usize) -> i32;
+    }
+
+    const BI_BITFIELDS: u32 = 3;
+    const DIB_RGB_COLORS: u32 = 0;
+
+    #[repr(C)]
+    struct BITMAPINFOHEADER {
+        biSize: u32,
+        biWidth: i32,
+        biHeight: i32,
+        biPlanes: u16,
+        biBitCount: u16,
+        biCompression: u32,
+        biSizeImage: u32,
+        biXPelsPerMeter: i32,
+        biYPelsPerMeter: i32,
+        biClrUsed: u32,
+        biClrImportant: u32,
+    }
+
+    #[repr(C)]
+    struct BITMAPINFO {
+        bmiHeader: BITMAPINFOHEADER,
+        bmiColors: [u32; 3],
+    }
+
+    #[repr(C)]
+    struct ICONINFO {
+        fIcon: u32,
+        xHotspot: u32,
+        yHotspot: u32,
+        hbmMask: usize,
+        hbmColor: usize,
+    }
+
     #[repr(C)]
     struct STARTUPINFOW {
         cb: u32,
@@ -302,11 +365,106 @@ mod imp {
         }
     }
 
+    /// Build an `HICON` straight from the `logo.ico` bytes embedded in the
+    /// binary (`include_bytes!`), the same source the taskbar icon uses. Returns
+    /// an `HICON` cast to `usize`, or 0 on any failure (the caller then falls
+    /// back to extracting the icon from the exe module).
+    ///
+    /// We decode the `.ico` with the `image` crate (which also handles the
+    /// PNG-compressed entries modern `.ico` files contain), resize to 32×32,
+    /// and hand the premultiplied BGRA pixels to a 32-bit DIB section that
+    /// `CreateIconIndirect` turns into an alpha-aware icon.
+    fn load_tray_icon() -> usize {
+        let bytes = include_bytes!("../logo.ico");
+        let img = match image::load_from_memory_with_format(bytes, image::ImageFormat::Ico) {
+            Ok(i) => i,
+            Err(_) => return 0,
+        };
+        let size = 32i32;
+        let img = img.resize_exact(size as u32, size as u32, image::imageops::FilterType::Lanczos3);
+        let rgba = img.to_rgba8();
+        let src = rgba.into_raw();
+        if src.len() != (size * size * 4) as usize {
+            return 0;
+        }
+        // Convert RGBA -> premultiplied BGRA (what a 32-bit icon DIB expects).
+        let mut bgra: Vec<u8> = Vec::with_capacity(src.len());
+        for c in src.chunks_exact(4) {
+            let r = c[0] as u32;
+            let g = c[1] as u32;
+            let b = c[2] as u32;
+            let a = c[3] as u32;
+            bgra.push(((b * a + 127) / 255) as u8);
+            bgra.push(((g * a + 127) / 255) as u8);
+            bgra.push(((r * a + 127) / 255) as u8);
+            bgra.push(a as u8);
+        }
+
+        unsafe {
+            let hdc = GetDC(0);
+            if hdc == 0 {
+                return 0;
+            }
+            let mut bi: BITMAPINFO = std::mem::zeroed();
+            bi.bmiHeader.biSize = std::mem::size_of::<BITMAPINFOHEADER>() as u32;
+            bi.bmiHeader.biWidth = size;
+            bi.bmiHeader.biHeight = -size; // negative => top-down
+            bi.bmiHeader.biPlanes = 1;
+            bi.bmiHeader.biBitCount = 32;
+            bi.bmiHeader.biCompression = BI_BITFIELDS;
+            bi.bmiHeader.biSizeImage = (size * size * 4) as u32;
+            bi.bmiColors = [0x00FF_0000, 0x0000_FF00, 0x0000_00FF];
+            let mut bits: *mut std::ffi::c_void = std::ptr::null_mut();
+            let hbmp = CreateDIBSection(
+                hdc,
+                &bi as *const BITMAPINFO,
+                DIB_RGB_COLORS,
+                &mut bits as *mut *mut std::ffi::c_void,
+                0,
+                0,
+            );
+            ReleaseDC(0, hdc);
+            if hbmp == 0 || bits.is_null() {
+                return 0;
+            }
+            std::ptr::copy_nonoverlapping(bgra.as_ptr(), bits as *mut u8, bgra.len());
+
+            // Opaque 1bpp mask (all zeros => fully opaque for an icon).
+            let mask_bytes = (((size + 15) / 16) * 2 * size) as usize;
+            let mask: Vec<u8> = vec![0u8; mask_bytes];
+            let hmask = CreateBitmap(size, size, 1, 1, mask.as_ptr() as *const std::ffi::c_void);
+            if hmask == 0 {
+                DeleteObject(hbmp);
+                return 0;
+            }
+
+            let ii = ICONINFO {
+                fIcon: 1,
+                xHotspot: 0,
+                yHotspot: 0,
+                hbmMask: hmask,
+                hbmColor: hbmp,
+            };
+            let hicon = CreateIconIndirect(&ii);
+            DeleteObject(hbmp);
+            DeleteObject(hmask);
+            hicon as usize
+        }
+    }
+
     fn add_icon(hwnd: isize) -> bool {
         unsafe {
             let exe = current_exe().unwrap_or_default();
             let exew: Vec<u16> = OsStr::new(&exe).encode_wide().chain(std::iter::once(0)).collect();
-            let hicon = extract_icon_w(get_module_handle_w(std::ptr::null()), exew.as_ptr(), 0);
+            // Prefer the icon built from the embedded logo.ico; if that fails
+            // (e.g. the image crate is unavailable), fall back to the exe's
+            // embedded resource.
+            let hicon = load_tray_icon();
+            let hicon = if hicon == 0 {
+                extract_icon_w(get_module_handle_w(std::ptr::null()), exew.as_ptr(), 0) as usize
+            } else {
+                hicon
+            };
             let tip = wide("MarinExplorer");
             let mut sz_tip = [0u16; 128];
             for (i, &c) in tip.iter().take(127).enumerate() {
@@ -318,7 +476,7 @@ mod imp {
                 u_id: 1,
                 u_flags: NIF_MESSAGE | NIF_ICON | NIF_TIP,
                 u_callback_message: TRAY_CALLBACK,
-                h_icon: if hicon.is_null() { 0 } else { hicon as usize },
+                h_icon: if hicon == 0 { 0 } else { hicon },
                 sz_tip,
                 dw_state: 0,
                 dw_state_mask: 0,
