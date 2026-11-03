@@ -12,7 +12,7 @@
 ; ---------------------------------------------------------------------------
 
 #ifndef MyAppVersion
-  #define MyAppVersion "0.1.18"
+  #define MyAppVersion "0.1.19"
 #endif
 
 ; `VersionInfoVersion` must be strictly numeric (x[.x.x.x]), while a display

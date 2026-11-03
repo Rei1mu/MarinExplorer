@@ -2,12 +2,18 @@
 
 > MarinExplorer 的全部版本记录。最新功能特性见 [README.md](./README.md#功能)。
 
+### v0.1.19 — 2026-11-04
+- **修复 ARM64 构建失败**：v0.1.18 的 `build.rs` 在 `rc.exe` 缺失时回退到 MinGW `windres`，产出的 x86_64 对象被 ARM64 链接器拒绝（`LNK1112: module machine type 'x64' conflicts with target machine type 'ARM64'`）。现已**彻底移除 windres / MinGW / gnu 回退**，仅用 MSVC + `rc.exe`；`rc.exe` 缺失时直接跳过资源，ARM64 构建恢复通过。
+
+**English**
+- **Fixed ARM64 build failure**: v0.1.18's `build.rs` fell back to MinGW `windres` when `rc.exe` was missing, emitting an x86_64 object that the ARM64 linker rejected (`LNK1112: module machine type 'x64' conflicts with target machine type 'ARM64'`). The `windres` / MinGW / `gnu` fallback is now **removed entirely** — MSVC + `rc.exe` only; if `rc.exe` is missing the resource is skipped and the ARM64 build passes again.
+
 ### v0.1.18 — 2026-11-04
-- **版本号写入 exe**：文件属性 → 详细信息现在显示 `FileVersion 0.1.18`（此前为空，无法区分运行版本）。图标与版本资源通过 MinGW `windres` 回退编译——本机无 Windows SDK 时也能嵌入资源。
+- **版本号写入 exe**：文件属性 → 详细信息现在显示 `FileVersion 0.1.18`（此前为空，无法区分运行版本）。图标与版本资源仅用 Windows SDK 的 `rc.exe` 编译（MSVC only，无 MinGW / windres 回退；`rc.exe` 缺失时自动跳过资源，构建照常通过）。
 - **修复双栏分隔条 panic**：窗口非常窄时分隔比例 `clamp` 下界大于上界会触发 panic，已封顶为 0.5。
 
 **English**
-- **Version stamped into the exe**: File Explorer → properties now shows `FileVersion 0.1.18` (previously blank, so you could not tell which build was running). Icon and version resources compile via a MinGW `windres` fallback when the Windows SDK is absent.
+- **Version stamped into the exe**: File Explorer → properties now shows `FileVersion 0.1.18` (previously blank, so you could not tell which build was running). Icon and version resources compile with the Windows SDK `rc.exe` only (MSVC only, no MinGW / windres fallback; if `rc.exe` is missing the resource is skipped and the build still passes).
 - **Fixed split-pane panic**: on a very narrow window the split ratio `clamp` lower bound exceeded the upper bound and panicked; now capped at 0.5.
 
 ### v0.1.17 — 2026-11-01
