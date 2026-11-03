@@ -2,6 +2,14 @@
 
 > MarinExplorer 的全部版本记录。最新功能特性见 [README.md](./README.md#功能)。
 
+### v0.1.18 — 2026-11-04
+- **版本号写入 exe**：文件属性 → 详细信息现在显示 `FileVersion 0.1.18`（此前为空，无法区分运行版本）。图标与版本资源通过 MinGW `windres` 回退编译——本机无 Windows SDK 时也能嵌入资源。
+- **修复双栏分隔条 panic**：窗口非常窄时分隔比例 `clamp` 下界大于上界会触发 panic，已封顶为 0.5。
+
+**English**
+- **Version stamped into the exe**: File Explorer → properties now shows `FileVersion 0.1.18` (previously blank, so you could not tell which build was running). Icon and version resources compile via a MinGW `windres` fallback when the Windows SDK is absent.
+- **Fixed split-pane panic**: on a very narrow window the split ratio `clamp` lower bound exceeded the upper bound and panicked; now capped at 0.5.
+
 ### v0.1.17 — 2026-11-01
 - **文件右键「转换为 ICO / PNG」**：选中图片在文件列表/网格右键即可转换，不必先打开预览窗口。
 - **预览窗口激活前置**：已打开预览时再双击另一个图片/gif/视频，原窗口前置并聚焦，不再需要手动切回。

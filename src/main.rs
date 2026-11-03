@@ -1337,7 +1337,12 @@ impl eframe::App for Explorer {
                 let sep = 1.0f32;
                 let span = (avail.x - sep).max(1.0);
                 let min_w = 60.0f32;
-                let frac = self.split_frac.clamp(min_w / span, 1.0 - min_w / span);
+                // `span` can fall below 2 * min_w on a very narrow window, and
+                // then `min_w / span > 1 - min_w / span` — `clamp` panics when
+                // min > max. Capping the lower bound at 0.5 keeps the two
+                // bounds ordered: a sliver of a pane, but no crash.
+                let lo = (min_w / span).min(0.5);
+                let frac = self.split_frac.clamp(lo, 1.0 - lo);
                 let w = span * frac;
                 let top = ui.cursor().min;
                 let r1 = egui::Rect::from_min_size(top, egui::vec2(w, h));
@@ -1400,8 +1405,7 @@ impl eframe::App for Explorer {
                     self.persist_layout();
                 } else if g.dragged() {
                     if let Some(pos) = g.interact_pointer_pos() {
-                        let f =
-                            ((pos.x - top.x) / span).clamp(min_w / span, 1.0 - min_w / span);
+                        let f = ((pos.x - top.x) / span).clamp(lo, 1.0 - lo);
                         if (f - self.split_frac).abs() > 1e-4 {
                             self.split_frac = f;
                         }
